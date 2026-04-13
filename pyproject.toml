@@ -33,9 +33,12 @@ dependencies = [
   "scipy>=1.7",
   "networkx>=2.6",
   "numba>=0.58",
+  "tqdm>=4.0",
+  "Cython>=0.29",
   "torch>=1.10",
   "torch-geometric>=2.0",
   "open3d>=0.17",
+  "scanpy>=1.9",
   # tomllib backport for Python <3.11. tracer.config calls tomllib;
   # CI matrix still includes 3.10 (pyproject `requires-python = ">=3.9"`).
   # Drop once requires-python bumps to >=3.11.
