@@ -11,7 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # windows-latest is excluded: pymetis (a hard tracer dep) bundles
+        # METIS C source that uses POSIX-only headers (sys/resource.h),
+        # which fails on Windows. Easier to drop than to maintain a
+        # Windows-specific pymetis fork.
+        os: [ubuntu-latest, macos-latest]
         python: ['3.10', '3.11']
     runs-on: ${{ matrix.os }}
 
