@@ -50,3 +50,8 @@ include-package-data = true
 where = ["src"]
 include = ["tracer"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
