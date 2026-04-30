@@ -8,6 +8,7 @@ import concurrent.futures  # noqa: F401 — retained for API compatibility
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from tqdm.auto import tqdm  # noqa: F401 — used by prune_transcripts_fast
 
 from . import _cy_prune
@@ -55,6 +56,26 @@ def build_dense_npmi_matrix(
     W[bi, ai] = vv
 
     return np.asarray(genes), gene_to_idx, W
+
+
+def build_sparse_npmi_matrix(result):
+    """Adapt a :class:`tracer.metrics.NpmiBootstrapResult` to the
+    ``(genes, gene_to_idx, W)`` triple consumed by
+    :func:`prune_transcripts_fast`.
+
+    The CSR upper-triangle ``W_sparse`` is returned as-is; downstream
+    code (notably :func:`tracer.stitching.coherence`) detects sparse
+    inputs and densifies the per-entity submatrix on the fly. Pairs
+    encoded as absent in CSR are treated as zero by the coherence
+    kernel — by design (see :func:`compute_npmi_bootstrap`).
+    """
+    genes = np.asarray(result.genes, dtype=str)
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
+    W = result.W_sparse
+    if not sp.isspmatrix_csr(W):
+        W = W.tocsr()
+    return genes, gene_to_idx, W
+
 
 def prune_genes_by_npmi_greedy(
     gene_ids: np.ndarray,
@@ -179,12 +200,20 @@ def prune_transcripts(
 
     df.drop(columns=["_cell_str", "_gene_idx"], inplace=True)
 
+    from .stitching import compute_housekeeping_mask
+
     aux = {
         "genes": genes,
         "gene_to_idx": gene_to_idx,
         "W": W,
         "partial_map": partial_map,
         "threshold": threshold,
+        "housekeeping_mask": compute_housekeeping_mask(
+            W,
+            pos_thresh=housekeeping_pos_thresh,
+            neg_thresh=housekeeping_neg_thresh,
+            min_strong_count=housekeeping_min_strong_count,
+        ),
     }
     return df, aux
 
@@ -202,6 +231,9 @@ def prune_transcripts_fast(
     n_jobs: int = 1,
     show_progress: bool = True,
     in_place: bool = False,
+    housekeeping_pos_thresh: float = 0.05,
+    housekeeping_neg_thresh: float = -0.05,
+    housekeeping_min_strong_count: int = 5,
 ):
     """
     Two-pass NPMI pruning. Writes pass-2 result to `out_col` in place;
@@ -428,12 +460,15 @@ def prune_transcripts_fast(
 
     df.drop(columns=["_cell_str", "_gene_idx"], inplace=True)
 
+    from .stitching import compute_housekeeping_mask
+
     aux = {
         "genes": genes,
         "gene_to_idx": gene_to_idx,
         "W": W,
         "partial_map": partial_map,
         "threshold": threshold,
+        "housekeeping_mask": compute_housekeeping_mask(W),
     }
     return df, aux
 

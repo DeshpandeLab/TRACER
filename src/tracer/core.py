@@ -12,6 +12,7 @@ from ._repro import (
 from ._utils import relu_symmetric
 from .pruning import (
     build_dense_npmi_matrix,
+    build_sparse_npmi_matrix,
     prune_genes_by_npmi_greedy,
     prune_transcripts,
     prune_transcripts_fast,
@@ -30,10 +31,19 @@ from .spatial import (
     enforce_spatial_coherence_fast,
     reassign_unassigned_to_nearby_entities,
     reassign_unassigned_to_nearby_entities_fast,
+    reassign_unassigned_by_gene_compat,
+    reassign_unassigned_to_nearest_tx_no_neg,
+    reassign_unassigned_grid_pool,
+    pre_stage2_rescue,
+    demote_small_entities,
 )
 from .stitching import (
     infer_entity_type,
     build_entity_table,
+    coherence,
+    signal_strength,
+    deltaC,
+    compute_housekeeping_mask,
     coherence_C_from_genes,
     coherence_C_from_genes_relu,
     deltaC_between_clusters,

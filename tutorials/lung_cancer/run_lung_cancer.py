@@ -25,6 +25,55 @@ def main():
     parser = argparse.ArgumentParser(description="Run TRACER pipeline on lung cancer tissue")
     parser.add_argument("--seed", type=int, default=42, help="Reproducibility seed (default: 42)")
     parser.add_argument("--run-smoke-test", action="store_true", help="Run deterministic reproducibility smoke test and exit")
+    parser.add_argument(
+        "--stage2-builder",
+        choices=("knn", "grid"),
+        default="knn",
+        help="Stage 2 graph builder: 'knn' (default, sklearn NearestNeighbors) "
+        "or 'grid' (xy bin-hash). Grid is linear-time and produces equivalent "
+        "components when exact_distance_filter=True.",
+    )
+    parser.add_argument(
+        "--stage5-candidates",
+        choices=("delaunay", "grid"),
+        default="delaunay",
+        help="Stage 5 stitch candidate source: 'delaunay' (default, centroid "
+        "Delaunay) or 'grid' (xy bin-grid over transcripts). Grid replaces "
+        "centroid-distance filtering with true contact geometry.",
+    )
+    parser.add_argument(
+        "--stage5-grid-g",
+        type=float,
+        default=2.0,
+        help="Stage 5 grid bin size G in um (only used when --stage5-candidates=grid). "
+        "Default 2.0 matches the Delaunay partition closely while running ~1.15x faster. "
+        "G=5.0 is more aggressive (over-merges).",
+    )
+    parser.add_argument(
+        "--stage5-grid-nbr",
+        choices=("4", "8"),
+        default="8",
+        help="Stage 5 grid neighborhood for stitch candidates "
+        "(only used when --stage5-candidates=grid). Default '8' (axial+diagonal).",
+    )
+    # Pipeline-restructure flags (positive-threshold + grid rescue path)
+    parser.add_argument("--prune-threshold", type=float, default=-0.05,
+                        help="Stage 1 NPMI prune threshold. +0.1 enables the "
+                        "purified-marker regime; -0.05 is the legacy conservative default.")
+    parser.add_argument("--pre-stage2-rescue", choices=("none", "grid"), default="none",
+                        help="Run pre-Stage-2 NPMI-categorical rescue (G=2 + cluster guard) "
+                        "to reattach filler tx before Stage 2.")
+    parser.add_argument("--pre-stage2-rescue-G", type=float, default=2.0)
+    parser.add_argument("--post-stage5-rescue", choices=("none", "grid"), default="none",
+                        help="Run post-Stage-5 NPMI-categorical rescue (G=5) "
+                        "to catch isolated stragglers after demote.")
+    parser.add_argument("--post-stage5-rescue-G", type=float, default=5.0)
+    parser.add_argument("--rescue-pos-npmi", type=float, default=0.05)
+    parser.add_argument("--rescue-neg-npmi", type=float, default=-0.05)
+    parser.add_argument("--rescue-cluster-guard", type=int, default=3,
+                        help="Pre-S2 cluster guard: skip rescue if a tx has "
+                        "this many same-bin same-gene unassigned peers. 0 disables.")
+    parser.add_argument("--demote-min-size", type=int, default=5)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -132,8 +181,12 @@ def main():
         apply_stitching_to_transcripts_memory_efficient,
         enforce_spatial_coherence_fast,
         prune_genes_by_npmi_greedy,
-        build_graph
+        build_graph,
+        demote_small_entities,
+        pre_stage2_rescue,
+        reassign_unassigned_grid_pool,
     )
+    from tracer.graph import build_grid_graph_xy
     # import core module for reassignment helper
     import tracer.core as core
     import torch
@@ -191,12 +244,14 @@ def main():
     print("Stage 1 done: rows=", len(df_pruned), "took", time.time() - t0, "s")
 
     # Stage 2: annotate unassigned components
-    print("Stage 2: annotate_unassigned_components_fast (build graph + CCs)")
+    # Pick graph builder per --stage2-builder.
+    stage2_builder = build_graph_fast if args.stage2_builder == "knn" else build_grid_graph_xy
+    print(f"Stage 2: annotate_unassigned_components_fast (builder={args.stage2_builder})")
     t0 = time.time()
     df_final = annotate_unassigned_components_fast(
         df_pruned=df_pruned,
         aux=aux,
-        build_graph_fn=build_graph_fast,
+        build_graph_fn=stage2_builder,
         prune_fn=prune_genes_by_npmi_greedy,
         coord_cols=("x", "y", "z"),
         k=8,
@@ -246,7 +301,8 @@ def main():
     print("Stage 4 done: rows=", len(df_split), "took", time.time() - t0, "s")
 
     # Stage 5: re-run stitching with spatial splits
-    print("Stage 5: apply_stitching_to_transcripts_memory_efficient (final stitching on split labels)")
+    # Pick candidate source per --stage5-candidates. Grid uses G = stage4 d.
+    print(f"Stage 5: apply_stitching_to_transcripts_memory_efficient (candidates={args.stage5_candidates})")
     t0 = time.time()
     df_finetuned, entity_to_stitched_ft = apply_stitching_to_transcripts_memory_efficient(
         df_final=df_split,
@@ -259,6 +315,9 @@ def main():
         deltaC_min=0.01,
         dist_threshold=5.0,
         use_3d=True,
+        candidate_source=args.stage5_candidates,
+        G=args.stage5_grid_g if args.stage5_candidates == "grid" else None,
+        stitch_neighborhood=args.stage5_grid_nbr,
         out_col="cell_id_finetuned",
         show_progress=True,
     )
