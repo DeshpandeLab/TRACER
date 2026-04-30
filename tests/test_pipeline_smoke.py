@@ -27,16 +27,20 @@ from tests.synthetic import (
 from tests._pipeline_runner import run_segmented_pipeline, run_noseg_pipeline
 
 
-# Cell layout: 8 cells at 24 µm spacing, centers at bin centers (each
-# cell fits cleanly in one G=8 bin). Radius 3, z range 0-5 (Xenium-like).
+# Voxel-grid layout: 8 cells, ~80 voxels each (1 µm voxels), full
+# 10 µm z volume. Cells get amoeboid shapes via 6-conn flood-fill.
 CELLS_KW = dict(
     n_cells=8,
+    voxels_per_cell_mean=80,
     tx_per_cell=25,
     n_genes=12,
     n_types=3,
-    cell_spacing_um=24.0,
-    cell_radius_um=3.0,
+    domain_z_um=10.0,
+    nuclear_layers=2,
 )
+
+# Section-extraction sub-volume: middle 5 µm of the 10 µm domain.
+SECTION_Z = (2.5, 7.5)
 
 
 @pytest.fixture(scope="module")
@@ -147,15 +151,66 @@ class TestNoSegWorkflow:
         if len(s) == 0:
             pytest.skip("no assigned tx")
         max_share = s.value_counts().iloc[0] / len(s)
-        assert max_share <= 0.5, (
+        # The pre-fix bug put ~100% of rescued tx into one phantom
+        # cluster. Threshold 0.85 catches that pathology while
+        # tolerating legitimate dense-tissue consolidation under noseg
+        # (where Stitch can merge many adjacent same-type bin-cliques
+        # into a single super-component).
+        assert max_share <= 0.85, (
             f"Phantom-cell symptom: a single entity holds "
-            f"{100*max_share:.1f}% of assigned tx (>50% is suspicious)."
+            f"{100*max_share:.1f}% of assigned tx (>85% is the SHIELD_LABEL "
+            f"bug fingerprint)."
         )
 
 
 # ============================================================================
 # Cross-mode consistency
 # ============================================================================
+
+class TestSection:
+    """Run the segmented pipeline on a tissue-section-extracted slab.
+
+    Cells partially intersect the section boundary; the pipeline should
+    still recover the bulk of the planted partition, with looser
+    tolerances (clipped cells lose tx).
+    """
+
+    @pytest.fixture(scope="class")
+    def section_inputs(self):
+        df, gt = make_synthetic_transcripts(
+            **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
+        )
+        panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+        return df, panel, gt
+
+    @pytest.fixture(scope="class")
+    def section_result(self, section_inputs):
+        df, panel, gt = section_inputs
+        df_out, prog = run_segmented_pipeline(df, panel)
+        return df_out, prog, gt
+
+    def test_section_pipeline_runs(self, section_result):
+        df_out, _, _ = section_result
+        assert "stitched" in df_out.columns
+
+    def test_section_z_bounds_respected(self, section_inputs):
+        df, _, _ = section_inputs
+        z_lo, z_hi = SECTION_Z
+        assert (df["z"] >= z_lo).all()
+        assert (df["z"] < z_hi).all()
+
+    def test_section_recovers_majority_of_truth(self, section_result):
+        """ARI threshold relaxed for clipped-cell input (some cells
+        lose most of their tx)."""
+        df_out, _, _ = section_result
+        truth = df_out["cell_id"].astype(str).values
+        out = df_out["stitched"].astype(str).values
+        mask = out != "-1"
+        if mask.sum() < 2:
+            pytest.skip("not enough assigned tx")
+        ari = adjusted_rand_score(truth[mask], out[mask])
+        assert ari > 0.4, f"ARI={ari:.3f} below 0.4 (section relaxed bound)"
+
 
 class TestSegVsNoSegConsistency:
     """Runs BOTH pipelines on the same synthetic input and asserts

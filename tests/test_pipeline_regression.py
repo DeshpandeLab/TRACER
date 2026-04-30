@@ -32,12 +32,14 @@ from tests.synthetic import (
 
 CELLS_KW = dict(
     n_cells=8,
+    voxels_per_cell_mean=80,
     tx_per_cell=25,
     n_genes=12,
     n_types=3,
-    cell_spacing_um=24.0,
-    cell_radius_um=3.0,
+    domain_z_um=10.0,
+    nuclear_layers=2,
 )
+SECTION_Z = (2.5, 7.5)
 
 
 # Per-metric tolerances. Counts: exact equality (deterministic).
@@ -124,6 +126,20 @@ def test_regression_noseg(synthetic_inputs):
     # We still record other metrics.
     tol = {**TOLERANCES_COUNTS, **TOLERANCES_PARTITION}
     assert_matches_reference("noseg", fp, tol)
+
+
+def test_regression_segmented_section():
+    """Regression on tissue-section-extracted slab. Different fingerprint
+    than full-volume run because clipped cells lose tx."""
+    df, gt = make_synthetic_transcripts(
+        **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
+    )
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    df_out, prog = run_segmented_pipeline(df, panel)
+    fp = _fingerprint(df_out, prog, gt)
+    fp["n_clipped_cells"] = gt["n_clipped_cells"]
+    tol = {**TOLERANCES_COUNTS, **TOLERANCES_PARTITION, "n_clipped_cells": 0}
+    assert_matches_reference("segmented_section", fp, tol)
 
 
 def test_regression_seg_vs_noseg(synthetic_inputs):

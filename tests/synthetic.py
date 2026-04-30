@@ -114,40 +114,118 @@ def make_synthetic_npmi_panel(N: int = 1000, G: int = 20, seed: int = 42
 # 2. Synthetic transcripts (for end-to-end pipeline tests)
 # -----------------------------------------------------------------------
 
+_SIX_NEIGHBORS = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0),
+                  (0, 0, -1), (0, 0, 1))
+
+
+def _flood_fill_cell(seed_voxel, target, owner, cell_idx, nuclear_layers):
+    """BFS-grow a cell from ``seed_voxel`` until it reaches ``target``
+    voxels or all reachable neighbours are exhausted.
+
+    Returns
+    -------
+    voxels : list[tuple[int, int, int]]
+        All voxels assigned to this cell, including the seed.
+    nuclear_voxels : set[tuple[int, int, int]]
+        Subset that were assigned in the first ``nuclear_layers`` BFS
+        layers (seed + first ``nuclear_layers - 1`` neighbour rings).
+
+    Mutates ``owner`` in place.
+    """
+    nx, ny, nz = owner.shape
+    voxels: list[tuple[int, int, int]] = [seed_voxel]
+    nuclear_voxels: set[tuple[int, int, int]] = {seed_voxel}
+    owner[seed_voxel] = cell_idx
+    frontier = [seed_voxel]
+    layer = 1  # seed is layer 0
+    while len(voxels) < target and frontier:
+        next_frontier: list[tuple[int, int, int]] = []
+        for vx in frontier:
+            for dx, dy, dz in _SIX_NEIGHBORS:
+                nvx = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
+                if not (0 <= nvx[0] < nx and 0 <= nvx[1] < ny and 0 <= nvx[2] < nz):
+                    continue
+                if owner[nvx] != -1:
+                    continue
+                owner[nvx] = cell_idx
+                voxels.append(nvx)
+                if layer < nuclear_layers:
+                    nuclear_voxels.add(nvx)
+                next_frontier.append(nvx)
+                if len(voxels) >= target:
+                    break
+            if len(voxels) >= target:
+                break
+        layer += 1
+        frontier = next_frontier
+    return voxels, nuclear_voxels
+
+
 def make_synthetic_transcripts(
     n_cells: int = 8,
+    voxels_per_cell_mean: int = 100,
+    voxels_per_cell_jitter: float = 0.2,
     tx_per_cell: int = 25,
     n_genes: int = 12,
     n_types: int = 3,
-    cell_spacing_um: float = 50.0,
-    cell_radius_um: float = 3.0,
-    z_range_um: tuple[float, float] = (0.0, 5.0),
+    voxel_size_um: float = 1.0,
+    domain_z_um: float = 10.0,
+    nuclear_layers: int = 2,
+    section_z_range_um: tuple[float, float] | None = None,
     cross_type_noise_pct: float = 0.20,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Build a transcript-level DataFrame with planted cell structure.
+    """Build a transcript-level DataFrame with voxel-grid cell shapes.
 
-    Layout: cells on a ``ceil(sqrt(n_cells)) × ceil(sqrt(n_cells))`` xy
-    grid at ``cell_spacing_um`` µm pitch. Each cell is assigned one of
-    ``n_types`` archetype types (cycling); each type has its own
-    archetype gene panel of ``n_genes / n_types`` genes. ``tx_per_cell``
-    transcripts per cell are sampled — ``(1 - cross_type_noise_pct)``
-    from the archetype panel, rest from any other gene.
+    Layout
+    ------
+    The 3D domain is gridded at ``voxel_size_um`` (default 1 µm).
+    ``n_cells`` seed voxels are placed uniformly at random; each cell
+    is grown by 6-connected BFS flood-fill until it reaches its target
+    voxel count (drawn uniformly from
+    ``[voxels_per_cell_mean × (1 ± voxels_per_cell_jitter)]``). Voxels
+    are exclusively owned — adjacent cells touch face-to-face but
+    never share a voxel.
+
+    The first ``nuclear_layers`` BFS layers (seed + immediate ring +
+    next ring at ``nuclear_layers=2``) are tagged as **nuclear**;
+    transcripts from those voxels get ``is_nuclear=True``.
+
+    xy domain auto-sized to fit cells with ~30 % slack:
+    ``domain_xy_um = sqrt(n_cells × voxels_per_cell_mean × 1.3 / nz)``.
+
+    Transcripts are placed at uniformly-random positions within their
+    owning voxel (NOT snapped to bin centers).
+
+    Each cell is assigned a type ``c % n_types``; ``tx_per_cell``
+    transcripts are sampled, each gene drawn from the cell's archetype
+    panel (``1 − cross_type_noise_pct`` weight) or a cross-type
+    noise gene.
+
+    Section extraction
+    ------------------
+    If ``section_z_range_um=(z_lo, z_hi)`` is set, transcripts with
+    ``z`` outside that interval are dropped. Cells partially in the
+    section keep their visible transcripts under the original
+    ``cell_id``. The section boundary is independent of voxel
+    boundaries.
 
     Returns
     -------
     df : pd.DataFrame
         Columns ``transcript_id`` (str), ``feature_name`` (str),
-        ``cell_id`` (str — ground truth), ``x``, ``y``, ``z`` (float32).
-        ``feature_name`` is named ``"gene_00"``, ``"gene_01"``, etc.
+        ``cell_id`` (str — ground truth), ``x``, ``y``, ``z`` (float32),
+        ``is_nuclear`` (bool).
 
     ground_truth : dict
-        ``n_cells`` (int)
-        ``n_types`` (int)
-        ``cell_centers`` (list[(x, y)])
-        ``cell_to_type`` (dict[str_cell_id -> int])
-        ``type_to_genes`` (dict[int -> list[str_gene_name]])
-        ``gene_to_type`` (dict[str_gene_name -> int])
+        ``n_cells, n_types, voxel_size_um, domain_xy_um, domain_z_um,
+        section_z_range_um, n_clipped_cells``,
+        ``cell_to_type: dict[str -> int]``,
+        ``type_to_genes: dict[int -> list[str]]``,
+        ``gene_to_type: dict[str -> int]``,
+        ``n_voxels_per_cell: dict[str -> int]``,
+        ``n_nuclear_voxels_per_cell: dict[str -> int]``,
+        ``cell_centers: list[(x, y, z)]`` (centroid of voxel set in µm).
     """
     rng = np.random.default_rng(seed)
 
@@ -164,51 +242,153 @@ def make_synthetic_transcripts(
     }
     gene_to_type = {g: t for t, gs in type_to_genes.items() for g in gs}
 
-    # Layout: roughly square grid
-    grid_n = int(np.ceil(np.sqrt(n_cells)))
-    cell_centers: list[tuple[float, float]] = []
-    cell_to_type: dict[str, int] = {}
+    # 1. Domain dimensions — 2× slack so seeds are spaced out and
+    # round-robin flood-fill rarely boxes anyone in.
+    nz = max(1, int(round(domain_z_um / voxel_size_um)))
+    target_volume = n_cells * voxels_per_cell_mean * 2.0
+    n_xy = max(2, int(np.ceil(np.sqrt(target_volume / nz))))
+    nx = ny = n_xy
+    domain_xy_um = nx * voxel_size_um
+
+    if nx * ny * nz < n_cells:
+        raise ValueError(
+            f"Domain ({nx}×{ny}×{nz}) too small for {n_cells} cell seeds; "
+            "raise voxels_per_cell_mean or domain_z_um."
+        )
+
+    # 2. Ownership grid (-1 = unowned)
+    owner = np.full((nx, ny, nz), -1, dtype=np.int32)
+
+    # 3. Seed cells
+    flat_idxs = rng.choice(nx * ny * nz, size=n_cells, replace=False)
+    seeds = [tuple(int(c) for c in np.unravel_index(i, (nx, ny, nz)))
+             for i in flat_idxs]
+
+    # 4. Flood-fill each cell to its target size
+    lo = max(1, int(voxels_per_cell_mean * (1 - voxels_per_cell_jitter)))
+    hi = max(lo + 1, int(voxels_per_cell_mean * (1 + voxels_per_cell_jitter)) + 1)
+    targets = rng.integers(lo, hi, size=n_cells)
+
+    # Round-robin BFS: each cell expands one layer per round, so no
+    # single cell hogs the volume. Boxed-in seeds still fail to grow,
+    # but the round-robin ensures fairness vs sequential greedy.
+    cell_voxels: list[list[tuple[int, int, int]]] = [[s] for s in seeds]
+    cell_nuclear_voxels: list[set[tuple[int, int, int]]] = [{s} for s in seeds]
+    cell_frontier: list[list[tuple[int, int, int]]] = [[s] for s in seeds]
+    for c, s in enumerate(seeds):
+        owner[s] = c
+    cell_layer = [1] * n_cells
+
+    while True:
+        progress = False
+        for c in range(n_cells):
+            if len(cell_voxels[c]) >= targets[c]:
+                continue
+            if not cell_frontier[c]:
+                continue
+            next_frontier: list[tuple[int, int, int]] = []
+            for vx in cell_frontier[c]:
+                for dx, dy, dz in _SIX_NEIGHBORS:
+                    nvx = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
+                    if not (0 <= nvx[0] < nx and 0 <= nvx[1] < ny and 0 <= nvx[2] < nz):
+                        continue
+                    if owner[nvx] != -1:
+                        continue
+                    owner[nvx] = c
+                    cell_voxels[c].append(nvx)
+                    if cell_layer[c] < nuclear_layers:
+                        cell_nuclear_voxels[c].add(nvx)
+                    next_frontier.append(nvx)
+                    progress = True
+                    if len(cell_voxels[c]) >= targets[c]:
+                        break
+                if len(cell_voxels[c]) >= targets[c]:
+                    break
+            cell_layer[c] += 1
+            cell_frontier[c] = next_frontier
+        if not progress:
+            break
+
+    # 5. Place transcripts
     rows = []
     tx_id = 0
+    cell_centers: list[tuple[float, float, float]] = []
+    cell_to_type: dict[str, int] = {}
+    n_voxels_per_cell: dict[str, int] = {}
+    n_nuclear_voxels_per_cell: dict[str, int] = {}
+
     for c in range(n_cells):
-        gx, gy = c % grid_n, c // grid_n
-        cx = (gx + 0.5) * cell_spacing_um
-        cy = (gy + 0.5) * cell_spacing_um
-        cell_centers.append((cx, cy))
+        voxels = cell_voxels[c]
+        nuclear = cell_nuclear_voxels[c]
+        if not voxels:
+            continue
         ctype = c % n_types
         cell_to_type[str(c)] = ctype
+        n_voxels_per_cell[str(c)] = len(voxels)
+        n_nuclear_voxels_per_cell[str(c)] = len(nuclear)
+        # Centroid (µm)
+        arr = np.asarray(voxels, dtype=np.float64)
+        cx = float((arr[:, 0].mean() + 0.5) * voxel_size_um)
+        cy = float((arr[:, 1].mean() + 0.5) * voxel_size_um)
+        cz = float((arr[:, 2].mean() + 0.5) * voxel_size_um)
+        cell_centers.append((cx, cy, cz))
 
         archetype_genes = type_to_genes[ctype]
         other_genes = [g for g in gene_names if g not in archetype_genes]
 
         for _ in range(tx_per_cell):
-            # Gene draw
+            voxel = voxels[int(rng.integers(len(voxels)))]
+            x = (voxel[0] + rng.random()) * voxel_size_um
+            y = (voxel[1] + rng.random()) * voxel_size_um
+            z = (voxel[2] + rng.random()) * voxel_size_um
             if rng.random() < cross_type_noise_pct:
                 gene = other_genes[int(rng.integers(len(other_genes)))]
             else:
                 gene = archetype_genes[int(rng.integers(len(archetype_genes)))]
-            # Coord draw within cell radius
-            r = rng.uniform(0, cell_radius_um)
-            theta = rng.uniform(0, 2 * np.pi)
-            x = cx + r * np.cos(theta)
-            y = cy + r * np.sin(theta)
-            z = rng.uniform(*z_range_um)
-            rows.append((str(tx_id), gene, str(c), float(x), float(y), float(z)))
+            is_nuc = voxel in nuclear
+            rows.append((
+                str(tx_id), gene, str(c),
+                float(x), float(y), float(z), bool(is_nuc),
+            ))
             tx_id += 1
 
     df = pd.DataFrame(
         rows,
-        columns=["transcript_id", "feature_name", "cell_id", "x", "y", "z"],
+        columns=["transcript_id", "feature_name", "cell_id",
+                 "x", "y", "z", "is_nuclear"],
     )
     df = df.astype({"x": np.float32, "y": np.float32, "z": np.float32})
+
+    # 6. Optional tissue-section extraction (independent of voxel grid)
+    n_clipped_cells = 0
+    if section_z_range_um is not None:
+        z_lo, z_hi = section_z_range_um
+        cells_before = set(df["cell_id"].astype(str))
+        df = df[(df["z"] >= z_lo) & (df["z"] < z_hi)].reset_index(drop=True)
+        cells_after = set(df["cell_id"].astype(str))
+        # Cells whose tx are partially clipped: present in both, but
+        # in cells_after with fewer rows. Approximate: count cells
+        # entirely lost vs partially lost.
+        for cid in cells_before:
+            n_full = sum(1 for c in range(n_cells) if str(c) == cid) * tx_per_cell
+            n_remaining = int((df["cell_id"].astype(str) == cid).sum())
+            if 0 < n_remaining < n_full:
+                n_clipped_cells += 1
 
     ground_truth: dict[str, Any] = {
         "n_cells": n_cells,
         "n_types": n_types,
+        "voxel_size_um": voxel_size_um,
+        "domain_xy_um": domain_xy_um,
+        "domain_z_um": domain_z_um,
+        "section_z_range_um": section_z_range_um,
+        "n_clipped_cells": n_clipped_cells,
         "cell_centers": cell_centers,
         "cell_to_type": cell_to_type,
         "type_to_genes": type_to_genes,
         "gene_to_type": gene_to_type,
+        "n_voxels_per_cell": n_voxels_per_cell,
+        "n_nuclear_voxels_per_cell": n_nuclear_voxels_per_cell,
     }
     return df, ground_truth
 
