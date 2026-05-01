@@ -22,6 +22,13 @@ sectioned tissue. Those are modeled independently below, so easy
 mode is a true ceiling and the ARI gap between modes is cleanly
 attributable to segmentation + sectioning.
 
+The table reports **input ARI** (the upstream segmentation's quality
+vs ground truth) alongside **output ARI** (TRACER's quality vs
+ground truth). The delta is TRACER's value-add over the upstream
+segmenter — the metric we ultimately care about. In easy mode input
+ARI is trivially 1.0 (input is truth); in realistic mode it
+reflects the DAPI/Voronoi simulator's output.
+
 - **full-volume + ground-truth** — easy mode (true ceiling). The
   10 µm voxel-grid synthetic domain with 8 intact cells, fed through
   TRACER with the *ground-truth* `cell_id` as input. With no decoding
@@ -50,12 +57,12 @@ maintainer's, not CI's.
 
 ---
 
-## 2026-05-01 — optimization/core-refactor @ 2c91b62
+## 2026-05-01 — optimization/core-refactor @ 44b8994
 
-| scenario | ARI | AMI | coverage | n_ent | runtime |
-|---|---|---|---|---|---|
-| full-volume + ground-truth | 1.000 | 1.000 | 100.0% | 8 | 0.02s |
-| section + DAPI/Voronoi | 0.670 | 0.796 | 98.9% | 3 | 0.02s |
+| scenario | input ARI | output ARI | output AMI | coverage | n_ent | runtime |
+|---|---|---|---|---|---|---|
+| full-volume + ground-truth | 1.000 | 1.000 | 1.000 | 100.0% | 8 | 0.02s |
+| section + DAPI/Voronoi | 0.333 | 0.670 | 0.796 | 98.9% | 3 | 0.02s |
 
 <details>
 <summary>Per-stage progression</summary>

@@ -38,6 +38,7 @@ _SRC = _PROJECT_ROOT / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+import numpy as np
 import pandas as pd
 from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
 
@@ -86,6 +87,18 @@ def _git_describe() -> tuple[str, str]:
         return "unknown", "unknown"
 
 
+def _ari_ami_vs_truth(labels: np.ndarray, truth: np.ndarray
+                      ) -> tuple[float, float]:
+    """ARI/AMI on the subset where both labels and truth are assigned."""
+    mask = (labels != "-1") & (truth != "-1")
+    if mask.sum() < 2:
+        return float("nan"), float("nan")
+    return (
+        float(adjusted_rand_score(truth[mask], labels[mask])),
+        float(adjusted_mutual_info_score(truth[mask], labels[mask])),
+    )
+
+
 def _measure(scenario: str, df: pd.DataFrame,
              panel: pd.DataFrame) -> dict[str, Any]:
     """Run the segmented pipeline and compute recovery metrics vs the
@@ -97,6 +110,11 @@ def _measure(scenario: str, df: pd.DataFrame,
     :func:`simulate_dapi_voronoi_segmentation`. For the easy-mode
     scenario the caller copies ``cell_id`` (which already equals
     truth) into ``cell_id_truth`` before calling.
+
+    We report ARI/AMI for **both** the input partition (the
+    upstream segmentation that TRACER receives) and the output
+    partition (TRACER's stitched labels), each vs ground truth. The
+    delta is TRACER's value-add over the upstream segmenter.
     """
     if "cell_id_truth" not in df.columns:
         raise ValueError(
@@ -105,6 +123,11 @@ def _measure(scenario: str, df: pd.DataFrame,
             "ground truth."
         )
     truth = df["cell_id_truth"].astype(str).to_numpy()
+    inp = df["cell_id"].astype(str).to_numpy()
+
+    # Input quality — how good is the segmentation we feed TRACER?
+    input_ari, input_ami = _ari_ami_vs_truth(inp, truth)
+
     t0 = time.time()
     # Pipeline emits diagnostic prints; swallow them so the benchmark's
     # markdown output is the only thing on stdout.
@@ -113,20 +136,17 @@ def _measure(scenario: str, df: pd.DataFrame,
     dt = time.time() - t0
 
     out = df_out["stitched"].astype(str).to_numpy()
-    mask = (out != "-1") & (truth != "-1")
-    if mask.sum() >= 2:
-        ari = float(adjusted_rand_score(truth[mask], out[mask]))
-        ami = float(adjusted_mutual_info_score(truth[mask], out[mask]))
-    else:
-        ari = ami = float("nan")
+    output_ari, output_ami = _ari_ami_vs_truth(out, truth)
     coverage = float((out != "-1").mean())
     s_assigned = pd.Series(out)[pd.Series(out) != "-1"]
     n_ent = int(s_assigned.nunique())
 
     return {
         "scenario": scenario,
-        "ari": ari,
-        "ami": ami,
+        "input_ari": input_ari,
+        "input_ami": input_ami,
+        "ari": output_ari,
+        "ami": output_ami,
         "coverage": coverage,
         "n_ent": n_ent,
         "runtime": dt,
@@ -138,14 +158,17 @@ def _format_block(results: list[dict[str, Any]]) -> str:
     branch, sha = _git_describe()
     today = datetime.date.today().isoformat()
 
+    def _fmt(v: float) -> str:
+        return "n/a" if v != v else f"{v:.3f}"
+
     lines = [f"## {today} — {branch} @ {sha}", ""]
-    lines.append("| scenario | ARI | AMI | coverage | n_ent | runtime |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| scenario | input ARI | output ARI | output AMI | "
+                 "coverage | n_ent | runtime |")
+    lines.append("|---|---|---|---|---|---|---|")
     for r in results:
-        ari = "n/a" if r["ari"] != r["ari"] else f"{r['ari']:.3f}"
-        ami = "n/a" if r["ami"] != r["ami"] else f"{r['ami']:.3f}"
         lines.append(
-            f"| {r['scenario']} | {ari} | {ami} | "
+            f"| {r['scenario']} | {_fmt(r['input_ari'])} | "
+            f"{_fmt(r['ari'])} | {_fmt(r['ami'])} | "
             f"{100 * r['coverage']:.1f}% | {r['n_ent']} | "
             f"{r['runtime']:.2f}s |"
         )
