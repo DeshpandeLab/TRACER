@@ -151,7 +151,8 @@ def main() -> None:
     # Scenario 1: easy mode — full volume + ground-truth segmentation
     df_full, gt_full = make_synthetic_transcripts(**CELLS_KW, seed=42)
     panel_full = make_synthetic_npmi_panel_for_transcripts(df_full, gt_full)
-    r1 = _measure("full-volume + GT", df_full, panel_full, truth_col="cell_id")
+    r1 = _measure("full-volume + ground-truth", df_full, panel_full,
+                  truth_col="cell_id")
 
     # Scenario 2: realistic mode — section + simulated DAPI/Voronoi
     df_sec, gt_sec = make_synthetic_transcripts(

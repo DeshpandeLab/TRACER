@@ -9,9 +9,10 @@ are appended in chronological order (newest at top). The benchmark is
 
 ## Two scenarios per entry
 
-- **full-volume + GT** — easy mode. The 10 µm voxel-grid synthetic
-  domain with 8 intact cells, fed through TRACER with ground-truth
-  `cell_id` as input. Should be ARI ≈ 1.0 in the limit; reality is
+- **full-volume + ground-truth** — easy mode. The 10 µm voxel-grid
+  synthetic domain with 8 intact cells, fed through TRACER with the
+  *ground-truth* `cell_id` as input (the true cell each transcript
+  was sampled from). Should be ARI ≈ 1.0 in the limit; reality is
   lower because the pipeline still over- or under-merges on dense
   same-type tissue.
 - **section + DAPI/Voronoi** — realistic mode. The middle 5 µm slab is
@@ -40,13 +41,13 @@ maintainer's, not CI's.
 
 | scenario | ARI | AMI | coverage | n_ent | runtime |
 |---|---|---|---|---|---|
-| full-volume + GT | 0.634 | 0.701 | 99.5% | 8 | 0.03s |
+| full-volume + ground-truth | 0.634 | 0.701 | 99.5% | 8 | 0.03s |
 | section + DAPI/Voronoi | 0.383 | 0.480 | 95.5% | 5 | 0.02s |
 
 <details>
 <summary>Per-stage progression</summary>
 
-**full-volume + GT**
+**full-volume + ground-truth**
 
 | stage | n_cells | n_partials | n_components | n_unassigned_tx |
 |---|---|---|---|---|
