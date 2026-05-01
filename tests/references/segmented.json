@@ -1,11 +1,11 @@
 {
-  "ami_vs_truth": 0.8014,
-  "ari_vs_truth": 0.7449,
-  "coverage_pct": 94.0,
+  "ami_vs_truth": 0.8006,
+  "ari_vs_truth": 0.7352,
+  "coverage_pct": 89.5,
   "n_cells": 8,
   "n_components": 0,
   "n_partials": 1,
-  "n_unassigned_tx": 12,
+  "n_unassigned_tx": 21,
   "stage_progression": [
     {
       "n_cells": 8,
@@ -24,28 +24,28 @@
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 13,
+      "n_partials": 35,
       "n_unassigned_tx": 12,
       "stage": "Split"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 13,
+      "n_partials": 35,
       "n_unassigned_tx": 3,
       "stage": "Initial Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 3,
-      "n_partials": 13,
+      "n_partials": 35,
       "n_unassigned_tx": 0,
       "stage": "Group"
     },
     {
       "n_cells": 8,
-      "n_components": 2,
-      "n_partials": 5,
+      "n_components": 3,
+      "n_partials": 15,
       "n_unassigned_tx": 0,
       "stage": "Stitch"
     },
@@ -53,14 +53,14 @@
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 1,
-      "n_unassigned_tx": 12,
+      "n_unassigned_tx": 28,
       "stage": "Demote"
     },
     {
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 1,
-      "n_unassigned_tx": 12,
+      "n_unassigned_tx": 21,
       "stage": "Final Rescue"
     }
   ]

@@ -67,7 +67,7 @@ def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,
                       coord_cols=("x", "y", "z")):
     return build_grid_graph_xyz(
         df_in, k=k, dist_threshold=dist_threshold, coord_cols=coord_cols,
-        G_xy=2.0, G_z=2.0, xy_neighborhood="8", z_neighborhood_depth=1,
+        G_xy=2.0, G_z=2.0, xy_neighborhood="8", z_neighborhood_depth=0,
         exact_distance_filter=False,
     )
 
@@ -145,6 +145,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
         penalize_simplicity=True, deltaC_min=0.0,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
+        G_z=1.0, z_neighbor_depth=1,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
@@ -217,6 +218,7 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         penalize_simplicity=True, deltaC_min=0.0,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
+        G_z=1.0, z_neighbor_depth=1,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
