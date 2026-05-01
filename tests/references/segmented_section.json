@@ -1,67 +1,67 @@
 {
-  "ami_vs_truth": 0.5994,
-  "ari_vs_truth": 0.5448,
-  "coverage_pct": 100.0,
-  "n_cells": 7,
+  "ami_vs_truth": 0.7879,
+  "ari_vs_truth": 0.7308,
+  "coverage_pct": 96.43,
+  "n_cells": 8,
   "n_clipped_cells": 7,
   "n_components": 0,
   "n_partials": 0,
-  "n_unassigned_tx": 0,
+  "n_unassigned_tx": 4,
   "stage_progression": [
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
       "n_partials": 0,
       "n_unassigned_tx": 0,
       "stage": "input"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
-      "n_partials": 5,
-      "n_unassigned_tx": 7,
+      "n_partials": 6,
+      "n_unassigned_tx": 6,
       "stage": "Prune"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
-      "n_partials": 5,
-      "n_unassigned_tx": 7,
+      "n_partials": 7,
+      "n_unassigned_tx": 6,
       "stage": "Split"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
-      "n_partials": 5,
-      "n_unassigned_tx": 1,
+      "n_partials": 7,
+      "n_unassigned_tx": 2,
       "stage": "Initial Rescue"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 1,
-      "n_partials": 5,
-      "n_unassigned_tx": 0,
+      "n_partials": 7,
+      "n_unassigned_tx": 1,
       "stage": "Group"
     },
     {
-      "n_cells": 7,
-      "n_components": 0,
-      "n_partials": 0,
-      "n_unassigned_tx": 0,
+      "n_cells": 8,
+      "n_components": 1,
+      "n_partials": 2,
+      "n_unassigned_tx": 1,
       "stage": "Stitch"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
       "n_partials": 0,
-      "n_unassigned_tx": 0,
+      "n_unassigned_tx": 4,
       "stage": "Demote"
     },
     {
-      "n_cells": 7,
+      "n_cells": 8,
       "n_components": 0,
       "n_partials": 0,
-      "n_unassigned_tx": 0,
+      "n_unassigned_tx": 4,
       "stage": "Final Rescue"
     }
   ]

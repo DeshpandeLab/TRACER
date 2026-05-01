@@ -1,5 +1,5 @@
 {
-  "ami_seg_vs_noseg": 0.5153,
-  "ari_seg_vs_noseg": 0.2336,
-  "n_assigned_in_both": 199
+  "ami_seg_vs_noseg": 0.7295,
+  "ari_seg_vs_noseg": 0.4757,
+  "n_assigned_in_both": 188
 }

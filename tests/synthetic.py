@@ -289,10 +289,13 @@ def make_synthetic_transcripts(
     }
     gene_to_type = {g: t for t, gs in type_to_genes.items() for g in gs}
 
-    # 1. Domain dimensions — 2× slack so seeds are spaced out and
-    # round-robin flood-fill rarely boxes anyone in.
+    # 1. Domain dimensions — 4× slack so seeds are well-spaced and
+    # round-robin flood-fill produces compact (more spherical) cells
+    # with multi-hop interior depth. At 2× slack the density was 44%
+    # and most cells ended up amoeboid with max BFS depth ≤ 1, which
+    # left no room for an interior nucleus.
     nz = max(1, int(round(domain_z_um / voxel_size_um)))
-    target_volume = n_cells * voxels_per_cell_mean * 2.0
+    target_volume = n_cells * voxels_per_cell_mean * 4.0
     n_xy = max(2, int(np.ceil(np.sqrt(target_volume / nz))))
     nx = ny = n_xy
     domain_xy_um = nx * voxel_size_um
@@ -389,8 +392,8 @@ def make_synthetic_transcripts(
             cell_nuclear_voxels.append(set())
             continue
         center_voxel = _deepest_voxel(voxels)
-        # BFS from center within cell's voxels for nuclear_layers rounds
         cell_voxel_set = set(voxels)
+        # BFS from center within the cell's voxels for nuclear_layers rounds.
         nuc: set[tuple[int, int, int]] = {center_voxel}
         frontier = [center_voxel]
         for _ in range(max(0, nuclear_layers - 1)):
