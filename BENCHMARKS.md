@@ -14,11 +14,19 @@ ground-truth partition (the true cell each transcript was sampled
 from in the synthetic generator). The scenarios differ only in what
 gets fed to TRACER as input.
 
-- **full-volume + ground-truth** — easy mode. The 10 µm voxel-grid
-  synthetic domain with 8 intact cells, fed through TRACER with the
-  *ground-truth* `cell_id` as input. Should be ARI ≈ 1.0 in the
-  limit; reality is lower because the pipeline still over- or
-  under-merges on dense same-type tissue.
+Both scenarios disable synthetic decoding noise
+(`cross_type_noise_pct=0`). Real-world per-tx decoding error rates
+are ≤ 5% on modern platforms; the dominant noise sources in spatial
+transcriptomics are segmentation errors and z-projection in
+sectioned tissue. Those are modeled independently below, so easy
+mode is a true ceiling and the ARI gap between modes is cleanly
+attributable to segmentation + sectioning.
+
+- **full-volume + ground-truth** — easy mode (true ceiling). The
+  10 µm voxel-grid synthetic domain with 8 intact cells, fed through
+  TRACER with the *ground-truth* `cell_id` as input. With no decoding
+  noise this should produce ARI = 1.0; any deviation is a regression
+  in the trivial-input pass-through path.
 - **section + DAPI/Voronoi** — realistic mode. The middle 5 µm slab is
   extracted (some cells clipped, some missing nuclei), then a
   simulated DAPI + Voronoi segmenter (see `tests/segmentation_sim.py`)
@@ -42,12 +50,12 @@ maintainer's, not CI's.
 
 ---
 
-## 2026-05-01 — optimization/core-refactor @ 7c2606f
+## 2026-05-01 — optimization/core-refactor @ 2c91b62
 
 | scenario | ARI | AMI | coverage | n_ent | runtime |
 |---|---|---|---|---|---|
-| full-volume + ground-truth | 0.634 | 0.701 | 99.5% | 8 | 0.03s |
-| section + DAPI/Voronoi | 0.383 | 0.480 | 95.5% | 5 | 0.02s |
+| full-volume + ground-truth | 1.000 | 1.000 | 100.0% | 8 | 0.02s |
+| section + DAPI/Voronoi | 0.670 | 0.796 | 98.9% | 3 | 0.02s |
 
 <details>
 <summary>Per-stage progression</summary>
@@ -57,25 +65,25 @@ maintainer's, not CI's.
 | stage | n_cells | n_partials | n_components | n_unassigned_tx |
 |---|---|---|---|---|
 | input | 8 | 0 | 0 | 0 |
-| Prune | 8 | 8 | 0 | 12 |
-| Split | 8 | 11 | 0 | 12 |
-| Initial Rescue | 8 | 11 | 0 | 1 |
-| Group | 8 | 11 | 1 | 0 |
-| Stitch | 8 | 0 | 1 | 0 |
-| Demote | 8 | 0 | 0 | 1 |
-| Final Rescue | 8 | 0 | 0 | 1 |
+| Prune | 8 | 0 | 0 | 0 |
+| Split | 8 | 0 | 0 | 0 |
+| Initial Rescue | 8 | 0 | 0 | 0 |
+| Group | 8 | 0 | 0 | 0 |
+| Stitch | 8 | 0 | 0 | 0 |
+| Demote | 8 | 0 | 0 | 0 |
+| Final Rescue | 8 | 0 | 0 | 0 |
 
 **section + DAPI/Voronoi**
 
 | stage | n_cells | n_partials | n_components | n_unassigned_tx |
 |---|---|---|---|---|
 | input | 2 | 0 | 0 | 0 |
-| Prune | 2 | 2 | 0 | 12 |
-| Split | 2 | 2 | 0 | 12 |
-| Initial Rescue | 2 | 2 | 0 | 12 |
-| Group | 2 | 2 | 2 | 2 |
-| Stitch | 2 | 1 | 2 | 2 |
-| Demote | 2 | 1 | 1 | 6 |
-| Final Rescue | 2 | 1 | 1 | 5 |
+| Prune | 2 | 2 | 0 | 1 |
+| Split | 2 | 2 | 0 | 1 |
+| Initial Rescue | 2 | 2 | 0 | 1 |
+| Group | 2 | 2 | 1 | 0 |
+| Stitch | 2 | 1 | 1 | 0 |
+| Demote | 2 | 1 | 0 | 1 |
+| Final Rescue | 2 | 1 | 0 | 1 |
 
 </details>

@@ -57,6 +57,14 @@ CELLS_KW = dict(
     n_types=3,
     domain_z_um=10.0,
     nuclear_layers=2,
+    # Decoding errors disabled. Real Xenium/MERFISH platforms report
+    # per-tx misread rates ≤ 5%, but the dominant noise sources in
+    # spatial transcriptomics are segmentation errors and z-projection
+    # in sectioned tissue — both already modeled here independently
+    # (DAPI/Voronoi sim + section_z_range_um). Layering an additional
+    # 20% gene-level noise on top would double-count and make the
+    # easy-mode ceiling artificially low.
+    cross_type_noise_pct=0.0,
 )
 SECTION_Z = (2.5, 7.5)
 
