@@ -42,11 +42,13 @@ contribution to upstream-segmenter degradation:
   (no DAPI threshold), and tx are reassigned to the nearest seed in
   xy only. Isolates the cost of z-blind 2D segmentation on a 3D
   tissue section, holding cell-count constant.
-- **section + DAPI/Voronoi** — adds **DAPI threshold**. The realistic
-  scenario. Cells with fewer than 3 nuclear tx in the section lose
-  their Voronoi seed, and their tx get absorbed into the nearest
-  DAPI-positive neighbor. The simulator lives in
-  ``tests/segmentation_sim.py``.
+- **section + DAPI/Voronoi** — adds **DAPI threshold + 5 µm extent
+  cap**. The realistic scenario. Cells with fewer than 3 nuclear tx
+  in the section lose their Voronoi seed; tx farther than 5 µm from
+  any DAPI centroid are left unassigned (mirroring Xenium's
+  fallback rule that cells don't extend more than ~5 µm beyond their
+  nucleus when membrane stain is unavailable). The simulator lives
+  in ``tests/segmentation_sim.py``.
 
 Per-row deltas (using the last entry below as illustration):
 
@@ -77,14 +79,14 @@ maintainer's, not CI's.
 
 ---
 
-## 2026-05-01 — optimization/core-refactor @ 7a0e8ce
+## 2026-05-01 — optimization/core-refactor @ 0834966
 
 | scenario | input ARI | output ARI | output AMI | coverage | n_ent | runtime |
 |---|---|---|---|---|---|---|
 | full-volume + ground-truth | 1.000 | 1.000 | 1.000 | 100.0% | 8 | 0.02s |
 | section + ground-truth | 1.000 | 1.000 | 1.000 | 100.0% | 7 | 0.01s |
 | section + Voronoi (perfect DAPI) | 0.663 | 0.687 | 0.741 | 98.9% | 7 | 0.02s |
-| section + DAPI/Voronoi | 0.333 | 0.673 | 0.801 | 98.9% | 3 | 0.02s |
+| section + DAPI/Voronoi | 0.552 | 0.673 | 0.801 | 98.9% | 3 | 0.02s |
 
 <details>
 <summary>Per-stage progression</summary>
@@ -132,13 +134,13 @@ maintainer's, not CI's.
 
 | stage | n_cells | n_partials | n_components | n_unassigned_tx |
 |---|---|---|---|---|
-| input | 2 | 0 | 0 | 0 |
-| Prune | 2 | 2 | 0 | 1 |
-| Split | 2 | 2 | 0 | 1 |
-| Initial Rescue | 2 | 2 | 0 | 1 |
-| Group | 2 | 2 | 1 | 0 |
-| Stitch | 2 | 1 | 1 | 0 |
-| Demote | 2 | 1 | 0 | 1 |
-| Final Rescue | 2 | 1 | 0 | 1 |
+| input | 3 | 0 | 0 | 0 |
+| Prune | 3 | 3 | 0 | 0 |
+| Split | 3 | 4 | 0 | 0 |
+| Initial Rescue | 3 | 4 | 0 | 0 |
+| Group | 3 | 4 | 0 | 0 |
+| Stitch | 3 | 1 | 0 | 0 |
+| Demote | 3 | 0 | 0 | 1 |
+| Final Rescue | 3 | 0 | 0 | 1 |
 
 </details>
