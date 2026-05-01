@@ -273,11 +273,9 @@ def make_synthetic_transcripts(
     # single cell hogs the volume. Boxed-in seeds still fail to grow,
     # but the round-robin ensures fairness vs sequential greedy.
     cell_voxels: list[list[tuple[int, int, int]]] = [[s] for s in seeds]
-    cell_nuclear_voxels: list[set[tuple[int, int, int]]] = [{s} for s in seeds]
     cell_frontier: list[list[tuple[int, int, int]]] = [[s] for s in seeds]
     for c, s in enumerate(seeds):
         owner[s] = c
-    cell_layer = [1] * n_cells
 
     while True:
         progress = False
@@ -296,18 +294,53 @@ def make_synthetic_transcripts(
                         continue
                     owner[nvx] = c
                     cell_voxels[c].append(nvx)
-                    if cell_layer[c] < nuclear_layers:
-                        cell_nuclear_voxels[c].add(nvx)
                     next_frontier.append(nvx)
                     progress = True
                     if len(cell_voxels[c]) >= targets[c]:
                         break
                 if len(cell_voxels[c]) >= targets[c]:
                     break
-            cell_layer[c] += 1
             cell_frontier[c] = next_frontier
         if not progress:
             break
+
+    # 4b. Re-center the nucleus to the cell's geometric centroid. The
+    # seed-based assignment in the BFS above places the nucleus wherever
+    # the seed voxel happened to land — often near the cell boundary if
+    # the cell grew preferentially in one direction. Biologically the
+    # nucleus sits near the cell center, so we relocate it post-hoc:
+    #   1. Compute the cell's centroid in voxel space.
+    #   2. Find the cell voxel closest to the centroid (the "anatomical
+    #      center").
+    #   3. BFS from that center *within the cell's voxel set* for
+    #      ``nuclear_layers`` rounds — those voxels become the nucleus.
+    cell_nuclear_voxels: list[set[tuple[int, int, int]]] = []
+    for c in range(n_cells):
+        voxels = cell_voxels[c]
+        if not voxels:
+            cell_nuclear_voxels.append(set())
+            continue
+        arr = np.asarray(voxels, dtype=np.float64)
+        centroid = arr.mean(axis=0)
+        # Closest cell voxel to centroid
+        d2 = ((arr - centroid) ** 2).sum(axis=1)
+        center_voxel = voxels[int(d2.argmin())]
+        # BFS from center within cell's voxels for nuclear_layers rounds
+        cell_voxel_set = set(voxels)
+        nuc: set[tuple[int, int, int]] = {center_voxel}
+        frontier = [center_voxel]
+        for _ in range(max(0, nuclear_layers - 1)):
+            next_f: list[tuple[int, int, int]] = []
+            for vx in frontier:
+                for dx, dy, dz in _SIX_NEIGHBORS:
+                    nvx = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
+                    if nvx in cell_voxel_set and nvx not in nuc:
+                        nuc.add(nvx)
+                        next_f.append(nvx)
+            if not next_f:
+                break
+            frontier = next_f
+        cell_nuclear_voxels.append(nuc)
 
     # 5. Place transcripts
     rows = []
