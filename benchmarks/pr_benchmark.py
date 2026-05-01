@@ -202,17 +202,26 @@ def main() -> None:
     panel_full = make_synthetic_npmi_panel_for_transcripts(df_full, gt_full)
     r1 = _measure("full-volume + ground-truth", df_full, panel_full)
 
-    # Scenario 2: realistic mode — section + simulated DAPI/Voronoi.
-    # The sim overwrites cell_id with noisy labels and preserves the
-    # original ground truth in cell_id_truth automatically.
+    # Scenario 2: section with ground-truth segmentation. Isolates the
+    # effect of sectioning alone (clipped cells, lost cells) without
+    # segmentation noise on top. Useful as a "section ceiling": the
+    # best TRACER can do on this slab given a perfect upstream
+    # segmenter.
     df_sec, gt_sec = make_synthetic_transcripts(
         **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
     )
     panel_sec = make_synthetic_npmi_panel_for_transcripts(df_sec, gt_sec)
-    df_sec_seg = simulate_dapi_voronoi_segmentation(df_sec)
-    r2 = _measure("section + DAPI/Voronoi", df_sec_seg, panel_sec)
+    df_sec_gt = df_sec.copy()
+    df_sec_gt["cell_id_truth"] = df_sec_gt["cell_id"].astype(str)
+    r2 = _measure("section + ground-truth", df_sec_gt, panel_sec)
 
-    print(_format_block([r1, r2]))
+    # Scenario 3: realistic mode — section + simulated DAPI/Voronoi.
+    # The sim overwrites cell_id with noisy labels and preserves the
+    # original ground truth in cell_id_truth automatically.
+    df_sec_seg = simulate_dapi_voronoi_segmentation(df_sec)
+    r3 = _measure("section + DAPI/Voronoi", df_sec_seg, panel_sec)
+
+    print(_format_block([r1, r2, r3]))
 
 
 if __name__ == "__main__":
