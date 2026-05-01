@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 from ._repro import _ensure_reproducibility_seed
 from ._utils import relu_symmetric
-from .graph import bin_xy, delaunay_edges, neighbor_bins
+from .graph import _BIN_BIAS, bin_xy, delaunay_edges, neighbor_bins, unpack_bin
 
 
 # ---------- Phase 4: Hierarchical Stitching ----------
@@ -478,6 +478,8 @@ def stitch_entities_hierarchical(
     candidate_source: str = "delaunay",
     G: float | None = None,
     stitch_neighborhood: str = "8",
+    G_z: float | None = None,
+    z_neighbor_depth: int = 0,
     transcript_coords: np.ndarray | None = None,
     transcript_entity_codes: np.ndarray | None = None,
     # Deprecated kwargs — translated to mode/threshold below.
@@ -630,9 +632,15 @@ def stitch_entities_hierarchical(
     else:  # candidate_source == "grid"
         if G is None:
             raise ValueError("G must be provided when candidate_source='grid'")
-        if stitch_neighborhood not in ("4", "8"):
+        if stitch_neighborhood not in ("0", "4", "8"):
             raise ValueError(
-                f"stitch_neighborhood must be '4' or '8' (got {stitch_neighborhood!r})"
+                f"stitch_neighborhood must be '0', '4' or '8' (got {stitch_neighborhood!r})"
+            )
+        if z_neighbor_depth < 0:
+            raise ValueError(f"z_neighbor_depth must be ≥ 0 (got {z_neighbor_depth})")
+        if z_neighbor_depth > 0 and G_z is None:
+            raise ValueError(
+                "z_neighbor_depth > 0 requires G_z to be set"
             )
         if transcript_coords is None or transcript_entity_codes is None:
             raise ValueError(
@@ -647,44 +655,112 @@ def stitch_entities_hierarchical(
 
         # Map transcripts to (bin_key, entity_idx). Skip transcripts whose
         # entity_idx is < 0 (e.g., DROP / unmapped labels).
-        bin_keys_all = bin_xy(transcript_coords[:, :2], G)
+        # Bin keys are either int64 (xy-only, packed) or (xy_int64, bz_int)
+        # tuples (xyz). Tuple keys cost a small dict-overhead penalty but
+        # the entity counts at stitch time are moderate.
         ec = np.asarray(transcript_entity_codes, dtype=np.int64)
         valid = ec >= 0
-        bin_keys = bin_keys_all[valid].tolist()
-        comp_codes = ec[valid].tolist()
+        xy_keys = bin_xy(transcript_coords[:, :2], G)[valid]
+        comp_codes = ec[valid]
+        if G_z is not None:
+            if transcript_coords.shape[1] < 3:
+                raise ValueError(
+                    "G_z requires transcript_coords to have a z column"
+                )
+            bz_arr = np.floor(
+                transcript_coords[valid, 2] / float(G_z)
+            ).astype(np.int64)
+            bin_keys = list(zip(xy_keys.tolist(), bz_arr.tolist()))
+        else:
+            bin_keys = xy_keys.tolist()
 
         bin_to_comps = defaultdict(set)
-        comp_to_bins = defaultdict(set)
-        for bk, c in zip(bin_keys, comp_codes):
+        for bk, c in zip(bin_keys, comp_codes.tolist()):
             bin_to_comps[bk].add(c)
-            comp_to_bins[c].add(bk)
 
-        # Initial candidate enumeration:
-        # - within-bin: all unordered pairs of distinct components
-        # - cross-bin (half-neighborhood): all (a, b) with a in bin, b in
-        #   half-neighbor bin, a != b. Half-neighborhood ensures every
-        #   unordered (bin_a, bin_b) pair is enumerated exactly once.
-        half_topology = "half-4" if stitch_neighborhood == "4" else "half-8"
+        # Half-neighborhood directions in xy. "0" → empty (same-bin pairs only).
+        if stitch_neighborhood == "0":
+            xy_half_offsets: tuple[tuple[int, int], ...] = ()
+        elif stitch_neighborhood == "4":
+            xy_half_offsets = ((0, 1), (1, 0))
+        else:  # "8"
+            xy_half_offsets = ((0, 1), (1, -1), (1, 0), (1, 1))
+
+        # z-offsets for the candidate-enumeration window. We use a half-
+        # window in z to avoid enumerating each unordered (bin_a, bin_b)
+        # pair twice: positive dz only, plus dz=0 for in-plane neighbors.
+        # For z_neighbor_depth=0, z is a "same-bin only" partition.
+        if G_z is None:
+            z_offsets_with_dz0: list[int] = [0]
+            z_offsets_strict_pos: list[int] = []
+        else:
+            z_offsets_with_dz0 = list(range(-z_neighbor_depth, z_neighbor_depth + 1))
+            z_offsets_strict_pos = list(range(1, z_neighbor_depth + 1))
+
         candidate_pairs: set[tuple[int, int]] = set()
         for bk, comps in bin_to_comps.items():
+            # within-bin: all unordered pairs of distinct components
             if len(comps) > 1:
-                comps_sorted = sorted(comps)
-                for a, b in itertools.combinations(comps_sorted, 2):
+                for a, b in itertools.combinations(sorted(comps), 2):
                     candidate_pairs.add((a, b))
-            for nb in neighbor_bins(bk, topology=half_topology):
-                nb_comps = bin_to_comps.get(nb)
-                if not nb_comps:
-                    continue
-                for a in comps:
-                    for b in nb_comps:
-                        if a != b:
-                            lo, hi = (a, b) if a < b else (b, a)
-                            candidate_pairs.add((lo, hi))
+
+            # Cross-bin: emit each unordered (bin_a, bin_b) exactly once.
+            # In the 2D path we use the "half" xy offsets at dz=0.
+            # In the 3D path we use:
+            #   - half xy offsets at every dz in [-depth..+depth]
+            #   - full xy (offset 0,0) at strictly-positive dz only
+            # so each unordered xy/z bin pair is enumerated once.
+            if G_z is None:
+                xy_packed = bk
+                bx, by = unpack_bin(xy_packed)
+                for dx, dy in xy_half_offsets:
+                    nb_xy_int = int(
+                        (np.int64(bx + dx + _BIN_BIAS) << np.int64(32))
+                        | np.int64(by + dy + _BIN_BIAS)
+                    )
+                    nb_comps = bin_to_comps.get(nb_xy_int)
+                    if not nb_comps:
+                        continue
+                    for a in comps:
+                        for b in nb_comps:
+                            if a != b:
+                                lo, hi = (a, b) if a < b else (b, a)
+                                candidate_pairs.add((lo, hi))
+            else:
+                xy_packed, bz = bk
+                bx, by = unpack_bin(xy_packed)
+                # (a) half xy offsets across all dz (incl. dz=0)
+                for dx, dy in xy_half_offsets:
+                    for dz in z_offsets_with_dz0:
+                        nb_xy_int = int(
+                        (np.int64(bx + dx + _BIN_BIAS) << np.int64(32))
+                        | np.int64(by + dy + _BIN_BIAS)
+                    )
+                        nb_key = (nb_xy_int, bz + dz)
+                        nb_comps = bin_to_comps.get(nb_key)
+                        if not nb_comps:
+                            continue
+                        for a in comps:
+                            for b in nb_comps:
+                                if a != b:
+                                    lo, hi = (a, b) if a < b else (b, a)
+                                    candidate_pairs.add((lo, hi))
+                # (b) same xy bin (dx=dy=0), strictly-positive dz
+                for dz in z_offsets_strict_pos:
+                    nb_key = (xy_packed, bz + dz)
+                    nb_comps = bin_to_comps.get(nb_key)
+                    if not nb_comps:
+                        continue
+                    for a in comps:
+                        for b in nb_comps:
+                            if a != b:
+                                lo, hi = (a, b) if a < b else (b, a)
+                                candidate_pairs.add((lo, hi))
 
         edges = list(candidate_pairs)
 
         # Indices are no longer needed after initial enumeration; release memory.
-        del bin_to_comps, comp_to_bins
+        del bin_to_comps
 
     # cluster metadata tracked at DSU roots
     dsu = DSU(N)
@@ -1082,6 +1158,8 @@ def apply_stitching_to_transcripts_memory_efficient(
     candidate_source: str = "delaunay",
     G: float | None = None,
     stitch_neighborhood: str = "8",
+    G_z: float | None = None,
+    z_neighbor_depth: int = 0,
     purity_threshold=_LEGACY_STITCH_KWARG_SENTINEL,
     tau=_LEGACY_STITCH_KWARG_SENTINEL,
     use_relu=_LEGACY_STITCH_KWARG_SENTINEL,
@@ -1173,7 +1251,14 @@ def apply_stitching_to_transcripts_memory_efficient(
             dtype=np.int64,
             count=len(ent_str),
         )
-        transcript_coords = df_final[[coord_cols[0], coord_cols[1]]].to_numpy(dtype=np.float64)
+        if G_z is not None and len(coord_cols) >= 3:
+            transcript_coords = df_final[
+                [coord_cols[0], coord_cols[1], coord_cols[2]]
+            ].to_numpy(dtype=np.float64)
+        else:
+            transcript_coords = df_final[
+                [coord_cols[0], coord_cols[1]]
+            ].to_numpy(dtype=np.float64)
 
     legacy_kwargs = {}
     if purity_threshold is not _LEGACY_STITCH_KWARG_SENTINEL:
@@ -1198,6 +1283,8 @@ def apply_stitching_to_transcripts_memory_efficient(
         candidate_source=candidate_source,
         G=G,
         stitch_neighborhood=stitch_neighborhood,
+        G_z=G_z,
+        z_neighbor_depth=z_neighbor_depth,
         transcript_coords=transcript_coords,
         transcript_entity_codes=transcript_entity_codes,
         **legacy_kwargs,
