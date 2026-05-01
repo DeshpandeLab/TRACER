@@ -33,6 +33,10 @@ import numpy as np
 import pandas as pd
 
 DAPI_MIN_NUCLEAR_TX = 3
+# Real Xenium's fallback expands a cell up to ~5 µm beyond its
+# nucleus when no membrane stain is available; tx farther than that
+# are left unassigned. We mirror that cap here.
+DEFAULT_MAX_DIST_FROM_NUCLEUS_UM = 5.0
 
 
 def simulate_voronoi_segmentation(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,6 +79,7 @@ def simulate_dapi_voronoi_segmentation(
     df: pd.DataFrame,
     *,
     dapi_min_tx: int = DAPI_MIN_NUCLEAR_TX,
+    max_dist_from_nucleus_um: float | None = DEFAULT_MAX_DIST_FROM_NUCLEUS_UM,
 ) -> pd.DataFrame:
     """Apply a simplified Xenium-style DAPI + Voronoi segmentation.
 
@@ -86,15 +91,22 @@ def simulate_dapi_voronoi_segmentation(
     dapi_min_tx : int, default 3
         Minimum nuclear-tx count for a cell to register a DAPI signal.
         Cells below this threshold are dropped from the segmentation.
+    max_dist_from_nucleus_um : float or None, default 5.0
+        Real Xenium's fallback rule: cells extend up to this distance
+        beyond their nucleus when no membrane stain is available; tx
+        farther than that are left unassigned. Pass ``None`` to disable
+        the cap (pure Voronoi tessellation, every tx assigned to nearest
+        DAPI cell regardless of distance).
 
     Returns
     -------
     df_segmented : pd.DataFrame
         Copy of ``df`` where ``cell_id`` is overwritten by the
         simulated segmentation. The original ground-truth cell_id is
-        preserved as ``cell_id_truth``. If no cell has enough nuclear
-        tx to register DAPI, every transcript becomes unassigned
-        (``cell_id == "-1"``).
+        preserved as ``cell_id_truth``. Tx whose nearest DAPI centroid
+        is further than ``max_dist_from_nucleus_um`` get
+        ``cell_id == "-1"``. If no cell has enough nuclear tx to
+        register DAPI, every transcript becomes unassigned.
     """
     df = df.copy()
     df["cell_id_truth"] = df["cell_id"].astype(str)
@@ -118,7 +130,15 @@ def simulate_dapi_voronoi_segmentation(
     # Pairwise xy distances; n_tx and n_centers are both small (~200, ~8)
     d2 = ((pts[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
     nearest = d2.argmin(axis=1)
-    df["cell_id"] = pd.Series(
-        [dapi_cells[i] for i in nearest], index=df.index, dtype=str,
-    )
+    assigned = np.array([dapi_cells[i] for i in nearest], dtype=object)
+
+    # 3. Apply Xenium-style "5 µm beyond nucleus" cap: tx farther than
+    # ``max_dist_from_nucleus_um`` from their nearest DAPI centroid are
+    # left unassigned (extracellular / orphaned).
+    if max_dist_from_nucleus_um is not None:
+        nearest_d = np.sqrt(d2[np.arange(len(pts)), nearest])
+        too_far = nearest_d > max_dist_from_nucleus_um
+        assigned[too_far] = "-1"
+
+    df["cell_id"] = pd.Series(assigned, index=df.index, dtype=str)
     return df
