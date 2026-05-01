@@ -46,7 +46,10 @@ from tests.synthetic import (
     make_synthetic_npmi_panel_for_transcripts,
     make_synthetic_transcripts,
 )
-from tests.segmentation_sim import simulate_dapi_voronoi_segmentation
+from tests.segmentation_sim import (
+    simulate_dapi_voronoi_segmentation,
+    simulate_voronoi_segmentation,
+)
 from tests._pipeline_runner import run_segmented_pipeline
 
 
@@ -89,8 +92,21 @@ def _git_describe() -> tuple[str, str]:
 
 def _ari_ami_vs_truth(labels: np.ndarray, truth: np.ndarray
                       ) -> tuple[float, float]:
-    """ARI/AMI on the subset where both labels and truth are assigned."""
-    mask = (labels != "-1") & (truth != "-1")
+    """ARI/AMI on **all surviving transcripts** in the scenario.
+
+    "Surviving" means the tx is present in ``df`` (i.e., it survived
+    sectioning if applicable). We do **not** drop tx where the
+    pipeline output is ``-1`` — instead, ``-1`` is treated as its own
+    cluster in the partition. This prevents the pipeline from
+    inflating ARI by aggressively demoting ambiguous tx: if it
+    demotes 10 tx that originally belonged to 5 different cells,
+    grouping them all under "-1" gets penalized.
+
+    The truth side never contains ``-1`` in our synthetic generator
+    (every planted tx has a real cell_id), but we keep the mask in
+    case a generator change introduces unassigned ground truth.
+    """
+    mask = truth != "-1"
     if mask.sum() < 2:
         return float("nan"), float("nan")
     return (
@@ -215,13 +231,21 @@ def main() -> None:
     df_sec_gt["cell_id_truth"] = df_sec_gt["cell_id"].astype(str)
     r2 = _measure("section + ground-truth", df_sec_gt, panel_sec)
 
-    # Scenario 3: realistic mode — section + simulated DAPI/Voronoi.
-    # The sim overwrites cell_id with noisy labels and preserves the
-    # original ground truth in cell_id_truth automatically.
-    df_sec_seg = simulate_dapi_voronoi_segmentation(df_sec)
-    r3 = _measure("section + DAPI/Voronoi", df_sec_seg, panel_sec)
+    # Scenario 3: section + perfect-DAPI Voronoi. Every surviving cell
+    # gets a Voronoi seed (no DAPI threshold), but tx are reassigned in
+    # xy only. Isolates the z-projection / xy-collapse error from the
+    # DAPI-loss error.
+    df_sec_vor = simulate_voronoi_segmentation(df_sec)
+    r3 = _measure("section + Voronoi (perfect DAPI)", df_sec_vor, panel_sec)
 
-    print(_format_block([r1, r2, r3]))
+    # Scenario 4: realistic mode — section + simulated DAPI/Voronoi.
+    # Adds the DAPI threshold on top of the xy-Voronoi assignment:
+    # cells with < dapi_min_tx nuclear tx lose their seed entirely, and
+    # their tx get absorbed into the nearest DAPI-positive neighbor.
+    df_sec_seg = simulate_dapi_voronoi_segmentation(df_sec)
+    r4 = _measure("section + DAPI/Voronoi", df_sec_seg, panel_sec)
+
+    print(_format_block([r1, r2, r3, r4]))
 
 
 if __name__ == "__main__":

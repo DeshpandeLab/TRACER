@@ -35,6 +35,42 @@ import pandas as pd
 DAPI_MIN_NUCLEAR_TX = 3
 
 
+def simulate_voronoi_segmentation(df: pd.DataFrame) -> pd.DataFrame:
+    """Voronoi-by-cell-centroid segmentation with **no DAPI threshold**.
+
+    Every ground-truth cell that has at least one transcript surviving
+    sectioning becomes a Voronoi seed (centroid = xy-mean of that cell's
+    surviving tx). All transcripts are then reassigned to the cell of
+    the nearest seed in xy. This isolates the **z-projection / xy-only
+    assignment error** from the DAPI-loss error: a tx in cell A at low
+    z can be reassigned to cell B if cell B's xy-centroid is closer,
+    even though their z values differ.
+
+    Use as an intermediate scenario between
+    ``section + ground-truth`` (no segmentation noise at all) and
+    ``simulate_dapi_voronoi_segmentation`` (also drops cells below the
+    DAPI threshold).
+    """
+    df = df.copy()
+    df["cell_id_truth"] = df["cell_id"].astype(str)
+    cells = sorted({c for c in df["cell_id_truth"] if c != "-1"})
+    if not cells:
+        df["cell_id"] = "-1"
+        return df
+
+    centers = np.array([
+        df.loc[df["cell_id_truth"] == c, ["x", "y"]].mean(axis=0).to_numpy()
+        for c in cells
+    ], dtype=np.float64)
+    pts = df[["x", "y"]].to_numpy(dtype=np.float64)
+    d2 = ((pts[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
+    nearest = d2.argmin(axis=1)
+    df["cell_id"] = pd.Series(
+        [cells[i] for i in nearest], index=df.index, dtype=str,
+    )
+    return df
+
+
 def simulate_dapi_voronoi_segmentation(
     df: pd.DataFrame,
     *,

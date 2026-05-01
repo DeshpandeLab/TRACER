@@ -7,7 +7,7 @@ the head commit of a branch before opening its pull request. Entries
 are appended in chronological order (newest at top). The benchmark is
 **not** part of CI — the numbers are advisory, not gating.
 
-## Three scenarios per entry
+## Four scenarios per entry, each adding one noise source
 
 In **all** scenarios, ARI and AMI are computed against the
 ground-truth partition (the true cell each transcript was sampled
@@ -25,28 +25,42 @@ vs ground truth) alongside **output ARI** (TRACER's quality vs
 ground truth). The delta is TRACER's value-add over the upstream
 segmenter — the metric we ultimately care about.
 
-The three scenarios cleanly decompose noise sources:
+Scenarios add noise sources cumulatively, culminating in the realistic
+last row. Row-to-row deltas in **input ARI** isolate each source's
+contribution to upstream-segmenter degradation:
 
-- **full-volume + ground-truth** — easy mode (true ceiling). The
-  10 µm voxel-grid synthetic domain with 8 intact cells, fed through
-  TRACER with the *ground-truth* `cell_id` as input. With no decoding
-  noise this should produce ARI = 1.0; any deviation is a regression
-  in the trivial-input pass-through path.
-- **section + ground-truth** — section ceiling. The middle 5 µm slab
-  is extracted (some cells clipped, some lost entirely), but the
-  *ground-truth* `cell_id` is still fed to TRACER. Isolates the
-  effect of sectioning alone — the upper bound for what TRACER can
-  produce given a perfect upstream segmenter on a sectioned input.
-- **section + DAPI/Voronoi** — realistic mode. The same slab as
-  above, but the input `cell_id` is replaced with a simulated
-  DAPI + Voronoi segmentation (see `tests/segmentation_sim.py`).
-  This is the metric we care about: how well TRACER **recovers**
-  truth from a noisy upstream segmenter on a sectioned input.
+- **full-volume + ground-truth** — baseline. 10 µm voxel-grid synthetic
+  domain with 8 intact cells, fed through TRACER with the
+  *ground-truth* `cell_id`. Sanity check; any deviation from ARI = 1.0
+  is a regression in the trivial pass-through path.
+- **section + ground-truth** — adds **sectioning**. The middle 5 µm
+  slab is extracted (some cells clipped, some lost), but the input
+  `cell_id` is still ground truth. Cells are now partial — exactly
+  the case TRACER's rescue/stitch logic targets.
+- **section + Voronoi (perfect DAPI)** — adds **xy-projection error**.
+  Every cell with at least one surviving tx becomes a Voronoi seed
+  (no DAPI threshold), and tx are reassigned to the nearest seed in
+  xy only. Isolates the cost of z-blind 2D segmentation on a 3D
+  tissue section, holding cell-count constant.
+- **section + DAPI/Voronoi** — adds **DAPI threshold**. The realistic
+  scenario. Cells with fewer than 3 nuclear tx in the section lose
+  their Voronoi seed, and their tx get absorbed into the nearest
+  DAPI-positive neighbor. The simulator lives in
+  ``tests/segmentation_sim.py``.
 
-The row-pair gap **(section + GT) − (section + DAPI/Voronoi)** isolates
-the cost of bad segmentation. The pair **(full-volume + GT) − (section
-+ GT)** isolates the cost of sectioning. Together they decompose
-where TRACER's recovery losses come from.
+Per-row deltas (using the last entry below as illustration):
+
+| transition | input-ARI delta | source isolated |
+|---|---|---|
+| (full GT) → (section GT) | 0.000 | sectioning alone |
+| (section GT) → (section Voronoi) | 0.337 | xy-projection error |
+| (section Voronoi) → (section DAPI/Voronoi) | 0.330 | DAPI seed loss |
+
+TRACER's per-row value-add (output ARI − input ARI) shows where its
+spatial + PMI logic recovers the most signal: the over-merged
+DAPI/Voronoi case, where mixed-archetype cells provide PMI hooks
+for splitting. Same-type Voronoi mis-assignments (row 3) are harder
+because PMI alone cannot distinguish cells of the same type.
 
 ## Workflow
 
@@ -63,13 +77,14 @@ maintainer's, not CI's.
 
 ---
 
-## 2026-05-01 — optimization/core-refactor @ fa52527
+## 2026-05-01 — optimization/core-refactor @ 7a0e8ce
 
 | scenario | input ARI | output ARI | output AMI | coverage | n_ent | runtime |
 |---|---|---|---|---|---|---|
 | full-volume + ground-truth | 1.000 | 1.000 | 1.000 | 100.0% | 8 | 0.02s |
 | section + ground-truth | 1.000 | 1.000 | 1.000 | 100.0% | 7 | 0.01s |
-| section + DAPI/Voronoi | 0.333 | 0.670 | 0.796 | 98.9% | 3 | 0.03s |
+| section + Voronoi (perfect DAPI) | 0.663 | 0.687 | 0.741 | 98.9% | 7 | 0.02s |
+| section + DAPI/Voronoi | 0.333 | 0.673 | 0.801 | 98.9% | 3 | 0.02s |
 
 <details>
 <summary>Per-stage progression</summary>
@@ -99,6 +114,19 @@ maintainer's, not CI's.
 | Stitch | 7 | 0 | 0 | 0 |
 | Demote | 7 | 0 | 0 | 0 |
 | Final Rescue | 7 | 0 | 0 | 0 |
+
+**section + Voronoi (perfect DAPI)**
+
+| stage | n_cells | n_partials | n_components | n_unassigned_tx |
+|---|---|---|---|---|
+| input | 7 | 0 | 0 | 0 |
+| Prune | 7 | 3 | 0 | 0 |
+| Split | 7 | 3 | 0 | 0 |
+| Initial Rescue | 7 | 3 | 0 | 0 |
+| Group | 7 | 3 | 0 | 0 |
+| Stitch | 7 | 1 | 0 | 0 |
+| Demote | 7 | 0 | 0 | 1 |
+| Final Rescue | 7 | 0 | 0 | 1 |
 
 **section + DAPI/Voronoi**
 
