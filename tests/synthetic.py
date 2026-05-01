@@ -173,6 +173,7 @@ def make_synthetic_transcripts(
     nuclear_layers: int = 2,
     section_z_range_um: tuple[float, float] | None = None,
     cross_type_noise_pct: float = 0.20,
+    enforce_inter_cell_gap: bool = False,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build a transcript-level DataFrame with voxel-grid cell shapes.
@@ -277,6 +278,18 @@ def make_synthetic_transcripts(
     for c, s in enumerate(seeds):
         owner[s] = c
 
+    def _has_other_cell_neighbor(nvx: tuple[int, int, int], c: int) -> bool:
+        """Return True if any 6-neighbor of ``nvx`` is owned by a cell
+        other than ``c``. Used to enforce a 1-voxel gap between cells."""
+        for ddx, ddy, ddz in _SIX_NEIGHBORS:
+            nbr = (nvx[0] + ddx, nvx[1] + ddy, nvx[2] + ddz)
+            if not (0 <= nbr[0] < nx and 0 <= nbr[1] < ny and 0 <= nbr[2] < nz):
+                continue
+            o = owner[nbr]
+            if o != -1 and o != c:
+                return True
+        return False
+
     while True:
         progress = False
         for c in range(n_cells):
@@ -291,6 +304,10 @@ def make_synthetic_transcripts(
                     if not (0 <= nvx[0] < nx and 0 <= nvx[1] < ny and 0 <= nvx[2] < nz):
                         continue
                     if owner[nvx] != -1:
+                        continue
+                    if enforce_inter_cell_gap and _has_other_cell_neighbor(nvx, c):
+                        # Skip — claiming this voxel would put us face-to-face
+                        # with a different cell. Leaves a 1-voxel buffer.
                         continue
                     owner[nvx] = c
                     cell_voxels[c].append(nvx)
