@@ -1,18 +1,27 @@
 """Smoke tests for the segmented + no-segmentation pipelines on synthetic
 transcripts.
 
-The synthetic input plants 8 cells in a 4x2 xy grid at 24 µm spacing,
-3 type archetypes (gene panels of 4 genes each), 25 tx per cell,
-80% archetype-coherent + 20% cross-type noise.
+The synthetic input plants 8 cells in a 3D voxel grid, 3 type archetypes
+(gene panels of 4 genes each), 25 tx per cell, 80% archetype-coherent +
+20% cross-type noise. Cells get amoeboid shapes via 6-connected flood-fill
+and partially overlap in xy (z separates them — biologically realistic
+dense tissue).
 
-Three test classes:
-- ``TestSegmentedWorkflow``: input ``cell_id`` set; runs Prune → Split
-  → Initial Rescue → Group → Stitch → Demote → Final Rescue.
-- ``TestNoSegWorkflow``: ``cell_id`` stripped to ``"-1"``; runs Group →
-  Stitch → Demote → Final Rescue. Includes a regression test for the
-  SHIELD_LABEL absorption bug (commit 6aa3f3e).
-- ``TestSegVsNoSegConsistency``: runs both pipelines on identical
-  synthetic input and asserts non-trivial cross-mode partition agreement.
+Two scenarios per workflow:
+- **FullVolume** (sanity baseline): all 8 cells intact in a 10 µm domain.
+  Easy mode — every cell has its full tx count and nucleus. Catches gross
+  regressions in the trivial path.
+- **Section** (primary stress test): the middle 5 µm slab is extracted,
+  yielding a mix of fully-contained cells and z-clipped partial cells.
+  This is the realistic scenario TRACER's rescue/stitch logic is built
+  for. Discriminating assertions (ARI, coverage, partial-vs-whole
+  recovery, no phantom cell) live here.
+
+Test classes:
+- ``TestSegmentedFullVolume`` / ``TestSegmentedSection``
+- ``TestNoSegFullVolume`` / ``TestNoSegSection``
+- ``TestSegVsNoSegConsistency``: cross-mode partition agreement on full
+  volume.
 """
 from __future__ import annotations
 
@@ -38,15 +47,30 @@ CELLS_KW = dict(
     domain_z_um=10.0,
     nuclear_layers=2,
 )
+TX_PER_CELL = CELLS_KW["tx_per_cell"]
 
-# Section-extraction sub-volume: middle 5 µm of the 10 µm domain.
+# Tissue-section sub-volume: middle 5 µm of the 10 µm domain.
 SECTION_Z = (2.5, 7.5)
 
 
+# ============================================================================
+# Fixtures
+# ============================================================================
+
 @pytest.fixture(scope="module")
 def synthetic_inputs():
-    """Built once per module: synthetic transcripts + matching PMI panel + ground truth."""
+    """Full 10 µm volume — every cell intact."""
     df, gt = make_synthetic_transcripts(**CELLS_KW, seed=42)
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    return df, panel, gt
+
+
+@pytest.fixture(scope="module")
+def section_inputs():
+    """5 µm slab extracted from the 10 µm volume — mix of whole + clipped cells."""
+    df, gt = make_synthetic_transcripts(
+        **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
+    )
     panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
     return df, panel, gt
 
@@ -65,6 +89,20 @@ def noseg_result(synthetic_inputs):
     return df_out, prog, gt
 
 
+@pytest.fixture(scope="module")
+def seg_section_result(section_inputs):
+    df, panel, gt = section_inputs
+    df_out, prog = run_segmented_pipeline(df, panel)
+    return df_out, prog, gt
+
+
+@pytest.fixture(scope="module")
+def noseg_section_result(section_inputs):
+    df, panel, gt = section_inputs
+    df_out, prog = run_noseg_pipeline(df, panel)
+    return df_out, prog, gt
+
+
 def _final_label_counts(df: pd.DataFrame, col: str) -> dict[str, int]:
     s = df[col].astype(str)
     n_tx_total = len(s)
@@ -73,40 +111,43 @@ def _final_label_counts(df: pd.DataFrame, col: str) -> dict[str, int]:
     return {"total": n_tx_total, "assigned": n_assigned, "unassigned": n_unas_tx}
 
 
+def _partition_by_clipping(df_in: pd.DataFrame) -> tuple[set[str], set[str]]:
+    """Return (well_preserved, heavily_clipped) cell-id sets, based on
+    how many of the planted ``TX_PER_CELL`` transcripts survived
+    sectioning.
+
+    - well-preserved: ≥ 80% of tx survived (cell is mostly inside the slab)
+    - heavily-clipped: ≤ 40% of tx survived (cell barely intersects)
+
+    Cells in the middle band are excluded from the comparison — they're
+    too noisy to give a clean signal either way.
+    """
+    counts = df_in["cell_id"].astype(str).value_counts()
+    well = set(counts[counts >= 0.8 * TX_PER_CELL].index)
+    clipped = set(counts[(counts > 0) & (counts <= 0.4 * TX_PER_CELL)].index)
+    return well, clipped
+
+
 # ============================================================================
-# Segmented workflow
+# Segmented — full volume (sanity baseline)
 # ============================================================================
 
-class TestSegmentedWorkflow:
+class TestSegmentedFullVolume:
+    """Easy-mode sanity baseline: all cells intact, all nuclei present.
+    Catches gross regressions in the trivial path."""
+
     def test_pipeline_runs_end_to_end(self, seg_result):
-        df_out, prog, gt = seg_result
+        df_out, prog, _ = seg_result
         assert "stitched" in df_out.columns
         # 8 stages of progression captured
         assert len(prog) >= 7
 
-    def test_final_entity_count_in_range(self, seg_result):
-        df_out, prog, gt = seg_result
-        s = df_out["stitched"].astype(str)
-        n_distinct = (s != "-1").groupby(s).any().sum()
-        # 8 planted cells; some pipeline noise allowed
-        assert 4 <= n_distinct <= 16, (
-            f"Expected 4..16 final entities, got {n_distinct}"
-        )
-
-    def test_coverage_above_50pct(self, seg_result):
-        df_out, prog, gt = seg_result
-        c = _final_label_counts(df_out, "stitched")
-        coverage = c["assigned"] / c["total"]
-        assert coverage > 0.5, f"Coverage {coverage:.1%} below 50%"
-
-    def test_seg_recovers_planted_truth(self, seg_result):
-        """Sanity: segmented TRACER on planted ground truth should
-        recover the partition with high ARI (it's a refinement of the
-        input cell_id, not a from-scratch clustering)."""
-        df_out, prog, gt = seg_result
+    def test_recovers_planted_truth(self, seg_result):
+        """On whole cells with planted ground truth, segmented TRACER
+        should refine cleanly (high ARI)."""
+        df_out, _, _ = seg_result
         truth = df_out["cell_id"].astype(str).values
         out = df_out["stitched"].astype(str).values
-        # Ignore unassigned tx in the assignment-only ARI
         mask = out != "-1"
         if mask.sum() < 2:
             pytest.skip("not enough assigned tx")
@@ -115,18 +156,146 @@ class TestSegmentedWorkflow:
 
 
 # ============================================================================
-# No-segmentation workflow
+# Segmented — 5 µm section (primary stress test)
 # ============================================================================
 
-class TestNoSegWorkflow:
+class TestSegmentedSection:
+    """Primary discriminating tests. Section input contains both
+    fully-contained cells AND z-clipped partial cells — the realistic
+    scenario TRACER's rescue/stitch logic targets."""
+
+    def test_section_pipeline_runs(self, seg_section_result):
+        df_out, prog, _ = seg_section_result
+        assert "stitched" in df_out.columns
+        assert len(prog) >= 7
+
+    def test_section_z_bounds_respected(self, section_inputs):
+        df, _, _ = section_inputs
+        z_lo, z_hi = SECTION_Z
+        assert (df["z"] >= z_lo).all()
+        assert (df["z"] < z_hi).all()
+
+    def test_section_has_mix_of_well_and_clipped(self, section_inputs):
+        """Sanity: the section actually contains the mix we're testing —
+        some well-preserved cells (≥80% tx surviving) and some heavily
+        clipped (≤40%)."""
+        df, _, gt = section_inputs
+        well, clipped = _partition_by_clipping(df)
+        assert len(well) > 0, (
+            "section has no well-preserved cells — bad section bounds"
+        )
+        assert len(clipped) > 0, (
+            "section has no heavily-clipped cells — bad section bounds"
+        )
+        assert gt["n_clipped_cells"] >= 1
+
+    def test_final_entity_count_in_range(self, seg_section_result):
+        df_out, _, _ = seg_section_result
+        s = df_out["stitched"].astype(str)
+        n_distinct = (s != "-1").groupby(s).any().sum()
+        # 8 planted cells; clipped cells may fragment or be lost.
+        assert 4 <= n_distinct <= 16, (
+            f"Expected 4..16 final entities, got {n_distinct}"
+        )
+
+    def test_coverage_above_50pct(self, seg_section_result):
+        df_out, _, _ = seg_section_result
+        c = _final_label_counts(df_out, "stitched")
+        coverage = c["assigned"] / c["total"]
+        assert coverage > 0.5, f"Coverage {coverage:.1%} below 50%"
+
+    def test_recovers_planted_truth(self, seg_section_result):
+        """ARI threshold relaxed for clipped-cell input (some cells lose
+        most of their tx and have no nucleus left)."""
+        df_out, _, _ = seg_section_result
+        truth = df_out["cell_id"].astype(str).values
+        out = df_out["stitched"].astype(str).values
+        mask = out != "-1"
+        if mask.sum() < 2:
+            pytest.skip("not enough assigned tx")
+        ari = adjusted_rand_score(truth[mask], out[mask])
+        assert ari > 0.4, f"ARI={ari:.3f} below 0.4 (section relaxed bound)"
+
+    def test_well_preserved_recovered_better_than_clipped(
+        self, section_inputs, seg_section_result,
+    ):
+        """The signal we actually care about: TRACER should preserve
+        well-intact cells more reliably than heavily-clipped ones. We
+        assert per-class assignment rate, not absolute ARI — clipped
+        cells are expected to be noisier and may even be entirely
+        unassignable."""
+        df_in, _, _ = section_inputs
+        df_out, _, _ = seg_section_result
+        well, clipped = _partition_by_clipping(df_in)
+        if not well or not clipped:
+            pytest.skip("section did not produce both well-preserved + clipped cells")
+
+        # Map transcript_id -> ground-truth cell_id (from input)
+        gt_cid = df_in.set_index("transcript_id")["cell_id"].astype(str)
+        out_lbl = df_out.set_index("transcript_id")["stitched"].astype(str)
+        idx = gt_cid.index.intersection(out_lbl.index)
+        gt_cid = gt_cid.loc[idx]
+        out_lbl = out_lbl.loc[idx]
+
+        well_mask = gt_cid.isin(well)
+        clipped_mask = gt_cid.isin(clipped)
+        well_assigned = (out_lbl[well_mask] != "-1").mean()
+        clipped_assigned = (out_lbl[clipped_mask] != "-1").mean()
+
+        # Well-preserved cells should retain assignment at least as well
+        # as clipped ones. Allow a small slack — cell-by-cell variance
+        # is real (e.g. a "well-preserved" cell may be in low-tx region).
+        assert well_assigned >= clipped_assigned - 0.10, (
+            f"Well-preserved cell assignment rate ({well_assigned:.1%}) is "
+            f"much worse than heavily-clipped ({clipped_assigned:.1%}) — "
+            f"pipeline is breaking the easy case."
+        )
+        # And well-preserved cells should be substantially recovered.
+        assert well_assigned > 0.5, (
+            f"Well-preserved cell assignment rate {well_assigned:.1%} "
+            f"below 50% — pipeline is failing on mostly-intact cells."
+        )
+
+    def test_no_phantom_cell(self, seg_section_result):
+        """Regression test for the SHIELD_LABEL absorption bug
+        (commit 6aa3f3e). No single entity should hold > 85% of
+        assigned tx."""
+        df_out, _, _ = seg_section_result
+        s = df_out["stitched"].astype(str)
+        s = s[s != "-1"]
+        if len(s) == 0:
+            pytest.skip("no assigned tx")
+        max_share = s.value_counts().iloc[0] / len(s)
+        assert max_share <= 0.85, (
+            f"Phantom-cell symptom: a single entity holds "
+            f"{100*max_share:.1f}% of assigned tx (>85% is the SHIELD_LABEL "
+            f"bug fingerprint)."
+        )
+
+
+# ============================================================================
+# No-segmentation — full volume (sanity baseline)
+# ============================================================================
+
+class TestNoSegFullVolume:
     def test_noseg_pipeline_runs_end_to_end(self, noseg_result):
-        df_out, prog, gt = noseg_result
+        df_out, _, _ = noseg_result
         assert "stitched" in df_out.columns
 
-    def test_noseg_finds_components(self, noseg_result):
+
+# ============================================================================
+# No-segmentation — 5 µm section (primary stress test)
+# ============================================================================
+
+class TestNoSegSection:
+    def test_noseg_section_runs(self, noseg_section_result):
+        df_out, _, _ = noseg_section_result
+        assert "stitched" in df_out.columns
+
+    def test_noseg_finds_components(self, noseg_section_result):
         """Group + Stitch should recover a non-trivial number of
-        components from the planted cells."""
-        df_out, prog, gt = noseg_result
+        components from the planted cells, even on clipped input."""
+        df_out, _, gt = noseg_section_result
         s = df_out["stitched"].astype(str)
         n_distinct = (s != "-1").groupby(s).any().sum()
         assert n_distinct >= 3, (
@@ -134,25 +303,23 @@ class TestNoSegWorkflow:
             f"(should find most of {gt['n_cells']} planted cells)"
         )
 
-    def test_no_phantom_cell(self, noseg_result):
+    def test_no_phantom_cell(self, noseg_section_result):
         """Regression test for the SHIELD_LABEL absorption bug
         (commit 6aa3f3e). Pre-fix, pre_stage2_rescue absorbed nearby
         unassigned tx into the __GUARD_SKIP__ shield label, producing
-        a phantom "cell" containing thousands of tx. Verify no single
-        entity holds > 50% of total tx (the phantom-cell symptom).
+        a phantom "cell" containing thousands of tx.
 
         Note: the no-seg pipeline doesn't actually invoke pre_stage2_rescue
         (it has no entities to rescue into) — but this test serves as a
         general "pathological merger" regression check that would also
         fail if Stitch over-merged."""
-        df_out, prog, gt = noseg_result
+        df_out, _, _ = noseg_section_result
         s = df_out["stitched"].astype(str)
         s = s[s != "-1"]
         if len(s) == 0:
             pytest.skip("no assigned tx")
         max_share = s.value_counts().iloc[0] / len(s)
-        # The pre-fix bug put ~100% of rescued tx into one phantom
-        # cluster. Threshold 0.85 catches that pathology while
+        # Threshold 0.85 catches the bug's ~100% fingerprint while
         # tolerating legitimate dense-tissue consolidation under noseg
         # (where Stitch can merge many adjacent same-type bin-cliques
         # into a single super-component).
@@ -166,51 +333,6 @@ class TestNoSegWorkflow:
 # ============================================================================
 # Cross-mode consistency
 # ============================================================================
-
-class TestSection:
-    """Run the segmented pipeline on a tissue-section-extracted slab.
-
-    Cells partially intersect the section boundary; the pipeline should
-    still recover the bulk of the planted partition, with looser
-    tolerances (clipped cells lose tx).
-    """
-
-    @pytest.fixture(scope="class")
-    def section_inputs(self):
-        df, gt = make_synthetic_transcripts(
-            **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
-        )
-        panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
-        return df, panel, gt
-
-    @pytest.fixture(scope="class")
-    def section_result(self, section_inputs):
-        df, panel, gt = section_inputs
-        df_out, prog = run_segmented_pipeline(df, panel)
-        return df_out, prog, gt
-
-    def test_section_pipeline_runs(self, section_result):
-        df_out, _, _ = section_result
-        assert "stitched" in df_out.columns
-
-    def test_section_z_bounds_respected(self, section_inputs):
-        df, _, _ = section_inputs
-        z_lo, z_hi = SECTION_Z
-        assert (df["z"] >= z_lo).all()
-        assert (df["z"] < z_hi).all()
-
-    def test_section_recovers_majority_of_truth(self, section_result):
-        """ARI threshold relaxed for clipped-cell input (some cells
-        lose most of their tx)."""
-        df_out, _, _ = section_result
-        truth = df_out["cell_id"].astype(str).values
-        out = df_out["stitched"].astype(str).values
-        mask = out != "-1"
-        if mask.sum() < 2:
-            pytest.skip("not enough assigned tx")
-        ari = adjusted_rand_score(truth[mask], out[mask])
-        assert ari > 0.4, f"ARI={ari:.3f} below 0.4 (section relaxed bound)"
-
 
 class TestSegVsNoSegConsistency:
     """Runs BOTH pipelines on the same synthetic input and asserts
