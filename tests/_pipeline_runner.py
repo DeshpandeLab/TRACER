@@ -177,8 +177,17 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
     The input ``cell_id`` column is overwritten to ``"-1"`` everywhere
     (so any prior segmentation is discarded). Stages: Group → Stitch →
     Demote → Final Rescue.
+
+    Accepts xy-grid-only input (Visium HD or any 2D imaging modality):
+    when the ``z`` column is absent it is synthesised as ``0`` so the
+    3D-aware stages (which expect ``coord_cols=("x", "y", "z")``) run
+    unchanged. With z constant, ``z_neighborhood_depth`` is a no-op —
+    every transcript lands in the same z-bin and any depth ≥ 0 admits
+    every candidate pair.
     """
     df = df.copy()
+    if "z" not in df.columns:
+        df["z"] = 0.0
     df["cell_id"] = "-1"
 
     progression: list[dict[str, Any]] = []

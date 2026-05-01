@@ -282,6 +282,19 @@ class TestNoSegFullVolume:
         df_out, _, _ = noseg_result
         assert "stitched" in df_out.columns
 
+    def test_noseg_handles_xy_only_input(self, synthetic_inputs):
+        """VHD / 2D-grid inputs lack a z column. The noseg pipeline
+        should accept them by synthesising z=0 so all 3D-aware stages
+        run unchanged."""
+        df, panel, _ = synthetic_inputs
+        df_xy = df.drop(columns=["z"])
+        assert "z" not in df_xy.columns
+        df_out, prog = run_noseg_pipeline(df_xy, panel)
+        assert "stitched" in df_out.columns
+        # No-op assertion: pipeline should produce some assigned tx.
+        assigned = (df_out["stitched"].astype(str) != "-1").sum()
+        assert assigned > 0, "noseg on xy-only input produced no assigned tx"
+
 
 # ============================================================================
 # No-segmentation — 5 µm section (primary stress test)
