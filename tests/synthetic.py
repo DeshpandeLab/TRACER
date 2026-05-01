@@ -118,6 +118,52 @@ _SIX_NEIGHBORS = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0),
                   (0, 0, -1), (0, 0, 1))
 
 
+def _deepest_voxel(
+    voxels: list[tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    """Find the cell voxel whose minimum 6-connected distance to any
+    non-cell voxel is maximum — i.e., the morphologically deepest
+    interior point of the cell.
+
+    Computed via multi-source BFS from the cell's boundary voxels (cell
+    voxels with at least one non-cell 6-neighbor) inward. The voxel
+    with the largest BFS distance is the deepest. For roughly-spherical
+    cells this is near the geometric centroid; for irregular or
+    elongated shapes it's the inradius point and can be substantially
+    further from the boundary than the centroid.
+    """
+    from collections import deque
+
+    cell_set = set(voxels)
+    if len(cell_set) == 1:
+        return voxels[0]
+
+    # Boundary = cell voxels with at least one non-cell 6-neighbor.
+    dist: dict[tuple[int, int, int], int] = {}
+    q: deque[tuple[int, int, int]] = deque()
+    for vx in voxels:
+        for dx, dy, dz in _SIX_NEIGHBORS:
+            nbr = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
+            if nbr not in cell_set:
+                dist[vx] = 0
+                q.append(vx)
+                break
+    if not q:
+        # Pathological: cell completely surrounded by other cell voxels
+        # (no boundary at all). Shouldn't happen with a finite grid.
+        return voxels[0]
+
+    while q:
+        vx = q.popleft()
+        for dx, dy, dz in _SIX_NEIGHBORS:
+            nbr = (vx[0] + dx, vx[1] + dy, vx[2] + dz)
+            if nbr in cell_set and nbr not in dist:
+                dist[nbr] = dist[vx] + 1
+                q.append(nbr)
+
+    return max(dist, key=dist.get)
+
+
 def _flood_fill_cell(seed_voxel, target, owner, cell_idx, nuclear_layers):
     """BFS-grow a cell from ``seed_voxel`` until it reaches ``target``
     voxels or all reachable neighbours are exhausted.
@@ -321,27 +367,28 @@ def make_synthetic_transcripts(
         if not progress:
             break
 
-    # 4b. Re-center the nucleus to the cell's geometric centroid. The
-    # seed-based assignment in the BFS above places the nucleus wherever
-    # the seed voxel happened to land — often near the cell boundary if
-    # the cell grew preferentially in one direction. Biologically the
-    # nucleus sits near the cell center, so we relocate it post-hoc:
-    #   1. Compute the cell's centroid in voxel space.
-    #   2. Find the cell voxel closest to the centroid (the "anatomical
-    #      center").
-    #   3. BFS from that center *within the cell's voxel set* for
-    #      ``nuclear_layers`` rounds — those voxels become the nucleus.
+    # 4b. Re-center the nucleus to the cell's deepest interior voxel.
+    # The seed-based assignment in the BFS above places the nucleus
+    # wherever the seed voxel happened to land — often near the cell
+    # boundary if the cell grew preferentially in one direction. The
+    # geometric centroid isn't enough either: for an elongated or
+    # crescent-shaped cell, the centroid voxel can still be near the
+    # surface (or even fall outside the voxel set entirely, in which
+    # case "closest cell voxel" is on the boundary).
+    #
+    # Instead, pick the voxel whose **minimum distance to any non-cell
+    # voxel** is maximum — the morphologically deepest interior point.
+    # Computed via multi-source BFS from the boundary inward. This
+    # guarantees the nucleus has at least ``min(deepest_dist,
+    # nuclear_layers)`` voxels of cytoplasm padding to the cell
+    # surface in every direction.
     cell_nuclear_voxels: list[set[tuple[int, int, int]]] = []
     for c in range(n_cells):
         voxels = cell_voxels[c]
         if not voxels:
             cell_nuclear_voxels.append(set())
             continue
-        arr = np.asarray(voxels, dtype=np.float64)
-        centroid = arr.mean(axis=0)
-        # Closest cell voxel to centroid
-        d2 = ((arr - centroid) ** 2).sum(axis=1)
-        center_voxel = voxels[int(d2.argmin())]
+        center_voxel = _deepest_voxel(voxels)
         # BFS from center within cell's voxels for nuclear_layers rounds
         cell_voxel_set = set(voxels)
         nuc: set[tuple[int, int, int]] = {center_voxel}
