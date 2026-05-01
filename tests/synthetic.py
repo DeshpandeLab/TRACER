@@ -220,6 +220,8 @@ def make_synthetic_transcripts(
     section_z_range_um: tuple[float, float] | None = None,
     cross_type_noise_pct: float = 0.20,
     enforce_inter_cell_gap: bool = False,
+    max_cell_z_extent_um: float | None = None,
+    n_z_strata: int | None = None,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build a transcript-level DataFrame with voxel-grid cell shapes.
@@ -310,9 +312,39 @@ def make_synthetic_transcripts(
     owner = np.full((nx, ny, nz), -1, dtype=np.int32)
 
     # 3. Seed cells
-    flat_idxs = rng.choice(nx * ny * nz, size=n_cells, replace=False)
-    seeds = [tuple(int(c) for c in np.unravel_index(i, (nx, ny, nz)))
-             for i in flat_idxs]
+    if n_z_strata is not None and n_z_strata > 1:
+        # Stratified z-seeding: place cells in distinct z-layers at SHARED
+        # xy positions, so cells stack vertically. Used to test the z-bin
+        # filter in stitching — random seeding rarely produces z-stacked
+        # cells given moderate cell counts.
+        if n_cells % n_z_strata != 0:
+            raise ValueError(
+                f"n_cells ({n_cells}) must be divisible by "
+                f"n_z_strata ({n_z_strata}) for symmetric stacking"
+            )
+        cells_per_stratum = n_cells // n_z_strata
+        if cells_per_stratum > nx * ny:
+            raise ValueError(
+                f"cells_per_stratum ({cells_per_stratum}) exceeds available "
+                f"xy positions ({nx * ny})"
+            )
+        # Pick random xy positions; use the same set in every stratum so
+        # cells share xy across strata.
+        xy_flat = rng.choice(nx * ny, size=cells_per_stratum, replace=False)
+        stratum_height = nz / n_z_strata
+        seeds = []
+        for s in range(n_z_strata):
+            z_seed = int((s + 0.5) * stratum_height)
+            for xy_idx in xy_flat:
+                x_seed = int(xy_idx // ny)
+                y_seed = int(xy_idx % ny)
+                seeds.append((x_seed, y_seed, z_seed))
+        # Order: cell 0 = stratum 0 / xy 0, cell 1 = stratum 0 / xy 1, …,
+        # cell cells_per_stratum = stratum 1 / xy 0, etc.
+    else:
+        flat_idxs = rng.choice(nx * ny * nz, size=n_cells, replace=False)
+        seeds = [tuple(int(c) for c in np.unravel_index(i, (nx, ny, nz)))
+                 for i in flat_idxs]
 
     # 4. Flood-fill each cell to its target size
     lo = max(1, int(voxels_per_cell_mean * (1 - voxels_per_cell_jitter)))
@@ -339,6 +371,17 @@ def make_synthetic_transcripts(
                 return True
         return False
 
+    # z-extent cap: cells can grow at most ±max_z_half_extent voxels
+    # from their seed's z. Constrains cells to thin z bands so multiple
+    # cells can stack at the same xy across distinct z layers — the
+    # realistic dense-tissue case.
+    if max_cell_z_extent_um is not None:
+        max_z_half_extent = max(
+            0, int(round(max_cell_z_extent_um / (2.0 * voxel_size_um)))
+        )
+    else:
+        max_z_half_extent = None
+
     while True:
         progress = False
         for c in range(n_cells):
@@ -358,6 +401,9 @@ def make_synthetic_transcripts(
                         # Skip — claiming this voxel would put us face-to-face
                         # with a different cell. Leaves a 1-voxel buffer.
                         continue
+                    if max_z_half_extent is not None:
+                        if abs(nvx[2] - seeds[c][2]) > max_z_half_extent:
+                            continue
                     owner[nvx] = c
                     cell_voxels[c].append(nvx)
                     next_frontier.append(nvx)
@@ -417,12 +463,26 @@ def make_synthetic_transcripts(
     n_voxels_per_cell: dict[str, int] = {}
     n_nuclear_voxels_per_cell: dict[str, int] = {}
 
+    # Type assignment. In stratified-z mode, cells stacked at the same
+    # xy share a type (so the z-bin filter has work to do — same-type
+    # stacked cells can't be split by PMI alone). Otherwise, use the
+    # standard round-robin c % n_types.
+    if n_z_strata is not None and n_z_strata > 1:
+        cells_per_stratum = n_cells // n_z_strata
+
+        def _type_for(c_idx: int) -> int:
+            xy_idx = c_idx % cells_per_stratum
+            return xy_idx % n_types
+    else:
+        def _type_for(c_idx: int) -> int:
+            return c_idx % n_types
+
     for c in range(n_cells):
         voxels = cell_voxels[c]
         nuclear = cell_nuclear_voxels[c]
         if not voxels:
             continue
-        ctype = c % n_types
+        ctype = _type_for(c)
         cell_to_type[str(c)] = ctype
         n_voxels_per_cell[str(c)] = len(voxels)
         n_nuclear_voxels_per_cell[str(c)] = len(nuclear)
