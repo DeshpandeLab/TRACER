@@ -37,6 +37,11 @@ DAPI_MIN_NUCLEAR_TX = 3
 # nucleus when no membrane stain is available; tx farther than that
 # are left unassigned. We mirror that cap here.
 DEFAULT_MAX_DIST_FROM_NUCLEUS_UM = 5.0
+# Two nuclei whose xy centroids are within this distance project to a
+# single blob in a 2D-projected DAPI image of a thick section, so a
+# 2D segmenter would detect them as one nucleus. Default 1.5 µm
+# (≈ a typical voxel/voxel-cluster scale on the synthetic generator).
+DEFAULT_DAPI_XY_MERGE_UM = 1.5
 
 
 def simulate_voronoi_segmentation(df: pd.DataFrame) -> pd.DataFrame:
@@ -80,6 +85,7 @@ def simulate_dapi_voronoi_segmentation(
     *,
     dapi_min_tx: int = DAPI_MIN_NUCLEAR_TX,
     max_dist_from_nucleus_um: float | None = DEFAULT_MAX_DIST_FROM_NUCLEUS_UM,
+    dapi_xy_merge_um: float | None = DEFAULT_DAPI_XY_MERGE_UM,
 ) -> pd.DataFrame:
     """Apply a simplified Xenium-style DAPI + Voronoi segmentation.
 
@@ -97,6 +103,16 @@ def simulate_dapi_voronoi_segmentation(
         farther than that are left unassigned. Pass ``None`` to disable
         the cap (pure Voronoi tessellation, every tx assigned to nearest
         DAPI cell regardless of distance).
+    dapi_xy_merge_um : float or None, default 1.5
+        Two distinct ground-truth nuclei whose xy centroids are within
+        this distance are merged into a single DAPI seed — modelling
+        what a 2D-projected DAPI image of a thick section actually
+        sees: stacked nuclei project to a single blob and a 2D
+        segmenter detects them as one nucleus. Tx from any of the
+        merged GT cells get the same input ``cell_id`` (the
+        lexicographically-smallest merged label). Pass ``None`` to
+        disable merging (each GT-cell DAPI gets its own seed, the
+        previous behaviour).
 
     Returns
     -------
@@ -125,7 +141,62 @@ def simulate_dapi_voronoi_segmentation(
         for c in dapi_cells
     ], dtype=np.float64)
 
-    # 2. Voronoi assignment: each tx → nearest DAPI centroid in xy
+    # 1b. Merge xy-co-located DAPI seeds (2D-projection blob effect).
+    # Single-link clustering by xy distance: any two seeds within
+    # ``dapi_xy_merge_um`` collapse into the same group. Each group
+    # becomes one merged seed at the (count-weighted) mean xy of its
+    # members; its label is the lexicographically-smallest GT cell_id
+    # in the group, and tx from any member GT cell map to it.
+    if dapi_xy_merge_um is not None and len(dapi_cells) > 1:
+        n = len(dapi_cells)
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        thr2 = float(dapi_xy_merge_um) ** 2
+        for i in range(n):
+            for j in range(i + 1, n):
+                d2_ij = ((centers[i] - centers[j]) ** 2).sum()
+                if d2_ij <= thr2:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+        # Form groups, derive merged labels and centroids
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        merged_labels: list[str] = []
+        merged_centers: list[np.ndarray] = []
+        # Map original GT cell_id → merged label that absorbs it
+        gt_to_merged: dict[str, str] = {}
+        for members in groups.values():
+            members_cells = [dapi_cells[k] for k in members]
+            # Pick smallest label numerically if all numeric, else
+            # lexicographically smallest. Stable group representative.
+            try:
+                rep = min(members_cells, key=lambda c: int(c))
+            except ValueError:
+                rep = min(members_cells)
+            # Count-weighted xy centroid (each member contributes its
+            # nuclear tx count as weight, so a member with more nuclear
+            # signal pulls the merged seed toward it).
+            weights = np.array([nuc_counts[c] for c in members_cells],
+                               dtype=np.float64)
+            mc = (centers[members] * weights[:, None]).sum(axis=0) / weights.sum()
+            merged_labels.append(rep)
+            merged_centers.append(mc)
+            for c in members_cells:
+                gt_to_merged[c] = rep
+        dapi_cells = merged_labels
+        centers = np.array(merged_centers, dtype=np.float64)
+    else:
+        gt_to_merged = {c: c for c in dapi_cells}
+
+    # 2. Voronoi assignment: each tx → nearest (merged) DAPI centroid in xy
     pts = df[["x", "y"]].to_numpy(dtype=np.float64)
     # Pairwise xy distances; n_tx and n_centers are both small (~200, ~8)
     d2 = ((pts[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
