@@ -78,11 +78,25 @@ def _git_describe() -> tuple[str, str]:
         return "unknown", "unknown"
 
 
-def _measure(scenario: str, df: pd.DataFrame, panel: pd.DataFrame,
-             truth_col: str = "cell_id") -> dict[str, Any]:
+def _measure(scenario: str, df: pd.DataFrame,
+             panel: pd.DataFrame) -> dict[str, Any]:
     """Run the segmented pipeline and compute recovery metrics vs the
-    ground-truth label in ``truth_col``."""
-    truth = df[truth_col].astype(str).to_numpy()
+    ground-truth partition.
+
+    The caller is responsible for ensuring ``df`` has a
+    ``cell_id_truth`` column carrying the ground-truth label. For the
+    realistic-mode scenario this is set by
+    :func:`simulate_dapi_voronoi_segmentation`. For the easy-mode
+    scenario the caller copies ``cell_id`` (which already equals
+    truth) into ``cell_id_truth`` before calling.
+    """
+    if "cell_id_truth" not in df.columns:
+        raise ValueError(
+            "df must have a 'cell_id_truth' column carrying the "
+            "ground-truth partition; ARI/AMI are always computed vs "
+            "ground truth."
+        )
+    truth = df["cell_id_truth"].astype(str).to_numpy()
     t0 = time.time()
     # Pipeline emits diagnostic prints; swallow them so the benchmark's
     # markdown output is the only thing on stdout.
@@ -148,23 +162,24 @@ def _format_block(results: list[dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    # Scenario 1: easy mode — full volume + ground-truth segmentation
+    # Scenario 1: easy mode — full volume + ground-truth segmentation.
+    # Copy cell_id → cell_id_truth so the comparison reference column
+    # name is consistent across scenarios. The pipeline still receives
+    # the ground-truth cell_id as its input segmentation.
     df_full, gt_full = make_synthetic_transcripts(**CELLS_KW, seed=42)
+    df_full["cell_id_truth"] = df_full["cell_id"].astype(str)
     panel_full = make_synthetic_npmi_panel_for_transcripts(df_full, gt_full)
-    r1 = _measure("full-volume + ground-truth", df_full, panel_full,
-                  truth_col="cell_id")
+    r1 = _measure("full-volume + ground-truth", df_full, panel_full)
 
-    # Scenario 2: realistic mode — section + simulated DAPI/Voronoi
+    # Scenario 2: realistic mode — section + simulated DAPI/Voronoi.
+    # The sim overwrites cell_id with noisy labels and preserves the
+    # original ground truth in cell_id_truth automatically.
     df_sec, gt_sec = make_synthetic_transcripts(
         **CELLS_KW, section_z_range_um=SECTION_Z, seed=42,
     )
     panel_sec = make_synthetic_npmi_panel_for_transcripts(df_sec, gt_sec)
     df_sec_seg = simulate_dapi_voronoi_segmentation(df_sec)
-    # Pipeline gets noisy cell_id; ARI/AMI are computed vs cell_id_truth.
-    r2 = _measure(
-        "section + DAPI/Voronoi", df_sec_seg, panel_sec,
-        truth_col="cell_id_truth",
-    )
+    r2 = _measure("section + DAPI/Voronoi", df_sec_seg, panel_sec)
 
     print(_format_block([r1, r2]))
 
