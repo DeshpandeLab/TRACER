@@ -9,18 +9,23 @@ are appended in chronological order (newest at top). The benchmark is
 
 ## Two scenarios per entry
 
+In **both** scenarios, ARI and AMI are computed against the
+ground-truth partition (the true cell each transcript was sampled
+from in the synthetic generator). The scenarios differ only in what
+gets fed to TRACER as input.
+
 - **full-volume + ground-truth** — easy mode. The 10 µm voxel-grid
   synthetic domain with 8 intact cells, fed through TRACER with the
-  *ground-truth* `cell_id` as input (the true cell each transcript
-  was sampled from). Should be ARI ≈ 1.0 in the limit; reality is
-  lower because the pipeline still over- or under-merges on dense
-  same-type tissue.
+  *ground-truth* `cell_id` as input. Should be ARI ≈ 1.0 in the
+  limit; reality is lower because the pipeline still over- or
+  under-merges on dense same-type tissue.
 - **section + DAPI/Voronoi** — realistic mode. The middle 5 µm slab is
   extracted (some cells clipped, some missing nuclei), then a
   simulated DAPI + Voronoi segmenter (see `tests/segmentation_sim.py`)
-  produces the input `cell_id`. ARI is computed against the
-  *ground-truth* partition. This is the metric we care about: how
-  well TRACER **recovers** truth from a noisy upstream segmenter.
+  produces the noisy input `cell_id`. The original ground truth is
+  preserved as `cell_id_truth` for ARI/AMI comparison. This is the
+  metric we care about: how well TRACER **recovers** truth from a
+  noisy upstream segmenter.
 
 ## Workflow
 
