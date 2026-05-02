@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from tracer.graph import build_grid_graph_xy, build_grid_graph_xyz
@@ -26,7 +27,10 @@ from tracer.spatial import (
     reassign_unassigned_grid_pool,
     demote_small_entities,
 )
-from tracer.stitching import apply_stitching_to_transcripts_memory_efficient
+from tracer.stitching import (
+    apply_stitching_to_transcripts_memory_efficient,
+    estimate_within_cell_dz_threshold,
+)
 
 
 # Modern config — matches segmented_workflow.ipynb / noseg_workflow.ipynb.
@@ -135,6 +139,18 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
+    # Auto-derive within-cell |Δz| threshold from the raw input
+    # segmentation. Bimodal Voronoi cells (which contain stacked
+    # stratum cells) yield a clean low-mode for within-cell Δz; the
+    # 90 %ile of that mode bounds legitimate cell-spanning merges.
+    dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
+    auto_dz = dz_stats["threshold"]
+    if not np.isfinite(auto_dz):
+        # Fallback: skip the Δz guard if no eligible entities.
+        auto_dz, auto_n = None, 0
+    else:
+        auto_n = 5
+
     # Stitch
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
@@ -146,6 +162,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
         G_z=1.0, z_neighbor_depth=1,
+        min_close_edges_dz=auto_dz, min_close_edges_n=auto_n,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 

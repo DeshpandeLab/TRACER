@@ -35,6 +35,243 @@ def infer_entity_type(entity_id: str) -> str:
     return "cell"
 
 
+def estimate_within_cell_dz_threshold(
+    df: pd.DataFrame,
+    *,
+    entity_col: str,
+    z_col: str = "z",
+    n_sample: int = 50,
+    min_entity_size: int = 5,
+    cohens_d_threshold: float = 0.8,
+    target_percentile: float = 90.0,
+    seed: int = 42,
+) -> dict:
+    """Estimate a within-cell |Δz| threshold from segmented input.
+
+    Pools pairwise |Δz| values across a sample of segmented entities,
+    fits a 2-component Gaussian mixture model, tests for bimodality
+    via Cohen's d on the fitted component means, and returns the
+    target percentile of the **smaller-mean component** when bimodal
+    (otherwise the percentile of the full distribution).
+
+    The intent: in a noisy DAPI/Voronoi segmentation that merges
+    stacked stratum cells, the within-entity |Δz| distribution is
+    bimodal — a low-Δz mode (within-stratum tx pairs) and a high-Δz
+    mode (cross-stratum tx pairs from the merged column). The smaller-
+    mean mode reflects within-cell scale; its right tail (90 %ile by
+    default) is a robust upper bound on legitimate within-cell |Δz|
+    that downstream stitching can use as a Δz filter threshold.
+
+    On clean, unimodal data (e.g. ground-truth labels), the GMM
+    collapses, Cohen's d falls below ``cohens_d_threshold``, and the
+    percentile of the full pooled distribution is returned instead.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Transcript-level table with at least ``entity_col`` and
+        ``z_col``.
+    entity_col : str
+        Column whose distinct non-``"-1"`` values define entities.
+    z_col : str, default ``"z"``
+        Column holding the z coordinate (µm).
+    n_sample : int, default 50
+        Number of entities to randomly sample. If fewer eligible
+        entities exist, all are used.
+    min_entity_size : int, default 5
+        Skip entities below this transcript count (no meaningful
+        pairwise statistic).
+    cohens_d_threshold : float, default 0.8
+        Cohen's d cutoff between the two GMM components for
+        declaring bimodality. 0.8 corresponds to a large effect size.
+    target_percentile : float in [0, 100], default 90
+        Percentile of the smaller-mean mode (or full distribution if
+        unimodal) to report as the within-cell threshold.
+    seed : int, default 42
+        Random seed for entity sampling and GMM initialization.
+
+    Returns
+    -------
+    result : dict with keys
+        - ``threshold`` (float, µm): the recommended |Δz| threshold
+        - ``bimodal`` (bool): whether Cohen's d ≥ threshold
+        - ``cohens_d`` (float): effect size between the two modes
+        - ``gmm_means`` (list of 2 floats): fitted component means
+        - ``gmm_stds`` (list of 2 floats): fitted component stds
+        - ``gmm_weights`` (list of 2 floats): mixing proportions
+        - ``smaller_mode_mean`` (float): mean of the smaller-mean mode
+        - ``smaller_mode_std`` (float): std of the smaller-mean mode
+        - ``smaller_mode_weight`` (float): mixing weight of that mode
+        - ``n_sampled_entities`` (int)
+        - ``n_pairs`` (int): total within-entity pairs pooled
+    """
+    try:
+        from sklearn.mixture import GaussianMixture
+    except ImportError as e:
+        raise ImportError(
+            "estimate_within_cell_dz_threshold requires scikit-learn"
+        ) from e
+
+    rng = np.random.default_rng(seed)
+    s = df[entity_col].astype(str)
+    sizes = df[s != "-1"].groupby(entity_col).size()
+    eligible = sizes[sizes >= int(min_entity_size)].index.tolist()
+    if not eligible:
+        return {
+            "threshold": float("nan"), "bimodal": False, "cohens_d": 0.0,
+            "gmm_means": [float("nan"), float("nan")],
+            "gmm_stds":  [float("nan"), float("nan")],
+            "gmm_weights": [float("nan"), float("nan")],
+            "smaller_mode_mean": float("nan"),
+            "smaller_mode_std":  float("nan"),
+            "smaller_mode_weight": float("nan"),
+            "n_sampled_entities": 0, "n_pairs": 0,
+        }
+
+    if len(eligible) > n_sample:
+        sampled = rng.choice(eligible, size=n_sample, replace=False).tolist()
+    else:
+        sampled = eligible
+
+    pooled = []
+    for e in sampled:
+        z = df.loc[df[entity_col] == e, z_col].to_numpy(dtype=float)
+        if len(z) < 2:
+            continue
+        ii, jj = np.triu_indices(len(z), k=1)
+        pooled.append(np.abs(z[ii] - z[jj]))
+    arr = np.concatenate(pooled) if pooled else np.empty(0)
+
+    if arr.size < 10:
+        return {
+            "threshold": float("nan"), "bimodal": False, "cohens_d": 0.0,
+            "gmm_means": [float("nan"), float("nan")],
+            "gmm_stds":  [float("nan"), float("nan")],
+            "gmm_weights": [float("nan"), float("nan")],
+            "smaller_mode_mean": float("nan"),
+            "smaller_mode_std":  float("nan"),
+            "smaller_mode_weight": float("nan"),
+            "n_sampled_entities": len(sampled), "n_pairs": int(arr.size),
+        }
+
+    X = arr.reshape(-1, 1)
+    gmm = GaussianMixture(n_components=2, random_state=int(seed),
+                          max_iter=200, n_init=4)
+    gmm.fit(X)
+    means = gmm.means_.flatten()
+    stds = np.sqrt(np.maximum(gmm.covariances_.flatten(), 1e-12))
+    weights = gmm.weights_
+
+    pooled_std = float(np.sqrt((stds[0] ** 2 + stds[1] ** 2) / 2))
+    cohens_d = float(abs(means[0] - means[1]) / pooled_std) if pooled_std > 0 else 0.0
+    bimodal = bool(cohens_d >= float(cohens_d_threshold))
+
+    smaller_idx = int(np.argmin(means))
+    if bimodal:
+        # Soft-assign every pair to its most likely component, then
+        # compute the percentile of pairs assigned to the smaller mode.
+        resp = gmm.predict_proba(X)
+        in_smaller = resp[:, smaller_idx] >= 0.5
+        smaller_arr = arr[in_smaller]
+        if smaller_arr.size == 0:
+            smaller_arr = arr  # safety
+        threshold = float(np.percentile(smaller_arr, float(target_percentile)))
+    else:
+        threshold = float(np.percentile(arr, float(target_percentile)))
+
+    return {
+        "threshold": threshold,
+        "bimodal": bimodal,
+        "cohens_d": cohens_d,
+        "gmm_means": means.tolist(),
+        "gmm_stds":  stds.tolist(),
+        "gmm_weights": weights.tolist(),
+        "smaller_mode_mean":   float(means[smaller_idx]),
+        "smaller_mode_std":    float(stds[smaller_idx]),
+        "smaller_mode_weight": float(weights[smaller_idx]),
+        "n_sampled_entities":  int(len(sampled)),
+        "n_pairs":             int(arr.size),
+    }
+
+
+def compute_within_entity_dz_stats(
+    df: pd.DataFrame,
+    *,
+    entity_col: str,
+    z_col: str = "z",
+    etype_filter: tuple[str, ...] | None = ("cell",),
+    min_entity_size: int = 5,
+    percentiles: tuple[float, ...] = (50, 75, 90, 95, 99),
+) -> dict[str, float]:
+    """Pool within-entity pairwise |Δz| across all entities, return stats.
+
+    Used to derive a data-driven Δz threshold for stitching's
+    ``min_close_edges_dz`` guard: any cross-component candidate pair whose
+    z-spread exceeds the within-cell scale is geometrically unlikely to
+    be same-cell and can be filtered before agglomerative scoring.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Transcript-level table with at least ``entity_col`` and ``z_col``.
+    entity_col : str
+        Column whose distinct non-``"-1"`` values define entities.
+    z_col : str, default ``"z"``
+        Column holding the z coordinate (µm).
+    etype_filter : tuple of {"cell", "partial", "component"} or None
+        Restrict the pool to entities of these types (per
+        :func:`infer_entity_type`). Pass ``None`` to include all
+        non-``"-1"`` entities. Default ``("cell",)`` — cells are the
+        most representative reference scale.
+    min_entity_size : int
+        Skip entities with fewer than this many transcripts (no
+        pairwise statistic).
+    percentiles : tuple of float
+        Percentiles to report alongside the median. Values in [0, 100].
+
+    Returns
+    -------
+    stats : dict
+        Keys: ``n_entities`` (int), ``n_pairs`` (int), ``median`` (float),
+        ``mean`` (float), ``max`` (float), and one entry per requested
+        percentile, e.g. ``"p75"``. All distances in same units as
+        ``z_col`` (typically µm). Returns NaN-filled dict if no data.
+    """
+    s = df[entity_col].astype(str)
+    keep = s != "-1"
+    if etype_filter is not None:
+        types = s.map(infer_entity_type)
+        keep = keep & types.isin(etype_filter)
+    sub = df[keep]
+    pooled: list[np.ndarray] = []
+    n_kept = 0
+    for _, g in sub.groupby(entity_col, sort=False):
+        if len(g) < max(2, int(min_entity_size)):
+            continue
+        z = g[z_col].to_numpy(dtype=float)
+        ii, jj = np.triu_indices(len(z), k=1)
+        pooled.append(np.abs(z[ii] - z[jj]))
+        n_kept += 1
+    if not pooled:
+        out = {"n_entities": 0, "n_pairs": 0,
+               "median": float("nan"), "mean": float("nan"),
+               "max": float("nan")}
+        for p in percentiles:
+            out[f"p{int(p)}"] = float("nan")
+        return out
+    arr = np.concatenate(pooled)
+    out = {
+        "n_entities": int(n_kept),
+        "n_pairs": int(arr.size),
+        "median": float(np.median(arr)),
+        "mean": float(arr.mean()),
+        "max": float(arr.max()),
+    }
+    for p in percentiles:
+        out[f"p{int(p)}"] = float(np.percentile(arr, p))
+    return out
+
+
 def build_entity_table(
     df_final: pd.DataFrame,
     *,
@@ -482,6 +719,10 @@ def stitch_entities_hierarchical(
     z_neighbor_depth: int = 0,
     transcript_coords: np.ndarray | None = None,
     transcript_entity_codes: np.ndarray | None = None,
+    min_candidate_edges: int | str = 0,
+    max_pair_median_dz: float | None = None,
+    min_close_edges_dz: float | None = None,
+    min_close_edges_n: int = 0,
     # Deprecated kwargs — translated to mode/threshold below.
     purity_threshold=_LEGACY_STITCH_KWARG_SENTINEL,
     tau=_LEGACY_STITCH_KWARG_SENTINEL,
@@ -489,6 +730,15 @@ def stitch_entities_hierarchical(
     use_relative=_LEGACY_STITCH_KWARG_SENTINEL,
 ):
     """Hierarchical entity stitching driven by ΔC.
+
+    The optional ``min_candidate_edges`` kwarg filters candidate pairs
+    by the number of supporting transcript-level cross-bin connections.
+    A pair (A, B) is admitted only when at least
+    ``min_candidate_edges`` transcript pairs (tx_a in A, tx_b in B) lie
+    in candidate bin neighborhoods. Pass an integer for a fixed
+    threshold or the string ``"min"`` for a per-pair adaptive
+    threshold of ``min(n_A, n_B)`` where n_X is the entity tx count.
+    Only meaningful when ``candidate_source='grid'``.
 
     Parameters
     ----------
@@ -675,8 +925,17 @@ def stitch_entities_hierarchical(
             bin_keys = xy_keys.tolist()
 
         bin_to_comps = defaultdict(set)
+        # Per-(bin, entity) tx counts so we can weight candidate edges
+        # by the supporting tx-tx pair count for the optional
+        # min_candidate_edges filter. Same memory order as bin_to_comps.
+        bin_to_comp_counts: dict = defaultdict(lambda: defaultdict(int))
         for bk, c in zip(bin_keys, comp_codes.tolist()):
             bin_to_comps[bk].add(c)
+            bin_to_comp_counts[bk][c] += 1
+        # Total tx per entity (for min_candidate_edges='min' mode)
+        entity_tx_total: dict[int, int] = defaultdict(int)
+        for c in comp_codes.tolist():
+            entity_tx_total[c] += 1
 
         # Half-neighborhood directions in xy. "0" → empty (same-bin pairs only).
         if stitch_neighborhood == "0":
@@ -698,11 +957,23 @@ def stitch_entities_hierarchical(
             z_offsets_strict_pos = list(range(1, z_neighbor_depth + 1))
 
         candidate_pairs: set[tuple[int, int]] = set()
+        # Tx-tx supporting-edge count per candidate pair, used to apply
+        # the optional min_candidate_edges filter below.
+        pair_tx_edges: dict[tuple[int, int], int] = defaultdict(int)
+
+        def _record(a, b, n_tx):
+            if a == b or n_tx <= 0:
+                return
+            lo, hi = (a, b) if a < b else (b, a)
+            candidate_pairs.add((lo, hi))
+            pair_tx_edges[(lo, hi)] += int(n_tx)
+
         for bk, comps in bin_to_comps.items():
+            cc_a = bin_to_comp_counts[bk]
             # within-bin: all unordered pairs of distinct components
             if len(comps) > 1:
                 for a, b in itertools.combinations(sorted(comps), 2):
-                    candidate_pairs.add((a, b))
+                    _record(a, b, cc_a[a] * cc_a[b])
 
             # Cross-bin: emit each unordered (bin_a, bin_b) exactly once.
             # In the 2D path we use the "half" xy offsets at dz=0.
@@ -721,11 +992,10 @@ def stitch_entities_hierarchical(
                     nb_comps = bin_to_comps.get(nb_xy_int)
                     if not nb_comps:
                         continue
+                    cc_b = bin_to_comp_counts[nb_xy_int]
                     for a in comps:
                         for b in nb_comps:
-                            if a != b:
-                                lo, hi = (a, b) if a < b else (b, a)
-                                candidate_pairs.add((lo, hi))
+                            _record(a, b, cc_a[a] * cc_b[b])
             else:
                 xy_packed, bz = bk
                 bx, by = unpack_bin(xy_packed)
@@ -740,22 +1010,85 @@ def stitch_entities_hierarchical(
                         nb_comps = bin_to_comps.get(nb_key)
                         if not nb_comps:
                             continue
+                        cc_b = bin_to_comp_counts[nb_key]
                         for a in comps:
                             for b in nb_comps:
-                                if a != b:
-                                    lo, hi = (a, b) if a < b else (b, a)
-                                    candidate_pairs.add((lo, hi))
+                                _record(a, b, cc_a[a] * cc_b[b])
                 # (b) same xy bin (dx=dy=0), strictly-positive dz
                 for dz in z_offsets_strict_pos:
                     nb_key = (xy_packed, bz + dz)
                     nb_comps = bin_to_comps.get(nb_key)
                     if not nb_comps:
                         continue
+                    cc_b = bin_to_comp_counts[nb_key]
                     for a in comps:
                         for b in nb_comps:
-                            if a != b:
-                                lo, hi = (a, b) if a < b else (b, a)
-                                candidate_pairs.add((lo, hi))
+                            _record(a, b, cc_a[a] * cc_b[b])
+
+        # Optional minimum-supporting-edges filter.
+        if min_candidate_edges:
+            if isinstance(min_candidate_edges, str):
+                if min_candidate_edges != "min":
+                    raise ValueError(
+                        f"min_candidate_edges string mode must be 'min' "
+                        f"(got {min_candidate_edges!r})"
+                    )
+                kept = {
+                    p for p, n in pair_tx_edges.items()
+                    if n >= min(entity_tx_total[p[0]], entity_tx_total[p[1]])
+                }
+            else:
+                thr = int(min_candidate_edges)
+                kept = {p for p, n in pair_tx_edges.items() if n >= thr}
+            candidate_pairs = kept
+
+        # Optional per-pair median |Δz| guard. Reject candidate pairs
+        # whose member tx have a median pairwise |Δz| larger than the
+        # threshold. Useful when the bin filter under-discriminates due
+        # to grid-alignment artefacts (a 1.5 µm physical gap can hide
+        # inside one G_z=2 bin if the bin boundary aligns badly).
+        if max_pair_median_dz is not None and G_z is not None:
+            # Build per-entity z-coord array once
+            ent_to_z: dict[int, np.ndarray] = defaultdict(list)
+            for c, z in zip(comp_codes.tolist(),
+                            transcript_coords[valid, 2].tolist()):
+                ent_to_z[c].append(z)
+            ent_to_z_arr = {c: np.asarray(zs) for c, zs in ent_to_z.items()}
+            kept2 = set()
+            for (a, b) in candidate_pairs:
+                za = ent_to_z_arr.get(a)
+                zb = ent_to_z_arr.get(b)
+                if za is None or zb is None:
+                    continue
+                dz = np.abs(za[:, None] - zb[None, :]).ravel()
+                if float(np.median(dz)) <= float(max_pair_median_dz):
+                    kept2.add((a, b))
+            candidate_pairs = kept2
+
+        # Count-based Δz guard: admit only if at least
+        # ``min_close_edges_n`` tx-tx pairs across (A, B) have
+        # |Δz| < ``min_close_edges_dz``. Picks up the asymmetry between
+        # within-cell pairs (where some edges are very tight) and
+        # cross-stratum pairs (where every edge clears the gap).
+        if (min_close_edges_dz is not None and min_close_edges_n > 0
+                and G_z is not None):
+            ent_to_z3: dict[int, np.ndarray] = defaultdict(list)
+            for c, z in zip(comp_codes.tolist(),
+                            transcript_coords[valid, 2].tolist()):
+                ent_to_z3[c].append(z)
+            ent_to_z3_arr = {c: np.asarray(zs) for c, zs in ent_to_z3.items()}
+            kept3 = set()
+            thr_dz = float(min_close_edges_dz)
+            thr_n = int(min_close_edges_n)
+            for (a, b) in candidate_pairs:
+                za = ent_to_z3_arr.get(a)
+                zb = ent_to_z3_arr.get(b)
+                if za is None or zb is None:
+                    continue
+                dz = np.abs(za[:, None] - zb[None, :]).ravel()
+                if int((dz < thr_dz).sum()) >= thr_n:
+                    kept3.add((a, b))
+            candidate_pairs = kept3
 
         edges = list(candidate_pairs)
 
@@ -1160,6 +1493,10 @@ def apply_stitching_to_transcripts_memory_efficient(
     stitch_neighborhood: str = "8",
     G_z: float | None = None,
     z_neighbor_depth: int = 0,
+    min_candidate_edges: int | str = 0,
+    max_pair_median_dz: float | None = None,
+    min_close_edges_dz: float | None = None,
+    min_close_edges_n: int = 0,
     purity_threshold=_LEGACY_STITCH_KWARG_SENTINEL,
     tau=_LEGACY_STITCH_KWARG_SENTINEL,
     use_relu=_LEGACY_STITCH_KWARG_SENTINEL,
@@ -1287,6 +1624,10 @@ def apply_stitching_to_transcripts_memory_efficient(
         z_neighbor_depth=z_neighbor_depth,
         transcript_coords=transcript_coords,
         transcript_entity_codes=transcript_entity_codes,
+        min_candidate_edges=min_candidate_edges,
+        max_pair_median_dz=max_pair_median_dz,
+        min_close_edges_dz=min_close_edges_dz,
+        min_close_edges_n=min_close_edges_n,
         **legacy_kwargs,
     )
 
