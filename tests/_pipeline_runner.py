@@ -69,10 +69,10 @@ def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str
 
 def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,
                       coord_cols=("x", "y", "z"),
-                      z_neighborhood_depth=0):
+                      G_z=2.0, z_neighborhood_depth=1):
     return build_grid_graph_xyz(
         df_in, k=k, dist_threshold=dist_threshold, coord_cols=coord_cols,
-        G_xy=2.0, G_z=2.0, xy_neighborhood="8",
+        G_xy=2.0, G_z=G_z, xy_neighborhood="8",
         z_neighborhood_depth=z_neighborhood_depth,
         exact_distance_filter=False,
     )
@@ -99,22 +99,21 @@ def run_segmented_pipeline(df: pd.DataFrame,
     progression: list[dict[str, Any]] = []
     _record_stage(progression, "input", df.assign(_lbl=df["cell_id"].astype(str)), "_lbl")
 
-    # Auto-derive within-cell |Δz| threshold + recommended G_z, plus a
-    # bimodality flag. Bimodality (Cohen's d ≥ 3) indicates the input
-    # has z-stratification (stacked cells, gap between strata), in
-    # which case Split should fragment aggressively across the gap
-    # (z_neighborhood_depth=0). Unimodal data (clean tall cells, no
-    # stratification) is preserved by Split with depth=1, which lets
-    # within-cell merges stay connected. Same dz_stats then drives
-    # Stitch's Δz guard and bin granularity downstream.
+    # Auto-derive within-cell |Δz| threshold + recommended G_z. The
+    # recommended_G_z is bimodality-aware:
+    #   - bimodal data (z-stratified, Cohen's d ≥ 3): G_z = floor(thr),
+    #     small enough to leave an empty-bin moat between the within-
+    #     cell mode and the cross-stratum mode.
+    #   - unimodal data: G_z = ceil(thr), wide enough to admit cell-
+    #     spanning merges at depth=1.
+    # The same G_z drives both Split's grid (where depth=1 is fixed)
+    # and Stitch's grid + Δz guard.
     dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
     auto_dz = dz_stats["threshold"]
     auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
-    auto_split_depth = 0 if dz_stats.get("bimodal", False) else 1
     if not np.isfinite(auto_dz):
         auto_dz, auto_n = None, 0
         auto_Gz = 1.0
-        auto_split_depth = 1
     if not np.isfinite(auto_Gz):
         auto_Gz = 1.0
 
@@ -128,12 +127,12 @@ def run_segmented_pipeline(df: pd.DataFrame,
     _record_stage(progression, "Prune", df_pruned, "tracer_id")
 
     # Stage 4 — Split (after-S1 position, grid_3d).
-    # depth chosen by bimodality: 0 for stratified input, 1 otherwise.
+    # G_z auto-derived from bimodality, depth fixed at 1.
     def _split_graph_fn(df_in, *, k=None, dist_threshold=None,
                         coord_cols=("x", "y", "z")):
         return _grid_3d_graph_fn(df_in, k=k, dist_threshold=dist_threshold,
                                  coord_cols=coord_cols,
-                                 z_neighborhood_depth=auto_split_depth)
+                                 G_z=auto_Gz, z_neighborhood_depth=1)
 
     df_pruned = enforce_spatial_coherence_fast(
         df_stitched=df_pruned, build_graph_fn=_split_graph_fn,

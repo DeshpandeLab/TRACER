@@ -25,28 +25,28 @@
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 7,
+      "n_partials": 8,
       "n_unassigned_tx": 6,
       "stage": "Split"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 7,
+      "n_partials": 8,
       "n_unassigned_tx": 2,
       "stage": "Initial Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 1,
-      "n_partials": 7,
+      "n_partials": 8,
       "n_unassigned_tx": 1,
       "stage": "Group"
     },
     {
       "n_cells": 8,
       "n_components": 1,
-      "n_partials": 7,
+      "n_partials": 8,
       "n_unassigned_tx": 1,
       "stage": "Stitch"
     },

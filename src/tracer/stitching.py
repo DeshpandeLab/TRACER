@@ -202,14 +202,21 @@ def estimate_within_cell_dz_threshold(
     else:
         threshold = float(np.percentile(arr, float(unimodal_percentile)))
 
-    # Recommended G_z: smallest 1-µm-multiple ≥ threshold (with a floor).
-    # G_z too small over-fragments cells unnecessarily; G_z too large
-    # misses z-stratification structure. ceil(threshold) sits just
-    # above the within-cell scale, so within-cell merges are still
-    # admitted at depth=1 while cross-stratum merges (Δz > threshold)
-    # get rejected.
-    recommended_G_z = float(max(float(min_recommended_G_z),
-                                np.ceil(threshold)))
+    # Recommended G_z is bimodality-aware:
+    #   - unimodal: ceil(threshold), the smallest 1-µm bin still above
+    #     within-cell scale. Wide enough to admit cell-spanning merges
+    #     at depth=1, narrow enough to bound them.
+    #   - bimodal: floor(threshold). The threshold is the smaller-mode
+    #     90 %ile (within-cell upper bound); a bin smaller than that
+    #     guarantees an empty-bin moat between the within-cell mode
+    #     and the cross-stratum mode, which Split & Stitch can refuse
+    #     to bridge at depth=1.
+    if bimodal:
+        recommended_G_z = float(max(float(min_recommended_G_z),
+                                    np.floor(threshold)))
+    else:
+        recommended_G_z = float(max(float(min_recommended_G_z),
+                                    np.ceil(threshold)))
 
     return {
         "threshold": threshold,
