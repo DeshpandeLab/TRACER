@@ -117,11 +117,19 @@ def run_segmented_pipeline(df: pd.DataFrame,
     if not np.isfinite(auto_Gz):
         auto_Gz = 1.0
 
-    # Stage 1 — Prune
+    # Stage 1 — Prune.
+    # Use the PMI column when available (not NPMI). NPMI's bounded
+    # [-1,+1] scale suppresses signal from rare-gene pairs; PMI
+    # preserves the log-ratio magnitude. NaN→0 so untested gene pairs
+    # don't grant "ghost survival" via panel coverage gaps.
+    # Fall back to NPMI if the panel lacks a PMI column (e.g., legacy
+    # synthetic panels).
+    metric_col = "PMI" if "PMI" in npmi_panel.columns else "NPMI"
     df_pruned, aux = prune_transcripts_fast(
         df, npmi_panel,
         cell_id_col="cell_id", gene_col="feature_name",
         threshold=PMI_THR, unassigned_id="-1",
+        metric_col=metric_col, nan_fill=0.0,
         n_jobs=-1, show_progress=False,
     )
     _record_stage(progression, "Prune", df_pruned, "tracer_id")

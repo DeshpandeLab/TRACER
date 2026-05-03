@@ -234,6 +234,8 @@ def prune_transcripts_fast(
     housekeeping_pos_thresh: float = 0.05,
     housekeeping_neg_thresh: float = -0.05,
     housekeeping_min_strong_count: int = 5,
+    metric_col: str = "NPMI",
+    nan_fill: float | None = None,
 ):
     """
     Two-pass NPMI pruning. Writes pass-2 result to `out_col` in place;
@@ -272,7 +274,9 @@ def prune_transcripts_fast(
     else:
         df["_cell_str"] = df[cell_id_col]
 
-    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df)
+    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df, npmi_col=metric_col)
+    if nan_fill is not None:
+        np.nan_to_num(W, copy=False, nan=float(nan_fill))
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
 
     # ---------- PASS 1 ----------
