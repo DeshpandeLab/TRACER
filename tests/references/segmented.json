@@ -1,11 +1,11 @@
 {
-  "ami_vs_truth": 0.8,
-  "ari_vs_truth": 0.7221,
-  "coverage_pct": 86.5,
+  "ami_vs_truth": 0.8503,
+  "ari_vs_truth": 0.8022,
+  "coverage_pct": 90.5,
   "n_cells": 8,
   "n_components": 0,
   "n_partials": 1,
-  "n_unassigned_tx": 27,
+  "n_unassigned_tx": 19,
   "stage_progression": [
     {
       "n_cells": 8,
@@ -24,28 +24,28 @@
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 35,
+      "n_partials": 13,
       "n_unassigned_tx": 12,
       "stage": "Split"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 35,
+      "n_partials": 13,
       "n_unassigned_tx": 3,
       "stage": "Initial Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 3,
-      "n_partials": 35,
+      "n_partials": 13,
       "n_unassigned_tx": 0,
       "stage": "Group"
     },
     {
       "n_cells": 8,
       "n_components": 3,
-      "n_partials": 24,
+      "n_partials": 11,
       "n_unassigned_tx": 0,
       "stage": "Stitch"
     },
@@ -53,14 +53,14 @@
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 1,
-      "n_unassigned_tx": 42,
+      "n_unassigned_tx": 23,
       "stage": "Demote"
     },
     {
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 1,
-      "n_unassigned_tx": 27,
+      "n_unassigned_tx": 19,
       "stage": "Final Rescue"
     }
   ]

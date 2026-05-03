@@ -68,10 +68,12 @@ def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str
 
 
 def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,
-                      coord_cols=("x", "y", "z")):
+                      coord_cols=("x", "y", "z"),
+                      z_neighborhood_depth=0):
     return build_grid_graph_xyz(
         df_in, k=k, dist_threshold=dist_threshold, coord_cols=coord_cols,
-        G_xy=2.0, G_z=2.0, xy_neighborhood="8", z_neighborhood_depth=0,
+        G_xy=2.0, G_z=2.0, xy_neighborhood="8",
+        z_neighborhood_depth=z_neighborhood_depth,
         exact_distance_filter=False,
     )
 
@@ -97,6 +99,25 @@ def run_segmented_pipeline(df: pd.DataFrame,
     progression: list[dict[str, Any]] = []
     _record_stage(progression, "input", df.assign(_lbl=df["cell_id"].astype(str)), "_lbl")
 
+    # Auto-derive within-cell |Δz| threshold + recommended G_z, plus a
+    # bimodality flag. Bimodality (Cohen's d ≥ 3) indicates the input
+    # has z-stratification (stacked cells, gap between strata), in
+    # which case Split should fragment aggressively across the gap
+    # (z_neighborhood_depth=0). Unimodal data (clean tall cells, no
+    # stratification) is preserved by Split with depth=1, which lets
+    # within-cell merges stay connected. Same dz_stats then drives
+    # Stitch's Δz guard and bin granularity downstream.
+    dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
+    auto_dz = dz_stats["threshold"]
+    auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
+    auto_split_depth = 0 if dz_stats.get("bimodal", False) else 1
+    if not np.isfinite(auto_dz):
+        auto_dz, auto_n = None, 0
+        auto_Gz = 1.0
+        auto_split_depth = 1
+    if not np.isfinite(auto_Gz):
+        auto_Gz = 1.0
+
     # Stage 1 — Prune
     df_pruned, aux = prune_transcripts_fast(
         df, npmi_panel,
@@ -106,9 +127,16 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Prune", df_pruned, "tracer_id")
 
-    # Stage 4 — Split (after-S1 position, grid_3d)
+    # Stage 4 — Split (after-S1 position, grid_3d).
+    # depth chosen by bimodality: 0 for stratified input, 1 otherwise.
+    def _split_graph_fn(df_in, *, k=None, dist_threshold=None,
+                        coord_cols=("x", "y", "z")):
+        return _grid_3d_graph_fn(df_in, k=k, dist_threshold=dist_threshold,
+                                 coord_cols=coord_cols,
+                                 z_neighborhood_depth=auto_split_depth)
+
     df_pruned = enforce_spatial_coherence_fast(
-        df_stitched=df_pruned, build_graph_fn=_grid_3d_graph_fn,
+        df_stitched=df_pruned, build_graph_fn=_split_graph_fn,
         entity_col="tracer_id", coord_cols=("x", "y", "z"),
         k=5, dist_threshold=5.0,
         out_col="tracer_id", show_progress=False,
@@ -139,26 +167,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
-    # Auto-derive within-cell |Δz| threshold and the matching G_z bin
-    # size from the raw input segmentation. Bimodal Voronoi cells
-    # (which contain stacked stratum cells) yield a clean low-mode for
-    # within-cell Δz; its 90 %ile bounds legitimate cell-spanning
-    # merges. Unimodal real-data inputs fall back to the median (50 %ile)
-    # of the full pool — a more robust scale than the long right tail
-    # contaminated by pathologically z-elongated entities. G_z is set
-    # to ceil(threshold), the smallest 1-µm bin that still admits
-    # within-cell merges at depth=1.
-    dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
-    auto_dz = dz_stats["threshold"]
-    auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
-    if not np.isfinite(auto_dz):
-        # Fallback: skip the Δz guard, use a 1 µm default G_z.
-        auto_dz, auto_n = None, 0
-        auto_Gz = 1.0
-    if not np.isfinite(auto_Gz):
-        auto_Gz = 1.0
-
-    # Stitch
+    # Stitch — uses the same dz_stats computed before Split.
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
         df_final=df_grouped, aux=aux,
