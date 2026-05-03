@@ -27,6 +27,7 @@ from tracer.spatial import (
     reassign_unassigned_grid_pool,
     demote_small_entities,
 )
+from tracer.pruning import prune_transcripts_nuclear_seed
 from tracer.stitching import (
     apply_stitching_to_transcripts_memory_efficient,
     estimate_within_cell_dz_threshold,
@@ -117,38 +118,52 @@ def run_segmented_pipeline(df: pd.DataFrame,
     if not np.isfinite(auto_Gz):
         auto_Gz = 1.0
 
-    # Stage 1 — Prune.
-    # Use the PMI column when available (not NPMI). NPMI's bounded
-    # [-1,+1] scale suppresses signal from rare-gene pairs; PMI
-    # preserves the log-ratio magnitude. NaN→0 so untested gene pairs
-    # don't grant "ghost survival" via panel coverage gaps.
-    # Fall back to NPMI if the panel lacks a PMI column (e.g., legacy
-    # synthetic panels).
+    # Stage 1 — Prune (nuclear-seed when overlaps_nucleus is available).
+    # Use PMI column when available; nuclear-seed identity prune
+    # anchors each cell on its compact nucleus, then admits cytoplasmic
+    # tx via mean PMI to the seed. Recursive Phase 1c surfaces
+    # secondary modules as partials. Fall back to NPMI/whole-cell prune
+    # if the panel lacks a PMI column or the input has no nuclear flag
+    # (legacy synthetic panels).
     metric_col = "PMI" if "PMI" in npmi_panel.columns else "NPMI"
-    df_pruned, aux = prune_transcripts_fast(
-        df, npmi_panel,
-        cell_id_col="cell_id", gene_col="feature_name",
-        threshold=PMI_THR, unassigned_id="-1",
-        metric_col=metric_col, nan_fill=0.0,
-        n_jobs=-1, show_progress=False,
-    )
+    if "overlaps_nucleus" in df.columns:
+        df_pruned, aux = prune_transcripts_nuclear_seed(
+            df, npmi_panel,
+            cell_id_col="cell_id", gene_col="feature_name",
+            nuclear_col="overlaps_nucleus",
+            threshold=PMI_THR, unassigned_id="-1",
+            metric_col=metric_col, nan_fill=0.0,
+            min_nuclear_genes=3,
+            n_jobs=-1, show_progress=False,
+        )
+    else:
+        df_pruned, aux = prune_transcripts_fast(
+            df, npmi_panel,
+            cell_id_col="cell_id", gene_col="feature_name",
+            threshold=PMI_THR, unassigned_id="-1",
+            metric_col=metric_col, nan_fill=0.0,
+            n_jobs=-1, show_progress=False,
+        )
     _record_stage(progression, "Prune", df_pruned, "tracer_id")
 
-    # Stage 4 — Split (after-S1 position, grid_3d).
-    # G_z auto-derived from bimodality, depth fixed at 1.
-    def _split_graph_fn(df_in, *, k=None, dist_threshold=None,
-                        coord_cols=("x", "y", "z")):
-        return _grid_3d_graph_fn(df_in, k=k, dist_threshold=dist_threshold,
-                                 coord_cols=coord_cols,
-                                 G_z=auto_Gz, z_neighborhood_depth=1)
-
-    df_pruned = enforce_spatial_coherence_fast(
-        df_stitched=df_pruned, build_graph_fn=_split_graph_fn,
-        entity_col="tracer_id", coord_cols=("x", "y", "z"),
-        k=5, dist_threshold=5.0,
-        out_col="tracer_id", show_progress=False,
-    )
-    _record_stage(progression, "Split", df_pruned, "tracer_id")
+    # Split stage REMOVED. The nuclear-seed prune emits spatially
+    # compact entities by construction (anchored on the nucleus), so
+    # there are no spatially-disconnected gene clusters for Split to
+    # fragment. For legacy whole-cell prune (no overlaps_nucleus), we
+    # still run Split as a safety net.
+    if "overlaps_nucleus" not in df.columns:
+        def _split_graph_fn(df_in, *, k=None, dist_threshold=None,
+                            coord_cols=("x", "y", "z")):
+            return _grid_3d_graph_fn(df_in, k=k, dist_threshold=dist_threshold,
+                                     coord_cols=coord_cols,
+                                     G_z=auto_Gz, z_neighborhood_depth=1)
+        df_pruned = enforce_spatial_coherence_fast(
+            df_stitched=df_pruned, build_graph_fn=_split_graph_fn,
+            entity_col="tracer_id", coord_cols=("x", "y", "z"),
+            k=5, dist_threshold=5.0,
+            out_col="tracer_id", show_progress=False,
+        )
+        _record_stage(progression, "Split", df_pruned, "tracer_id")
 
     # Initial Rescue
     df_pruned, n_rescued, n_skipped, _ = pre_stage2_rescue(
