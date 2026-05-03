@@ -42,8 +42,10 @@ def estimate_within_cell_dz_threshold(
     z_col: str = "z",
     n_sample: int = 50,
     min_entity_size: int = 5,
-    cohens_d_threshold: float = 0.8,
+    cohens_d_threshold: float = 3.0,
     target_percentile: float = 90.0,
+    unimodal_percentile: float = 50.0,
+    min_recommended_G_z: float = 1.0,
     seed: int = 42,
 ) -> dict:
     """Estimate a within-cell |Δz| threshold from segmented input.
@@ -81,12 +83,31 @@ def estimate_within_cell_dz_threshold(
     min_entity_size : int, default 5
         Skip entities below this transcript count (no meaningful
         pairwise statistic).
-    cohens_d_threshold : float, default 0.8
+    cohens_d_threshold : float, default 3.0
         Cohen's d cutoff between the two GMM components for
-        declaring bimodality. 0.8 corresponds to a large effect size.
+        declaring bimodality. d ≥ 3 corresponds to nearly-disjoint
+        modes (the means are 3+ pooled std-deviations apart). The
+        default is intentionally strict because a unimodal
+        triangular distribution (e.g., within-cell |Δz| pairs from
+        clean ground-truth cells) trivially splits into two GMM
+        components with d ≈ 2 — strict cutoff prevents that
+        spurious bimodality from misleading the threshold.
     target_percentile : float in [0, 100], default 90
-        Percentile of the smaller-mean mode (or full distribution if
-        unimodal) to report as the within-cell threshold.
+        Percentile of the **smaller-mean GMM mode** to report as the
+        threshold when the data is bimodal. The smaller mode is the
+        within-cell distribution (cross-stratum pairs go in the larger
+        mode), so its right tail is a robust upper bound on legitimate
+        within-cell |Δz|.
+    unimodal_percentile : float in [0, 100], default 50
+        Percentile of the **full pooled distribution** to report when
+        the data is unimodal (Cohen's d below cutoff). The unimodal
+        case typically arises from clean segmentation — the right
+        tail then includes pathologically z-elongated entities and
+        isn't a reliable scale, so the median is a more robust
+        within-cell-scale estimate than higher percentiles.
+    min_recommended_G_z : float, default 1.0
+        Floor for the ``recommended_G_z`` output (in µm). Useful when
+        downstream tooling assumes integer-µm bins.
     seed : int, default 42
         Random seed for entity sampling and GMM initialization.
 
@@ -125,6 +146,7 @@ def estimate_within_cell_dz_threshold(
             "smaller_mode_mean": float("nan"),
             "smaller_mode_std":  float("nan"),
             "smaller_mode_weight": float("nan"),
+            "recommended_G_z": float("nan"),
             "n_sampled_entities": 0, "n_pairs": 0,
         }
 
@@ -151,6 +173,7 @@ def estimate_within_cell_dz_threshold(
             "smaller_mode_mean": float("nan"),
             "smaller_mode_std":  float("nan"),
             "smaller_mode_weight": float("nan"),
+            "recommended_G_z": float("nan"),
             "n_sampled_entities": len(sampled), "n_pairs": int(arr.size),
         }
 
@@ -177,7 +200,16 @@ def estimate_within_cell_dz_threshold(
             smaller_arr = arr  # safety
         threshold = float(np.percentile(smaller_arr, float(target_percentile)))
     else:
-        threshold = float(np.percentile(arr, float(target_percentile)))
+        threshold = float(np.percentile(arr, float(unimodal_percentile)))
+
+    # Recommended G_z: smallest 1-µm-multiple ≥ threshold (with a floor).
+    # G_z too small over-fragments cells unnecessarily; G_z too large
+    # misses z-stratification structure. ceil(threshold) sits just
+    # above the within-cell scale, so within-cell merges are still
+    # admitted at depth=1 while cross-stratum merges (Δz > threshold)
+    # get rejected.
+    recommended_G_z = float(max(float(min_recommended_G_z),
+                                np.ceil(threshold)))
 
     return {
         "threshold": threshold,
@@ -189,6 +221,7 @@ def estimate_within_cell_dz_threshold(
         "smaller_mode_mean":   float(means[smaller_idx]),
         "smaller_mode_std":    float(stds[smaller_idx]),
         "smaller_mode_weight": float(weights[smaller_idx]),
+        "recommended_G_z":     recommended_G_z,
         "n_sampled_entities":  int(len(sampled)),
         "n_pairs":             int(arr.size),
     }

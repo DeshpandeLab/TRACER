@@ -1,6 +1,6 @@
 {
-  "ami_vs_truth": 0.7875,
-  "ari_vs_truth": 0.6776,
+  "ami_vs_truth": 0.7391,
+  "ari_vs_truth": 0.6087,
   "coverage_pct": 90.18,
   "n_cells": 8,
   "n_clipped_cells": 7,
@@ -46,7 +46,7 @@
     {
       "n_cells": 8,
       "n_components": 1,
-      "n_partials": 12,
+      "n_partials": 13,
       "n_unassigned_tx": 1,
       "stage": "Stitch"
     },
@@ -54,7 +54,7 @@
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 0,
-      "n_unassigned_tx": 21,
+      "n_unassigned_tx": 25,
       "stage": "Demote"
     },
     {

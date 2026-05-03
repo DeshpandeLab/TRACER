@@ -1,11 +1,11 @@
 {
-  "ami_vs_truth": 0.8388,
-  "ari_vs_truth": 0.7892,
-  "coverage_pct": 85.0,
+  "ami_vs_truth": 0.8,
+  "ari_vs_truth": 0.7221,
+  "coverage_pct": 86.5,
   "n_cells": 8,
   "n_components": 0,
-  "n_partials": 0,
-  "n_unassigned_tx": 30,
+  "n_partials": 1,
+  "n_unassigned_tx": 27,
   "stage_progression": [
     {
       "n_cells": 8,
@@ -52,15 +52,15 @@
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 0,
-      "n_unassigned_tx": 44,
+      "n_partials": 1,
+      "n_unassigned_tx": 42,
       "stage": "Demote"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 0,
-      "n_unassigned_tx": 30,
+      "n_partials": 1,
+      "n_unassigned_tx": 27,
       "stage": "Final Rescue"
     }
   ]

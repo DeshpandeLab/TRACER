@@ -139,17 +139,24 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
-    # Auto-derive within-cell |Δz| threshold from the raw input
-    # segmentation. Bimodal Voronoi cells (which contain stacked
-    # stratum cells) yield a clean low-mode for within-cell Δz; the
-    # 90 %ile of that mode bounds legitimate cell-spanning merges.
+    # Auto-derive within-cell |Δz| threshold and the matching G_z bin
+    # size from the raw input segmentation. Bimodal Voronoi cells
+    # (which contain stacked stratum cells) yield a clean low-mode for
+    # within-cell Δz; its 90 %ile bounds legitimate cell-spanning
+    # merges. Unimodal real-data inputs fall back to the median (50 %ile)
+    # of the full pool — a more robust scale than the long right tail
+    # contaminated by pathologically z-elongated entities. G_z is set
+    # to ceil(threshold), the smallest 1-µm bin that still admits
+    # within-cell merges at depth=1.
     dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
     auto_dz = dz_stats["threshold"]
+    auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
     if not np.isfinite(auto_dz):
-        # Fallback: skip the Δz guard if no eligible entities.
+        # Fallback: skip the Δz guard, use a 1 µm default G_z.
         auto_dz, auto_n = None, 0
-    else:
-        auto_n = 5
+        auto_Gz = 1.0
+    if not np.isfinite(auto_Gz):
+        auto_Gz = 1.0
 
     # Stitch
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
@@ -161,8 +168,9 @@ def run_segmented_pipeline(df: pd.DataFrame,
         penalize_simplicity=True, deltaC_min=0.0,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
-        G_z=1.0, z_neighbor_depth=1,
-        min_close_edges_dz=auto_dz, min_close_edges_n=auto_n,
+        G_z=auto_Gz, z_neighbor_depth=1,
+        min_close_edges_dz=auto_dz,
+        min_close_edges_n=5 if auto_dz is not None else 0,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
