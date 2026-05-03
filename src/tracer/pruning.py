@@ -476,6 +476,212 @@ def prune_transcripts_fast(
     }
     return df, aux
 
+def prune_transcripts_nuclear_seed(
+    df,
+    npmi_df,
+    *,
+    cell_id_col: str = "cell_id",
+    out_col: str = "tracer_id",
+    gene_col: str = "feature_name",
+    nuclear_col: str = "overlaps_nucleus",
+    threshold: float = 1e-5,
+    unassigned_id: str = "-1",
+    metric_col: str = "PMI",
+    nan_fill: float = 0.0,
+    min_nuclear_genes: int = 3,
+    show_progress: bool = False,
+    n_jobs: int = -1,
+    debug_stages: bool = False,
+    in_place: bool = False,
+    housekeeping_pos_thresh: float = 0.05,
+    housekeeping_neg_thresh: float = -0.05,
+    housekeeping_min_strong_count: int = 5,
+):
+    """Nuclear-seed Prune: anchor cell identity on the spatially-compact
+    nucleus, then admit cytoplasmic tx whose gene fits the seed by PMI.
+
+    Per-cell algorithm:
+      Phase 1a: Run the greedy bad-edge pruner on the cell's NUCLEAR-tx
+        gene set only. The retained set is the cell's "seed" — its
+        primary identity, anchored on the spatially compact nucleus.
+        If the cell has fewer than ``min_nuclear_genes`` unique nuclear
+        genes, fall back to the standard whole-cell prune.
+
+      Phase 1b: For every tx in the cell (nuclear + cytoplasmic), test
+        whether its gene fits the seed by mean PMI. Admit to the main
+        cell if mean PMI ≥ ``threshold``; otherwise rejected to the
+        rest-pile.
+
+      Phase 1c: Run greedy prune recursively on the rest-pile's nuclear
+        genes. The retained sub-seed becomes a partial entity; its
+        cytoplasmic-gene-fit tx admit to the partial. Tx with neither
+        seed nor sub-seed support get demoted to ``unassigned_id``,
+        leaving them for downstream Rescue.
+
+    The PMI scoring uses ``nan_fill`` (default 0.0) so untested gene
+    pairs don't grant ghost survival.
+
+    Returns ``(df_out, aux)`` matching the signature of
+    :func:`prune_transcripts_fast`. ``aux`` carries the same keys plus
+    a ``"seed_per_cell"`` mapping for downstream introspection.
+    """
+    _ensure_reproducibility_seed()
+
+    if nuclear_col not in df.columns:
+        # Fallback: no nucleus information → run standard whole-cell prune
+        return prune_transcripts_fast(
+            df, npmi_df,
+            cell_id_col=cell_id_col, out_col=out_col, gene_col=gene_col,
+            threshold=threshold, unassigned_id=unassigned_id,
+            metric_col=metric_col, nan_fill=nan_fill,
+            n_jobs=n_jobs, show_progress=show_progress,
+            in_place=in_place, debug_stages=debug_stages,
+            housekeeping_pos_thresh=housekeeping_pos_thresh,
+            housekeeping_neg_thresh=housekeeping_neg_thresh,
+            housekeeping_min_strong_count=housekeeping_min_strong_count,
+        )
+
+    if not in_place:
+        df = df.copy()
+    prepare_transcript_df(df, gene_col=gene_col)
+
+    df["_cell_str"] = df[cell_id_col].astype(str)
+    df["_is_nuc"] = df[nuclear_col].astype(bool)
+
+    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df, npmi_col=metric_col)
+    if nan_fill is not None:
+        np.nan_to_num(W, copy=False, nan=float(nan_fill))
+    df["_gene_idx"] = df[gene_col].map(gene_to_idx)
+
+    df[out_col] = df["_cell_str"].copy()
+
+    seed_per_cell: dict[str, list[int]] = {}
+    partial_map: dict[str, str] = {}
+
+    def _greedy_prune_local(g_local: np.ndarray) -> set[int]:
+        """Returns set of gene indices retained after one pass of greedy
+        bad-edge removal on the local NPMI/PMI submatrix."""
+        if g_local.size <= 1:
+            return set(g_local.tolist())
+        subW = W[np.ix_(g_local, g_local)]
+        bad = (subW < threshold)
+        np.fill_diagonal(bad, False)
+        active = np.ones(g_local.size, dtype=bool)
+        while active.sum() > 1:
+            counts = np.zeros(g_local.size, dtype=int)
+            for i in range(g_local.size):
+                if active[i]:
+                    counts[i] = int((bad[i] & active).sum())
+            if counts.max() == 0:
+                break
+            rm = int(np.argmax(counts))
+            active[rm] = False
+        return set(g_local[active].tolist())
+
+    def _mean_pmi_to(gene_idx: int, seed_idx: set[int]) -> float:
+        if not seed_idx:
+            return float("-inf")
+        if gene_idx in seed_idx:
+            return float("inf")
+        vals = [W[gene_idx, s] for s in seed_idx]
+        if not vals:
+            return float("-inf")
+        return float(np.mean(vals))
+
+    # Per-cell loop
+    cells = [c for c in df["_cell_str"].unique() if c != unassigned_id]
+    for cid in cells:
+        mask_cell = (df["_cell_str"] == cid)
+        cell_df = df[mask_cell]
+
+        # Phase 1a — nuclear seed
+        nuc_genes_idx = (cell_df.loc[cell_df["_is_nuc"], "_gene_idx"]
+                         .dropna().astype(int).unique())
+        nuc_genes_idx = np.sort(nuc_genes_idx)
+
+        if len(nuc_genes_idx) >= int(min_nuclear_genes):
+            seed_idx = _greedy_prune_local(nuc_genes_idx)
+        else:
+            # Fallback: prune on whole-cell gene set
+            all_genes_idx = (cell_df["_gene_idx"].dropna().astype(int).unique())
+            all_genes_idx = np.sort(all_genes_idx)
+            seed_idx = _greedy_prune_local(all_genes_idx)
+
+        seed_per_cell[cid] = sorted(seed_idx)
+
+        if not seed_idx:
+            # No coherent seed → demote everything to unassigned
+            df.loc[mask_cell, out_col] = unassigned_id
+            continue
+
+        # Phase 1b — admit each tx by gene's mean PMI to seed
+        cell_idx = cell_df.index
+        gene_idx_arr = cell_df["_gene_idx"].to_numpy()
+        admit_mask = np.zeros(len(cell_df), dtype=bool)
+        for i, g in enumerate(gene_idx_arr):
+            if pd.isna(g):
+                continue
+            g = int(g)
+            if g in seed_idx:
+                admit_mask[i] = True
+            else:
+                if _mean_pmi_to(g, seed_idx) >= float(threshold):
+                    admit_mask[i] = True
+        # Tx that fit seed → main cell (already labelled with cid)
+        # Tx that don't → flag for phase 1c
+        rejected = cell_idx[~admit_mask]
+
+        if len(rejected) == 0:
+            continue
+
+        # Phase 1c — recursive prune on rejected genes
+        rejected_df = df.loc[rejected]
+        rej_nuc_idx = (rejected_df.loc[rejected_df["_is_nuc"], "_gene_idx"]
+                       .dropna().astype(int).unique())
+        rej_nuc_idx = np.sort(rej_nuc_idx)
+
+        if len(rej_nuc_idx) >= int(min_nuclear_genes):
+            sub_seed_idx = _greedy_prune_local(rej_nuc_idx)
+        else:
+            sub_seed_idx = set()
+
+        if sub_seed_idx:
+            partial_label = f"{cid}-1"
+            partial_map[cid] = partial_label
+            # Admit rejected tx into partial if their gene fits sub-seed
+            rej_gene_idx = rejected_df["_gene_idx"].to_numpy()
+            sub_admit_mask = np.zeros(len(rejected), dtype=bool)
+            for i, g in enumerate(rej_gene_idx):
+                if pd.isna(g):
+                    continue
+                g = int(g)
+                if g in sub_seed_idx:
+                    sub_admit_mask[i] = True
+                elif _mean_pmi_to(g, sub_seed_idx) >= float(threshold):
+                    sub_admit_mask[i] = True
+
+            sub_admit_idx = rejected[sub_admit_mask]
+            sub_unas_idx = rejected[~sub_admit_mask]
+            df.loc[sub_admit_idx, out_col] = partial_label
+            df.loc[sub_unas_idx, out_col] = unassigned_id
+        else:
+            df.loc[rejected, out_col] = unassigned_id
+
+    df.drop(columns=["_cell_str", "_is_nuc", "_gene_idx"], inplace=True)
+
+    from .stitching import compute_housekeeping_mask
+    aux = {
+        "genes": genes,
+        "gene_to_idx": gene_to_idx,
+        "W": W,
+        "partial_map": partial_map,
+        "threshold": threshold,
+        "housekeeping_mask": compute_housekeeping_mask(W),
+        "seed_per_cell": seed_per_cell,
+    }
+    return df, aux
+
+
 def pairwise_npmi_stats(gene_ids, W):
     if gene_ids.size <= 1:
         return dict(
