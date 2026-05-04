@@ -426,6 +426,90 @@ def coherence_count_kernel(
     return (purity - conflict), purity, conflict
 
 
+def coherence_count_primitives(
+    cnp.ndarray[cnp.int32_t, ndim=1] gene_ids,
+    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    double threshold,
+):
+    """Like `coherence_count_kernel` but returns the raw counts
+    (n_above, n_below, n_finite) instead of (C, purity, conflict).
+    Used by the decomposable-coherence Stitch path for primitive-sum
+    arithmetic across merges."""
+    cdef int k = gene_ids.shape[0]
+    if k < 2:
+        return 0, 0, 0
+    cdef cnp.int32_t[:] g_mv = gene_ids
+    cdef cnp.float32_t[:, :] W_mv = W
+    cdef int i, j, gi, gj
+    cdef int n_above = 0
+    cdef int n_below = 0
+    cdef int n_finite = 0
+    cdef float v
+    cdef double neg_thr = -threshold
+    for i in range(k):
+        gi = g_mv[i]
+        for j in range(i + 1, k):
+            gj = g_mv[j]
+            v = W_mv[gi, gj]
+            if v != v:  # NaN
+                continue
+            n_finite += 1
+            if v > threshold:
+                n_above += 1
+            elif v < neg_thr:
+                n_below += 1
+    return n_above, n_below, n_finite
+
+
+def coherence_cross_primitives(
+    cnp.ndarray[cnp.int32_t, ndim=1] gene_ids_a,
+    cnp.ndarray[cnp.int32_t, ndim=1] gene_ids_b,
+    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    double threshold,
+):
+    """Cross-set primitives: count of (g_a, g_b) pairs with g_a in
+    gene_ids_a, g_b in gene_ids_b, g_a != g_b, where W[g_a, g_b] is
+    above/below threshold. Returns (n_above, n_below, n_finite).
+
+    Used to compute coh(union) from primitives:
+      coh(P ∪ Q) = (a + b + a×b - common_internal_double_count) / ...
+    where common_internal subtracts overlap to avoid double-count.
+
+    Caller must pass gene_ids_a and gene_ids_b as DISJOINT arrays for
+    the simple-sum semantics. For overlap-aware union, decompose
+    P ∪ Q = (P\Q) ∪ (Q\P) ∪ (P∩Q) into 3 disjoint segments and call
+    this kernel pairwise.
+    """
+    cdef int ka = gene_ids_a.shape[0]
+    cdef int kb = gene_ids_b.shape[0]
+    if ka == 0 or kb == 0:
+        return 0, 0, 0
+    cdef cnp.int32_t[:] ga_mv = gene_ids_a
+    cdef cnp.int32_t[:] gb_mv = gene_ids_b
+    cdef cnp.float32_t[:, :] W_mv = W
+    cdef int i, j, gi, gj
+    cdef int n_above = 0
+    cdef int n_below = 0
+    cdef int n_finite = 0
+    cdef float v
+    cdef double neg_thr = -threshold
+    for i in range(ka):
+        gi = ga_mv[i]
+        for j in range(kb):
+            gj = gb_mv[j]
+            if gi == gj:
+                continue
+            v = W_mv[gi, gj]
+            if v != v:
+                continue
+            n_finite += 1
+            if v > threshold:
+                n_above += 1
+            elif v < neg_thr:
+                n_below += 1
+    return n_above, n_below, n_finite
+
+
 def rescue_per_tx_batch(
     cnp.ndarray[cnp.float32_t, ndim=2] una_coords,    # [n_una, 3] (x,y,z)
     cnp.ndarray[cnp.int64_t, ndim=1] una_g_idx,       # [n_una], gene-vocab idx, -1 = skip
