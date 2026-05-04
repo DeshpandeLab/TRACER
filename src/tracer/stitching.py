@@ -1782,6 +1782,12 @@ def apply_stitching_to_transcripts_memory_efficient(
     tau=_LEGACY_STITCH_KWARG_SENTINEL,
     use_relu=_LEGACY_STITCH_KWARG_SENTINEL,
     use_relative=_LEGACY_STITCH_KWARG_SENTINEL,
+    # Experimental: lazy DSU+heap with decomposable-coherence primitives.
+    # Default False (eager path, byte-unchanged). Bit-match validated on
+    # 500/1000 µm ROIs (99.98%+ per-tx label parity, ARI identical to 4
+    # decimals). See `_stitch_entities_hierarchical_decomposable` for
+    # rationale and `TODO.md` for tissue-scale follow-ups.
+    use_decomposable_stitch: bool = False,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -1909,6 +1915,7 @@ def apply_stitching_to_transcripts_memory_efficient(
         max_pair_median_dz=max_pair_median_dz,
         min_close_edges_dz=min_close_edges_dz,
         min_close_edges_n=min_close_edges_n,
+        use_decomposable_stitch=use_decomposable_stitch,
         **legacy_kwargs,
     )
 
