@@ -1379,26 +1379,27 @@ def stitch_entities_hierarchical(
         """All-axis containment: c[d] ∈ [bb_min[d], bb_max[d]] for all d."""
         return bool(np.all(c >= bb_min) and np.all(c <= bb_max))
 
+    def _spatial_overlap(ra: int, rb: int) -> bool:
+        """Smaller entity's centroid lies inside larger entity's bbox.
+        Only meaningful when `spatial_centroid_gate` is True and arrays
+        are populated; caller checks the gate flag."""
+        n_a = int(root_n_tx[ra])
+        n_b = int(root_n_tx[rb])
+        if n_a <= n_b:
+            small_idx, large_idx = ra, rb
+        else:
+            small_idx, large_idx = rb, ra
+        return _centroid_in_bbox(
+            root_centroid[small_idx],
+            root_bbox_min[large_idx],
+            root_bbox_max[large_idx],
+        )
+
     # constraint: can we merge clusters A and B?
     def can_merge(ra, rb):
         # never merge two clusters that both contain a cell
         if has_cell[ra] and has_cell[rb]:
             return False
-        # Optional spatial gate: smaller entity's centroid must lie
-        # inside the larger entity's bbox.
-        if spatial_centroid_gate and root_centroid is not None:
-            n_a = int(root_n_tx[ra])
-            n_b = int(root_n_tx[rb])
-            if n_a <= n_b:
-                small_idx, large_idx = ra, rb
-            else:
-                small_idx, large_idx = rb, ra
-            if not _centroid_in_bbox(
-                root_centroid[small_idx],
-                root_bbox_min[large_idx],
-                root_bbox_max[large_idx],
-            ):
-                return False
         return True
 
     # ----------------------------------------------------------------
@@ -1481,8 +1482,22 @@ def stitch_entities_hierarchical(
         union_genes.sort()
         return union_prims, union_genes
 
+    # Sentinel ΔC value for spatial-overlap pairs. Pushes them to the
+    # top of the heap (popped first, bypass coherence + threshold).
+    # 1e9 is far above any realistic ΔC value (∈ [-1, 1] in practice).
+    _SPATIAL_OVERLAP_DC = 1e9
+
     # compute deltaC between current roots
     def compute_deltaC_roots(ra, rb):
+        # Spatial bypass (Tier 1): if the smaller entity's centroid is
+        # inside the larger entity's bbox, treat the pair as a
+        # GUARANTEED merge — return a high sentinel ΔC. No coherence /
+        # gene-PMI evaluation is performed. The merge still must
+        # satisfy `can_merge` (cell-cell rule) at pop time.
+        if (spatial_centroid_gate and root_centroid is not None
+                and _spatial_overlap(ra, rb)):
+            return _SPATIAL_OVERLAP_DC
+
         # Decomposable-primitive fast path: derive C(union) from the
         # roots' running primitive sums + on-the-fly cross primitives,
         # without re-iterating the union's full gene-pair set. Bit-
@@ -1560,8 +1575,19 @@ def stitch_entities_hierarchical(
 
     heap = []
     for ei, (i, j) in enumerate(edges):
-        if gate_keep_mask is not None and not gate_keep_mask[ei]:
-            continue  # rejected by top-clique gate; skip expensive ΔC eval
+        # Tier 1 (positive override): spatial-overlap bypass. If the
+        # smaller entity's centroid is inside the larger's bbox, this
+        # pair MUST go on the heap (with sentinel ΔC) regardless of
+        # the gate result. compute_deltaC_roots returns 1e9 for these.
+        is_spatial = (
+            spatial_centroid_gate and root_centroid is not None
+            and _spatial_overlap(i, j)
+        )
+        # Tier 2 (cheap rejection): fast-gate skips expensive eval ONLY
+        # when there's no spatial bypass.
+        if (not is_spatial) and gate_keep_mask is not None and not gate_keep_mask[ei]:
+            continue
+        # Tier 3 (full ΔC eval, or sentinel 1e9 if spatial-overlap)
         di = compute_deltaC_roots(i, j)
         if np.isfinite(di) and di >= deltaC_min:
             heapq.heappush(heap, _heap_item(di, i, j))
