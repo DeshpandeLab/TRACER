@@ -893,6 +893,17 @@ def stitch_entities_hierarchical(
     # 894 merges, 0 mismatches) but not yet on full-tissue scale.
     # Default False (use the existing eager-recompute greedy).
     use_decomposable_stitch: bool = False,
+    # Experimental: top-K positive-clique fast-gate for candidate pairs
+    # at heap-init. For each entity, precompute its K signature genes
+    # (highest sum of positive PMI to others in same entity). For each
+    # candidate pair (i, j), scan the K×K cross-PMI block: if ANY entry
+    # is < neg_npmi_threshold, REJECT the pair without computing its
+    # full ΔC. Cuts heap-init Python-loop overhead by skipping the
+    # majority of cell-pair candidates (most are biologically
+    # incompatible). 0 = disabled (no behavior change). Recommended
+    # K = 3-5 for empirical bit-match.
+    fast_gate_top_k: int = 0,
+    fast_gate_neg_threshold: float = -0.05,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1440,8 +1451,43 @@ def stitch_entities_hierarchical(
             a, b = b, a
         return (-dc, a, b)
 
+    # ----------------------------------------------------------------
+    # Optional heap-init fast-gate: drop candidate pairs whose top-clique
+    # cross-PMI block contains a strong-negative entry. For most cell-
+    # pair candidates that are biologically incompatible, this avoids
+    # the expensive compute_deltaC_roots call entirely. The gate is
+    # applied ONLY to the initial edge list (heap-init); boundary
+    # expansion + stale-pop reinserts during the merge loop are unchanged.
+    # ----------------------------------------------------------------
+    gate_keep_mask: np.ndarray | None = None
+    if fast_gate_top_k > 0 and len(edges) > 0:
+        try:
+            from . import _cy_prune as _cyp_gate
+            # Build float32 dense W if not already
+            if isinstance(npmi_mat, np.ndarray) and npmi_mat.dtype == np.float32:
+                _W_f32 = npmi_mat
+            else:
+                import scipy.sparse as _sp
+                if _sp.issparse(npmi_mat):
+                    _W_f32 = npmi_mat.toarray().astype(np.float32)
+                else:
+                    _W_f32 = np.ascontiguousarray(npmi_mat, dtype=np.float32)
+            top_cliques = _cyp_gate.top_k_positive_clique_per_entity(
+                gene_id_lists, _W_f32, int(fast_gate_top_k), float(threshold),
+            )
+            edges_arr = np.asarray(edges, dtype=np.int32)
+            if edges_arr.ndim == 1:
+                edges_arr = edges_arr.reshape(-1, 2)
+            gate_keep_mask = _cyp_gate.fast_gate_pairs(
+                top_cliques, edges_arr, _W_f32, float(fast_gate_neg_threshold),
+            )
+        except Exception:
+            gate_keep_mask = None  # graceful fallback: no gating
+
     heap = []
-    for i, j in edges:
+    for ei, (i, j) in enumerate(edges):
+        if gate_keep_mask is not None and not gate_keep_mask[ei]:
+            continue  # rejected by top-clique gate; skip expensive ΔC eval
         di = compute_deltaC_roots(i, j)
         if np.isfinite(di) and di >= deltaC_min:
             heapq.heappush(heap, _heap_item(di, i, j))
@@ -1788,6 +1834,12 @@ def apply_stitching_to_transcripts_memory_efficient(
     # decimals). See `_stitch_entities_hierarchical_decomposable` for
     # rationale and `TODO.md` for tissue-scale follow-ups.
     use_decomposable_stitch: bool = False,
+    # Experimental: top-K positive-clique fast-gate at heap-init.
+    # 0 = disabled (default). ≥1 enables — pre-filters candidate pairs
+    # using a small per-entity signature signature; rejects pairs with
+    # strong-negative top-clique cross-PMI before expensive ΔC eval.
+    fast_gate_top_k: int = 0,
+    fast_gate_neg_threshold: float = -0.05,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -1916,6 +1968,8 @@ def apply_stitching_to_transcripts_memory_efficient(
         min_close_edges_dz=min_close_edges_dz,
         min_close_edges_n=min_close_edges_n,
         use_decomposable_stitch=use_decomposable_stitch,
+        fast_gate_top_k=fast_gate_top_k,
+        fast_gate_neg_threshold=fast_gate_neg_threshold,
         **legacy_kwargs,
     )
 

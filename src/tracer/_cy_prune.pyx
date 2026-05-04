@@ -384,6 +384,114 @@ def prune_cells_nuclear_seed(
     return out
 
 
+def top_k_positive_clique_per_entity(
+    list gene_id_lists,
+    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    int K,
+    double pos_threshold,
+):
+    """For each entity, identify its top-K signature genes — the K genes
+    with highest sum of positive PMI to other genes in the same entity.
+
+    Returns int32 ndarray of shape (n_entities, K). Unused slots are -1
+    (e.g., when an entity has fewer than K genes).
+
+    Used as a cheap pre-filter signature: two cells whose top-clique
+    cross-PMI block contains a strong-negative entry are very unlikely
+    to have positive ΔC at the full-pair level.
+    """
+    cdef int n_ent = len(gene_id_lists)
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] out = np.full((n_ent, K), -1, dtype=np.int32)
+    cdef cnp.int32_t[:, :] out_mv = out
+    cdef cnp.float32_t[:, :] W_mv = W
+    cdef int e, n_genes, i, j, gi, gj, k
+    cdef float v
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] g_arr
+    cdef cnp.int32_t[:] g_mv
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] scores
+    cdef cnp.float64_t[:] scores_mv
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] order
+
+    for e in range(n_ent):
+        obj = gene_id_lists[e]
+        if obj is None:
+            continue
+        g_arr = np.asarray(obj, dtype=np.int32)
+        n_genes = g_arr.shape[0]
+        if n_genes == 0:
+            continue
+        if n_genes <= K:
+            g_mv = g_arr
+            for i in range(n_genes):
+                out_mv[e, i] = g_mv[i]
+            continue
+        scores = np.zeros(n_genes, dtype=np.float64)
+        scores_mv = scores
+        g_mv = g_arr
+        for i in range(n_genes):
+            gi = g_mv[i]
+            for j in range(n_genes):
+                if i == j:
+                    continue
+                gj = g_mv[j]
+                v = W_mv[gi, gj]
+                if v != v:
+                    continue
+                if v > pos_threshold:
+                    scores_mv[i] += v
+        # Top K by score (np.argsort returns ascending; take last K)
+        order = np.argsort(scores)
+        for k in range(K):
+            out_mv[e, k] = g_mv[order[n_genes - 1 - k]]
+    return out
+
+
+def fast_gate_pairs(
+    cnp.ndarray[cnp.int32_t, ndim=2] top_cliques,        # [n_ent, K]
+    cnp.ndarray[cnp.int32_t, ndim=2] pair_indices,        # [n_pairs, 2]
+    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    double neg_threshold,
+):
+    """Vectorised batch gate. Returns uint8 array of length n_pairs:
+    1 if the pair SURVIVES (no strong-negative cross-pair in top-clique
+    block), 0 if rejected.
+
+    For each pair (i, j): scan W[top_cliques[i, *], top_cliques[j, *]]
+    for any value < neg_threshold (skipping -1 placeholders).
+    """
+    cdef int n_pairs = pair_indices.shape[0]
+    cdef int K = top_cliques.shape[1]
+    cdef cnp.ndarray[cnp.uint8_t, ndim=1] keep = np.ones(n_pairs, dtype=np.uint8)
+    cdef cnp.uint8_t[:] keep_mv = keep
+    cdef cnp.int32_t[:, :] tc_mv = top_cliques
+    cdef cnp.int32_t[:, :] pi_mv = pair_indices
+    cdef cnp.float32_t[:, :] W_mv = W
+    cdef int p, i, j, a, b, gi, gj
+    cdef float v
+    for p in range(n_pairs):
+        i = pi_mv[p, 0]
+        j = pi_mv[p, 1]
+        for a in range(K):
+            gi = tc_mv[i, a]
+            if gi < 0:
+                continue
+            for b in range(K):
+                gj = tc_mv[j, b]
+                if gj < 0:
+                    continue
+                if gi == gj:
+                    continue
+                v = W_mv[gi, gj]
+                if v != v:
+                    continue
+                if v < neg_threshold:
+                    keep_mv[p] = 0
+                    break
+            if keep_mv[p] == 0:
+                break
+    return keep
+
+
 def coherence_count_kernel(
     cnp.ndarray[cnp.int32_t, ndim=1] gene_ids,
     cnp.ndarray[cnp.float32_t, ndim=2] W,
