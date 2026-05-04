@@ -30,22 +30,22 @@
     },
     {
       "n_cells": 8,
-      "n_components": 0,
+      "n_components": 2,
       "n_partials": 13,
-      "n_unassigned_tx": 3,
-      "stage": "Initial Rescue"
-    },
-    {
-      "n_cells": 8,
-      "n_components": 0,
-      "n_partials": 13,
-      "n_unassigned_tx": 3,
+      "n_unassigned_tx": 5,
       "stage": "Group"
     },
     {
       "n_cells": 8,
-      "n_components": 0,
-      "n_partials": 11,
+      "n_components": 2,
+      "n_partials": 13,
+      "n_unassigned_tx": 3,
+      "stage": "Rescue"
+    },
+    {
+      "n_cells": 8,
+      "n_components": 2,
+      "n_partials": 12,
       "n_unassigned_tx": 3,
       "stage": "Stitch"
     },
@@ -53,7 +53,7 @@
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 1,
-      "n_unassigned_tx": 23,
+      "n_unassigned_tx": 28,
       "stage": "Demote"
     },
     {

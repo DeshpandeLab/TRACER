@@ -179,16 +179,39 @@ def run_segmented_pipeline(df: pd.DataFrame,
         )
         _record_stage(progression, "Split", df_pruned, "tracer_id")
 
-    # Initial Rescue — iterate up to RESCUE_MAX_PASSES with early-stop.
-    # Each pass reseeds gene sets from newly-rescued tx, letting tendrils
-    # of irregular cells extend by one neighbour per pass. Convergence
-    # diagnostic: 3 passes captures ≥98 % of asymptotic gain (50 µm and
-    # 500 µm crops both); pass 1 alone is 65–92 %, pass 2 closes most
-    # of the gap.
+    # Group BEFORE Rescue (variant C / yield-optimal default).
+    #
+    # Empirically (lung 500 µm ROI, post-DROP-retirement sweep):
+    #   A baseline (Prune → Rescue → Group → Stitch → ...): ARI 0.798, unas 6,106
+    #   B skip-IR  (Prune → Group → Stitch → ...):           ARI 0.813, unas 6,738
+    #   C swap     (Prune → Group → Rescue → Stitch → ...):  ARI 0.793, unas 5,557 ← yield-optimal
+    #
+    # C wins on yield (~−500 to −1,200 unas vs A/B): Group assembles
+    # spatially-coherent unassigned tx into comp pseudo-entities, then
+    # Rescue picks up the leftovers (incl. group_rejected DROP-pile tx
+    # whose individual gene happens to fit a nearby cell). Two passes at
+    # the unassigned pool — one entity-level (Group), one tx-level
+    # (Rescue) — recover more than either alone.
+    df_grouped = annotate_unassigned_components_fast(
+        df_pruned=df_pruned, aux=aux,
+        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
+        coord_cols=("x", "y", "z"),
+        k=8, dist_threshold=1.5, min_comp_size=4,
+        npmi_threshold=ANNOTATE_NEG_THR,
+        entity_col="tracer_id", out_col="tracer_id",
+        cell_id_col="cell_id", gene_col="feature_name",
+        transcript_id_col="transcript_id", show_progress=False,
+    )
+    _record_stage(progression, "Group", df_grouped, "tracer_id")
+
+    # Rescue — iterate up to RESCUE_MAX_PASSES with early-stop. Each pass
+    # reseeds gene sets from newly-rescued tx, letting tendrils of
+    # irregular cells extend by one neighbour per pass. Convergence
+    # diagnostic: 3 passes captures ≥98 % of asymptotic gain.
     n_rescued = 0
     for _pass in range(RESCUE_MAX_PASSES):
-        df_pruned, n_pass_rescued, _, _ = pre_stage2_rescue(
-            df_pruned, aux=aux,
+        df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
+            df_grouped, aux=aux,
             entity_col="tracer_id", gene_col="feature_name",
             coord_cols=("x", "y", "z"), out_col="tracer_id",
             G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
@@ -197,21 +220,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
         )
         n_rescued += n_pass_rescued
         if n_pass_rescued == 0:
-            break  # converged; further passes can't add anything
-    _record_stage(progression, "Initial Rescue", df_pruned, "tracer_id")
-
-    # Group
-    df_grouped = annotate_unassigned_components_fast(
-        df_pruned=df_pruned, aux=aux,
-        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
-        coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=5,
-        npmi_threshold=ANNOTATE_NEG_THR,
-        entity_col="tracer_id", out_col="tracer_id",
-        cell_id_col="cell_id", gene_col="feature_name",
-        transcript_id_col="transcript_id", show_progress=False,
-    )
-    _record_stage(progression, "Group", df_grouped, "tracer_id")
+            break
+    _record_stage(progression, "Rescue", df_grouped, "tracer_id")
 
     # Stitch — uses the same dz_stats computed before Split.
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
