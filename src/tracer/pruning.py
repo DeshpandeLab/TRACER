@@ -496,9 +496,16 @@ def prune_transcripts_nuclear_seed(
     housekeeping_pos_thresh: float = 0.05,
     housekeeping_neg_thresh: float = -0.05,
     housekeeping_min_strong_count: int = 5,
+    skip_phase_1c: bool = False,
 ):
     """Nuclear-seed Prune: anchor cell identity on the spatially-compact
     nucleus, then admit cytoplasmic tx whose gene fits the seed by PMI.
+
+    If ``skip_phase_1c=True``, the recursive sub-seed carve-out (Phase
+    1c) is skipped — rest-pile tx (those that fail Phase 1b admission)
+    go straight to ``unassigned_id``. Group + Stitch handle them
+    downstream. Faster Prune; loses partial-label identity for EMT-
+    style sub-modules.
 
     Per-cell algorithm:
       Phase 1a: Run the greedy bad-edge pruner on the cell's NUCLEAR-tx
@@ -555,119 +562,76 @@ def prune_transcripts_nuclear_seed(
 
     df[out_col] = df["_cell_str"].copy()
 
-    seed_per_cell: dict[str, list[int]] = {}
     partial_map: dict[str, str] = {}
 
-    def _greedy_prune_local(g_local: np.ndarray) -> set[int]:
-        """Returns set of gene indices retained after one pass of greedy
-        bad-edge removal on the local NPMI/PMI submatrix."""
-        if g_local.size <= 1:
-            return set(g_local.tolist())
-        subW = W[np.ix_(g_local, g_local)]
-        bad = (subW < threshold)
-        np.fill_diagonal(bad, False)
-        active = np.ones(g_local.size, dtype=bool)
-        while active.sum() > 1:
-            counts = np.zeros(g_local.size, dtype=int)
-            for i in range(g_local.size):
-                if active[i]:
-                    counts[i] = int((bad[i] & active).sum())
-            if counts.max() == 0:
-                break
-            rm = int(np.argmax(counts))
-            active[rm] = False
-        return set(g_local[active].tolist())
+    # ---- Cython batch: per-cell Phase 1a/1b/1c in a single C-level call ----
+    # The Python per-cell loop with DataFrame masking is O(n_cells × n_tx)
+    # — for 58k cells × 1.4M tx that's ~80B mask ops. _cy_prune.prune_cells_nuclear_seed
+    # processes all cells in one C pass with no per-cell DataFrame work.
+    #
+    # Inputs: per-cell row-index lists + flat tx arrays. Returned codes
+    # per tx: 0 = main, 1 = partial, 2 = unassigned.
+    #
+    # We need integer row positions (not pandas index labels) so the
+    # Cython kernel can index directly into the arrays. df is already
+    # `.copy()` so its index is a fresh RangeIndex unless the caller
+    # passed an unusual one — we use np.arange(len(df)) explicitly to
+    # be safe.
+    n_tx = len(df)
+    df["_row_pos"] = np.arange(n_tx, dtype=np.int32)
 
-    def _mean_pmi_to(gene_idx: int, seed_idx: set[int]) -> float:
-        if not seed_idx:
-            return float("-inf")
-        if gene_idx in seed_idx:
-            return float("inf")
-        vals = [W[gene_idx, s] for s in seed_idx]
-        if not vals:
-            return float("-inf")
-        return float(np.mean(vals))
+    # Build per-cell row-position lists via groupby (one O(N) pass,
+    # replaces the n_cells × n_tx masking loop).
+    grouped_positions = df[df["_cell_str"] != unassigned_id].groupby(
+        "_cell_str", sort=False
+    )["_row_pos"].apply(lambda s: s.to_numpy(dtype=np.int32))
+    cell_ids = list(grouped_positions.index)
+    cell_tx_idx_lists = [grouped_positions.iloc[i] for i in range(len(cell_ids))]
 
-    # Per-cell loop
-    cells = [c for c in df["_cell_str"].unique() if c != unassigned_id]
-    for cid in cells:
-        mask_cell = (df["_cell_str"] == cid)
-        cell_df = df[mask_cell]
+    # Flat per-tx arrays. -1 marks "no gene-idx" (NaN in the map).
+    gene_idx_int = (df["_gene_idx"]
+                    .where(df["_gene_idx"].notna(), -1)
+                    .astype(np.int32).to_numpy())
+    is_nuc_int = df["_is_nuc"].to_numpy().astype(np.uint8)
 
-        # Phase 1a — nuclear seed
-        nuc_genes_idx = (cell_df.loc[cell_df["_is_nuc"], "_gene_idx"]
-                         .dropna().astype(int).unique())
-        nuc_genes_idx = np.sort(nuc_genes_idx)
+    codes = _cy_prune.prune_cells_nuclear_seed(
+        cell_tx_idx_lists,
+        gene_idx_int,
+        is_nuc_int,
+        W if W.dtype == np.float32 else W.astype(np.float32),
+        float(threshold),
+        int(min_nuclear_genes),
+        1 if skip_phase_1c else 0,
+    )
 
-        if len(nuc_genes_idx) >= int(min_nuclear_genes):
-            seed_idx = _greedy_prune_local(nuc_genes_idx)
-        else:
-            # Fallback: prune on whole-cell gene set
-            all_genes_idx = (cell_df["_gene_idx"].dropna().astype(int).unique())
-            all_genes_idx = np.sort(all_genes_idx)
-            seed_idx = _greedy_prune_local(all_genes_idx)
+    # Apply codes to out_col. Default state of out_col is the cell_id
+    # string already (set above as df[out_col] = df["_cell_str"].copy()),
+    # which is what code 0 (main) wants. So we only need to overwrite
+    # codes 1 and 2.
+    code_arr = np.asarray(codes)
+    cell_str_arr = df["_cell_str"].to_numpy()
 
-        seed_per_cell[cid] = sorted(seed_idx)
+    # Build partial labels (code == 1): "{cid}-1"
+    partial_mask = (code_arr == 1)
+    if partial_mask.any():
+        partial_labels = np.array([f"{c}-1" for c in cell_str_arr[partial_mask]])
+        # Update partial_map for any cell that has at least one partial tx
+        for cid_with_partial in np.unique(cell_str_arr[partial_mask]):
+            partial_map[str(cid_with_partial)] = f"{cid_with_partial}-1"
+        df.loc[partial_mask, out_col] = partial_labels
 
-        if not seed_idx:
-            # No coherent seed → demote everything to unassigned
-            df.loc[mask_cell, out_col] = unassigned_id
-            continue
+    # Unassigned (code == 2)
+    unas_mask = (code_arr == 2)
+    if unas_mask.any():
+        df.loc[unas_mask, out_col] = unassigned_id
 
-        # Phase 1b — admit each tx by gene's mean PMI to seed
-        cell_idx = cell_df.index
-        gene_idx_arr = cell_df["_gene_idx"].to_numpy()
-        admit_mask = np.zeros(len(cell_df), dtype=bool)
-        for i, g in enumerate(gene_idx_arr):
-            if pd.isna(g):
-                continue
-            g = int(g)
-            if g in seed_idx:
-                admit_mask[i] = True
-            else:
-                if _mean_pmi_to(g, seed_idx) >= float(threshold):
-                    admit_mask[i] = True
-        # Tx that fit seed → main cell (already labelled with cid)
-        # Tx that don't → flag for phase 1c
-        rejected = cell_idx[~admit_mask]
+    # seed_per_cell is a diagnostic; not returned by the batch (would
+    # cost extra memory). Set to empty dict — caller's API still works,
+    # just lacks the per-cell seed introspection. If a caller needs it,
+    # they can recompute by re-running the Python ref impl.
+    seed_per_cell: dict[str, list[int]] = {}
 
-        if len(rejected) == 0:
-            continue
-
-        # Phase 1c — recursive prune on rejected genes
-        rejected_df = df.loc[rejected]
-        rej_nuc_idx = (rejected_df.loc[rejected_df["_is_nuc"], "_gene_idx"]
-                       .dropna().astype(int).unique())
-        rej_nuc_idx = np.sort(rej_nuc_idx)
-
-        if len(rej_nuc_idx) >= int(min_nuclear_genes):
-            sub_seed_idx = _greedy_prune_local(rej_nuc_idx)
-        else:
-            sub_seed_idx = set()
-
-        if sub_seed_idx:
-            partial_label = f"{cid}-1"
-            partial_map[cid] = partial_label
-            # Admit rejected tx into partial if their gene fits sub-seed
-            rej_gene_idx = rejected_df["_gene_idx"].to_numpy()
-            sub_admit_mask = np.zeros(len(rejected), dtype=bool)
-            for i, g in enumerate(rej_gene_idx):
-                if pd.isna(g):
-                    continue
-                g = int(g)
-                if g in sub_seed_idx:
-                    sub_admit_mask[i] = True
-                elif _mean_pmi_to(g, sub_seed_idx) >= float(threshold):
-                    sub_admit_mask[i] = True
-
-            sub_admit_idx = rejected[sub_admit_mask]
-            sub_unas_idx = rejected[~sub_admit_mask]
-            df.loc[sub_admit_idx, out_col] = partial_label
-            df.loc[sub_unas_idx, out_col] = unassigned_id
-        else:
-            df.loc[rejected, out_col] = unassigned_id
-
-    df.drop(columns=["_cell_str", "_is_nuc", "_gene_idx"], inplace=True)
+    df.drop(columns=["_cell_str", "_is_nuc", "_gene_idx", "_row_pos"], inplace=True)
 
     from .stitching import compute_housekeeping_mask
     aux = {
