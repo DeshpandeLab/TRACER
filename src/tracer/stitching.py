@@ -922,14 +922,19 @@ def stitch_entities_hierarchical(
     # tie on suffix → majority-tx-count winner gets the merged label.
     # If None, falls back to lexicographic tiebreak.
     entity_n_tx: dict[str, int] | None = None,
-    # Optional spatial centroid-in-bbox gate at merge time. When True,
-    # `can_merge(ra, rb)` requires the SMALLER entity's centroid to lie
-    # inside the LARGER entity's per-axis tx-coord range. Equivalent
-    # to: for each axis, the larger entity has at least one tx with
-    # coord above and one below the smaller's centroid. Default False
-    # (no spatial constraint beyond what `dist_threshold` already does
-    # at candidate-build time).
+    # Optional spatial centroid-in-bbox bypass at merge time. When True,
+    # candidate pairs where the SMALLER entity's centroid lies inside
+    # the LARGER entity's per-axis tx-coord range are MERGED without
+    # PMI evaluation (positive override / Tier-1 in the 3-tier cascade).
+    # Default False (no spatial bypass; standard ΔC-driven merging).
     spatial_centroid_gate: bool = False,
+    # Tightness of the spatial-overlap test. K=1 → bbox check; K≥2 →
+    # require K tx coords above AND K below smaller's centroid per
+    # axis. Higher K → stricter (more interior).
+    spatial_centroid_k: int = 1,
+    # Per-entity tx-coord arrays. Required for K≥2.
+    # dict[entity_id -> (n_tx, n_dim) ndarray].
+    entity_tx_coords: dict | None = None,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1347,15 +1352,17 @@ def stitch_entities_hierarchical(
             root_prims = None
 
     # ----------------------------------------------------------------
-    # Per-root spatial state (centroid + axis-aligned bbox + tx count).
-    # Initialised from summary_df columns when the spatial gate is
-    # active. Maintained on union: weighted-mean centroid, axis-aligned
-    # bbox union, tx-count sum.
+    # Per-root spatial state.
+    # K=1 (default): bbox check via min/max columns from summary_df.
+    # K≥2: count-based check requiring K tx-coords above AND K below
+    # the smaller entity's centroid per axis. Requires per-root tx
+    # coord arrays (maintained as concatenated ndarrays on union).
     # ----------------------------------------------------------------
     root_centroid: np.ndarray | None = None  # [N, n_dim]
-    root_bbox_min: np.ndarray | None = None  # [N, n_dim]
-    root_bbox_max: np.ndarray | None = None  # [N, n_dim]
+    root_bbox_min: np.ndarray | None = None  # [N, n_dim]  K=1 only
+    root_bbox_max: np.ndarray | None = None  # [N, n_dim]  K=1 only
     root_n_tx: np.ndarray | None = None      # [N]
+    root_tx_coords: list | None = None        # [N] list of (n_tx, n_dim) arrays — K≥2 only
     if spatial_centroid_gate:
         coord_keys = ["x", "y", "z"] if use_3d else ["x", "y"]
         try:
@@ -1367,33 +1374,57 @@ def stitch_entities_hierarchical(
             if "n_tx" in summary_df.columns:
                 root_n_tx = summary_df["n_tx"].to_numpy(dtype=np.int64).copy()
             else:
-                # No tx-count column → fall back to all-1 (gate still
-                # works; smaller-vs-larger ordering becomes lex on idx)
                 root_n_tx = np.ones(N, dtype=np.int64)
+            if spatial_centroid_k >= 2:
+                if entity_tx_coords is None:
+                    # Need per-entity tx coords for K≥2 → fall back to K=1
+                    spatial_centroid_k = 1
+                    root_tx_coords = None
+                else:
+                    root_tx_coords = [
+                        np.asarray(entity_tx_coords.get(str(eid), np.zeros((0, len(coord_keys)))),
+                                    dtype=np.float64)
+                        for eid in summary_df["entity_id"].astype(str)
+                    ]
         except KeyError:
-            # Bbox columns missing in older summary_df builds → disable
             spatial_centroid_gate = False
             root_centroid = root_bbox_min = root_bbox_max = root_n_tx = None
-
-    def _centroid_in_bbox(c: np.ndarray, bb_min: np.ndarray, bb_max: np.ndarray) -> bool:
-        """All-axis containment: c[d] ∈ [bb_min[d], bb_max[d]] for all d."""
-        return bool(np.all(c >= bb_min) and np.all(c <= bb_max))
+            root_tx_coords = None
 
     def _spatial_overlap(ra: int, rb: int) -> bool:
-        """Smaller entity's centroid lies inside larger entity's bbox.
-        Only meaningful when `spatial_centroid_gate` is True and arrays
-        are populated; caller checks the gate flag."""
+        """Smaller entity's centroid lies inside larger entity's
+        spatial extent. K=1 → bbox containment. K≥2 → need ≥K tx
+        coords above AND ≥K below per axis (more interior).
+        """
         n_a = int(root_n_tx[ra])
         n_b = int(root_n_tx[rb])
         if n_a <= n_b:
             small_idx, large_idx = ra, rb
         else:
             small_idx, large_idx = rb, ra
-        return _centroid_in_bbox(
-            root_centroid[small_idx],
-            root_bbox_min[large_idx],
-            root_bbox_max[large_idx],
-        )
+        c = root_centroid[small_idx]
+
+        if spatial_centroid_k <= 1:
+            # Bbox check (cheap)
+            bb_min = root_bbox_min[large_idx]
+            bb_max = root_bbox_max[large_idx]
+            return bool(np.all(c >= bb_min) and np.all(c <= bb_max))
+
+        # K≥2: per-axis count of tx in larger entity above/below c.
+        large_coords = root_tx_coords[large_idx]
+        if large_coords.size == 0 or large_coords.shape[0] < 2 * spatial_centroid_k:
+            # Larger entity has fewer than 2K tx → can't satisfy
+            # rule. Reject (treat as no overlap).
+            return False
+        for d in range(c.shape[0]):
+            col = large_coords[:, d]
+            n_above = int(np.sum(col > c[d]))
+            if n_above < spatial_centroid_k:
+                return False
+            n_below = int(np.sum(col < c[d]))
+            if n_below < spatial_centroid_k:
+                return False
+        return True
 
     # constraint: can we merge clusters A and B?
     def can_merge(ra, rb):
@@ -1632,6 +1663,15 @@ def stitch_entities_hierarchical(
             root_bbox_max[rnew] = np.maximum(root_bbox_max[rnew], root_bbox_max[rold])
             root_n_tx[rnew] = n_total
             root_n_tx[rold] = 0
+            # K≥2 path: maintain concatenated tx-coord arrays per root.
+            if root_tx_coords is not None:
+                if root_tx_coords[rnew].size == 0:
+                    root_tx_coords[rnew] = root_tx_coords[rold]
+                elif root_tx_coords[rold].size > 0:
+                    root_tx_coords[rnew] = np.concatenate(
+                        [root_tx_coords[rnew], root_tx_coords[rold]], axis=0
+                    )
+                root_tx_coords[rold] = np.zeros((0, root_centroid.shape[1]), dtype=np.float64)
 
         # union genes (and primitive sums when in decomposable mode).
         # In decomposable mode we already computed _combine_prims for
@@ -2041,6 +2081,15 @@ def apply_stitching_to_transcripts_memory_efficient(
     # False (no spatial constraint beyond Stitch's existing
     # `dist_threshold` Delaunay-edge filter at candidate-build time).
     spatial_centroid_gate: bool = False,
+    # Tightness of the spatial-overlap test. K=1 → bbox check (at
+    # least 1 tx of larger entity above AND 1 below smaller's centroid
+    # in each axis). K=2 → require 2 above AND 2 below per axis (more
+    # interior). K=3 → 3 each. Higher K = stricter.
+    spatial_centroid_k: int = 1,
+    # Optional per-entity tx-coord arrays. Required for K≥2; with K=1
+    # the gate falls back to bbox check using `summary_df`'s min/max
+    # columns. dict[entity_id_str -> (n_tx, n_dim) ndarray].
+    entity_tx_coords: dict | None = None,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -2154,6 +2203,18 @@ def apply_stitching_to_transcripts_memory_efficient(
         df_final[entity_col].astype(str).value_counts().to_dict()
     )
 
+    # When the K≥2 strict spatial gate is requested, compute per-entity
+    # tx-coord arrays. Cheap groupby-by-entity on transcript-level data.
+    entity_tx_coords_dict: dict | None = None
+    if spatial_centroid_gate and spatial_centroid_k >= 2:
+        coord_cols_used = list(coord_cols) if use_3d else list(coord_cols[:2])
+        entity_tx_coords_dict = {}
+        ent_str_col = df_final[entity_col].astype(str)
+        for eid, sub in df_final.groupby(ent_str_col, observed=True):
+            entity_tx_coords_dict[str(eid)] = sub[coord_cols_used].to_numpy(
+                dtype=np.float64
+            )
+
     entity_to_stitched, info = stitch_entities_hierarchical(
         summary_df=summary.rename(columns={"entity_id": "entity_id"}),
         aux=aux,
@@ -2180,6 +2241,8 @@ def apply_stitching_to_transcripts_memory_efficient(
         fast_gate_mean_threshold=fast_gate_mean_threshold,
         entity_n_tx=entity_n_tx_dict,
         spatial_centroid_gate=spatial_centroid_gate,
+        spatial_centroid_k=spatial_centroid_k,
+        entity_tx_coords=entity_tx_coords_dict,
         **legacy_kwargs,
     )
 
