@@ -904,6 +904,10 @@ def stitch_entities_hierarchical(
     # K = 3-5 for empirical bit-match.
     fast_gate_top_k: int = 0,
     fast_gate_mean_threshold: float = 0.0,
+    # Optional: per-entity tx counts. Used when multi-partial mergers
+    # tie on suffix → majority-tx-count winner gets the merged label.
+    # If None, falls back to lexicographic tiebreak.
+    entity_n_tx: dict[str, int] | None = None,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1572,7 +1576,87 @@ def stitch_entities_hierarchical(
             # an O(|bins(rnew)| * 9) scan per merge.
             pass
 
-    # choose stitched label per final root with priority: cell > partial > component
+    # ----------------------------------------------------------------
+    # Choose stitched label per final root.
+    # Priority: cell > partial > component.
+    #
+    # Multi-partial merger rule (when partial_ids[r] has > 1 element):
+    # the merged entity is GIVEN A FRESH LABEL with a SECOND DASH
+    # LEVEL, so the result is distinguishable from any of its inputs.
+    #
+    # Label form:
+    #   Phase 1c partial:  "{cell}-{d1}"        (single dash, e.g. "37962-1")
+    #   Stitch merger:     "{cell}-{d1}-{d2}"   (two dashes, e.g. "37962-1-1")
+    #
+    # The depth-2 namespace `(cell, d1)` is per-(winning cell, winning
+    # d1). It is initialised by scanning all input partials and
+    # recording the max d2 seen in each (cell, d1) namespace; new
+    # mergers increment past that max → guaranteed-unique labels.
+    #
+    # Decision rule for picking the merger's parent (which (cell, d1)
+    # namespace owns the result):
+    #   1. Higher d1 suffix wins (more aggregated lineage).
+    #   2. Higher d2 suffix wins (already-merged > unmerged).
+    #   3. Higher tx count wins (dominant biological signal).
+    #   4. Lexicographic (final deterministic tiebreak).
+    # ----------------------------------------------------------------
+    def _parse_partial(label: str) -> tuple[str, int, int] | None:
+        """Parse '{cell}-{d1}' or '{cell}-{d1}-{d2}'. Returns (cell,
+        d1, d2) or None if not a valid partial label. d2 = 0 for
+        single-dash labels."""
+        if "-" not in label:
+            return None
+        parts = label.rsplit("-", 2)
+        # parts can be 1, 2, or 3 elements depending on dash count.
+        if len(parts) == 2:
+            cell, d1_str = parts
+            try:
+                return cell, int(d1_str), 0
+            except ValueError:
+                return None
+        elif len(parts) == 3:
+            cell, d1_str, d2_str = parts
+            try:
+                return cell, int(d1_str), int(d2_str)
+            except ValueError:
+                return None
+        return None
+
+    # Initialise the depth-2 counters from input labels.
+    next_merger_counter: dict[tuple[str, int], int] = {}
+    for i in range(N):
+        eid = entity_ids[i]
+        if etypes[i] != "partial":
+            continue
+        parsed = _parse_partial(eid)
+        if parsed is None:
+            continue
+        cell, d1, d2 = parsed
+        key = (cell, d1)
+        cur = next_merger_counter.get(key, 0)
+        if d2 > cur:
+            next_merger_counter[key] = d2
+
+    def _pick_partial_label(partials: set[str]) -> str:
+        if len(partials) == 1:
+            return next(iter(partials))
+        rows = []
+        for p in partials:
+            parsed = _parse_partial(p)
+            if parsed is None:
+                continue
+            cell, d1, d2 = parsed
+            n_tx = (entity_n_tx or {}).get(p, 0)
+            rows.append((d1, d2, n_tx, p, cell))
+        if not rows:
+            return sorted(partials)[0]
+        # Sort: highest d1 → highest d2 → highest tx → lex-smaller label.
+        rows.sort(key=lambda r: (-r[0], -r[1], -r[2], r[3]))
+        winner_d1, _, _, _, winner_cell = rows[0]
+        key = (winner_cell, winner_d1)
+        next_merger_counter[key] = next_merger_counter.get(key, 0) + 1
+        return f"{winner_cell}-{winner_d1}-{next_merger_counter[key]}"
+
     root_to_label = {}
     for i in range(N):
         r = dsu.find(i)
@@ -1581,7 +1665,7 @@ def stitch_entities_hierarchical(
         if cell_ids[r]:
             label = sorted(cell_ids[r])[0]          # deterministic
         elif partial_ids[r]:
-            label = sorted(partial_ids[r])[0]
+            label = _pick_partial_label(partial_ids[r])
         else:
             label = sorted(comp_ids[r])[0]
         root_to_label[r] = label
@@ -1946,6 +2030,13 @@ def apply_stitching_to_transcripts_memory_efficient(
     if use_relative is not _LEGACY_STITCH_KWARG_SENTINEL:
         legacy_kwargs["use_relative"] = use_relative
 
+    # Per-entity tx count for the multi-partial merger tiebreak rule
+    # in stitch_entities_hierarchical (majority-tx-count when suffix
+    # levels tie). One O(N) value_counts pass over the entity column.
+    entity_n_tx_dict = (
+        df_final[entity_col].astype(str).value_counts().to_dict()
+    )
+
     entity_to_stitched, info = stitch_entities_hierarchical(
         summary_df=summary.rename(columns={"entity_id": "entity_id"}),
         aux=aux,
@@ -1970,6 +2061,7 @@ def apply_stitching_to_transcripts_memory_efficient(
         use_decomposable_stitch=use_decomposable_stitch,
         fast_gate_top_k=fast_gate_top_k,
         fast_gate_mean_threshold=fast_gate_mean_threshold,
+        entity_n_tx=entity_n_tx_dict,
         **legacy_kwargs,
     )
 
