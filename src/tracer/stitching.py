@@ -903,7 +903,7 @@ def stitch_entities_hierarchical(
     # incompatible). 0 = disabled (no behavior change). Recommended
     # K = 3-5 for empirical bit-match.
     fast_gate_top_k: int = 0,
-    fast_gate_neg_threshold: float = -0.05,
+    fast_gate_mean_threshold: float = 0.0,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1479,7 +1479,7 @@ def stitch_entities_hierarchical(
             if edges_arr.ndim == 1:
                 edges_arr = edges_arr.reshape(-1, 2)
             gate_keep_mask = _cyp_gate.fast_gate_pairs(
-                top_cliques, edges_arr, _W_f32, float(fast_gate_neg_threshold),
+                top_cliques, edges_arr, _W_f32, float(fast_gate_mean_threshold),
             )
         except Exception:
             gate_keep_mask = None  # graceful fallback: no gating
@@ -1839,7 +1839,7 @@ def apply_stitching_to_transcripts_memory_efficient(
     # using a small per-entity signature signature; rejects pairs with
     # strong-negative top-clique cross-PMI before expensive ΔC eval.
     fast_gate_top_k: int = 0,
-    fast_gate_neg_threshold: float = -0.05,
+    fast_gate_mean_threshold: float = 0.0,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -1969,7 +1969,7 @@ def apply_stitching_to_transcripts_memory_efficient(
         min_close_edges_n=min_close_edges_n,
         use_decomposable_stitch=use_decomposable_stitch,
         fast_gate_top_k=fast_gate_top_k,
-        fast_gate_neg_threshold=fast_gate_neg_threshold,
+        fast_gate_mean_threshold=fast_gate_mean_threshold,
         **legacy_kwargs,
     )
 

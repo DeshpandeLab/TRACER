@@ -450,14 +450,21 @@ def fast_gate_pairs(
     cnp.ndarray[cnp.int32_t, ndim=2] top_cliques,        # [n_ent, K]
     cnp.ndarray[cnp.int32_t, ndim=2] pair_indices,        # [n_pairs, 2]
     cnp.ndarray[cnp.float32_t, ndim=2] W,
-    double neg_threshold,
+    double mean_threshold,
 ):
-    """Vectorised batch gate. Returns uint8 array of length n_pairs:
-    1 if the pair SURVIVES (no strong-negative cross-pair in top-clique
-    block), 0 if rejected.
+    """Vectorised batch gate using MEAN cross-PMI of the top-clique
+    block. Returns uint8 array of length n_pairs: 1 if the pair
+    SURVIVES (mean cross-PMI in K×K block is ≥ mean_threshold).
 
-    For each pair (i, j): scan W[top_cliques[i, *], top_cliques[j, *]]
-    for any value < neg_threshold (skipping -1 placeholders).
+    For each pair (i, j): compute mean(W[top_cliques[i, *],
+    top_cliques[j, *]]) over finite entries (skipping -1 placeholders
+    and self-pairs g_a == g_b). Reject if mean < mean_threshold.
+
+    A single strongly-negative entry no longer kills the pair (which
+    over-rejected legitimate Phase-1c partial reattachments where
+    one or two markers diverge but the broader signature is still
+    coherent). Default `mean_threshold = 0.0` rejects only when the
+    cross block is net-negative on average.
     """
     cdef int n_pairs = pair_indices.shape[0]
     cdef int K = top_cliques.shape[1]
@@ -467,10 +474,14 @@ def fast_gate_pairs(
     cdef cnp.int32_t[:, :] pi_mv = pair_indices
     cdef cnp.float32_t[:, :] W_mv = W
     cdef int p, i, j, a, b, gi, gj
+    cdef int n_finite
+    cdef double total
     cdef float v
     for p in range(n_pairs):
         i = pi_mv[p, 0]
         j = pi_mv[p, 1]
+        total = 0.0
+        n_finite = 0
         for a in range(K):
             gi = tc_mv[i, a]
             if gi < 0:
@@ -484,11 +495,13 @@ def fast_gate_pairs(
                 v = W_mv[gi, gj]
                 if v != v:
                     continue
-                if v < neg_threshold:
-                    keep_mv[p] = 0
-                    break
-            if keep_mv[p] == 0:
-                break
+                total += v
+                n_finite += 1
+        # No observations → keep (no evidence of incompatibility)
+        if n_finite == 0:
+            continue
+        if (total / n_finite) < mean_threshold:
+            keep_mv[p] = 0
     return keep
 
 
