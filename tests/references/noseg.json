@@ -48,6 +48,13 @@
       "n_partials": 0,
       "n_unassigned_tx": 86,
       "stage": "Final Rescue"
+    },
+    {
+      "n_cells": 0,
+      "n_components": 4,
+      "n_partials": 0,
+      "n_unassigned_tx": 86,
+      "stage": "Finalize"
     }
   ]
 }

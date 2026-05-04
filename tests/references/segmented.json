@@ -37,16 +37,16 @@
     },
     {
       "n_cells": 8,
-      "n_components": 3,
+      "n_components": 0,
       "n_partials": 13,
-      "n_unassigned_tx": 0,
+      "n_unassigned_tx": 3,
       "stage": "Group"
     },
     {
       "n_cells": 8,
-      "n_components": 3,
+      "n_components": 0,
       "n_partials": 11,
-      "n_unassigned_tx": 0,
+      "n_unassigned_tx": 3,
       "stage": "Stitch"
     },
     {
@@ -62,6 +62,13 @@
       "n_partials": 1,
       "n_unassigned_tx": 19,
       "stage": "Final Rescue"
+    },
+    {
+      "n_cells": 8,
+      "n_components": 0,
+      "n_partials": 1,
+      "n_unassigned_tx": 19,
+      "stage": "Finalize"
     }
   ]
 }
