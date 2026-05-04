@@ -485,19 +485,34 @@ def annotate_unassigned_components_fast(
         g_arrays = [comp_gene_map[k] if comp_gene_map[k].size > 0 else None for k in comp_keys]
         removed_lists = _cy_prune.prune_cells(g_arrays, W, float(npmi_threshold))
 
+        # Pre-compute comp_id → row-positions ONCE (replaces the
+        # O(N × n_comps) per-comp full-df mask in the loop below).
+        # One sort + numpy.split based on sorted-run boundaries is
+        # O(N log N) — same cost as the kernel batch itself, vs O(N×n_comps)
+        # of the previous pattern.
+        keep_candidate_arr = keep_candidate.to_numpy()
+        comp_id_arr = comp_id_series.astype(str).to_numpy()
+        keep_idx = np.where(keep_candidate_arr)[0]
+        comp_str_keep = comp_id_arr[keep_idx]
+        sort_order = np.argsort(comp_str_keep, kind="stable")
+        sorted_comp = comp_str_keep[sort_order]
+        sorted_idx = keep_idx[sort_order]
+        unique_comps_sorted, split_offsets = np.unique(sorted_comp, return_index=True)
+        bounds = np.concatenate([split_offsets, [len(sorted_idx)]])
+        comp_id_to_indices: dict[str, np.ndarray] = {
+            str(unique_comps_sorted[ci]): sorted_idx[bounds[ci]:bounds[ci + 1]]
+            for ci in range(len(unique_comps_sorted))
+        }
+
         iterator = zip(comp_keys, removed_lists)
         if show_progress:
             iterator = tqdm(list(iterator), desc="prune_comps")
 
         drop_gene_mask_all = np.zeros(len(df), dtype=bool)
-        comp_id_series_str = comp_id_series.astype(str)
-        keep_candidate_arr = keep_candidate.to_numpy()
 
         for comp_id, removed in iterator:
-            comp_mask_arr = (comp_id_series_str.to_numpy() == comp_id) & keep_candidate_arr
-            comp_indices = np.where(comp_mask_arr)[0]
-
-            if comp_indices.size == 0:
+            comp_indices = comp_id_to_indices.get(str(comp_id))
+            if comp_indices is None or comp_indices.size == 0:
                 continue
 
             if removed is None or len(removed) == 0:
@@ -1622,8 +1637,128 @@ def reassign_unassigned_grid_pool(
     import scipy.sparse as sp_mod
     W_is_sparse = sp_mod.issparse(W)
 
+    # ----- Cython batch fast path (replaces the Python per-tx loop) -----
+    # Conditions: dense W, real coord array (no per-call adaptation), and
+    # the standard veto modes. Falls back to the legacy Python loop for
+    # any unusual shape.
+    use_cython_batch = (
+        not W_is_sparse
+        and len(coord_cols) >= 2
+        and veto_mode in ("min", "mean")
+    )
+    if use_cython_batch:
+        from . import _cy_prune
+        # Build entity-id integer codes (alphabetical ordering for determinism).
+        unique_ents = sorted(set(assigned_entities.tolist()))
+        ent_to_id = {e: i for i, e in enumerate(unique_ents)}
+        id_to_ent = unique_ents
+        n_ent = len(unique_ents)
+        ass_ent_id = np.array([ent_to_id[e] for e in assigned_entities],
+                                dtype=np.int32)
+
+        # Entity-genes CSR (per-entity sorted gene-idx arrays).
+        ent_gene_offsets = np.zeros(n_ent + 1, dtype=np.int32)
+        per_ent_genes = []
+        for ent in unique_ents:
+            gset = entity_genes_lookup.get(ent, frozenset())
+            sorted_genes = np.array(sorted(gset), dtype=np.int32)
+            per_ent_genes.append(sorted_genes)
+            ent_gene_offsets[len(per_ent_genes)] = (
+                ent_gene_offsets[len(per_ent_genes) - 1] + sorted_genes.size
+            )
+        if per_ent_genes:
+            ent_gene_idx = np.concatenate(per_ent_genes).astype(np.int32)
+        else:
+            ent_gene_idx = np.zeros(0, dtype=np.int32)
+
+        # Bin → assigned-tx local-idx CSR. `bin_xy` packs (bx, by) into
+        # sparse 64-bit keys (not contiguous), so we factorise the
+        # assigned-tx bin keys to a dense 0..n_unique remap, build CSR
+        # over remap indices, and look up neighbor bins via dict.
+        if len(bin_keys_a) == 0:
+            use_cython_batch = False
+        else:
+            unique_bin_keys, remap_idx_a = np.unique(bin_keys_a, return_inverse=True)
+            # CSR offsets over the dense remap.
+            n_unique_bins = unique_bin_keys.size
+            bin_offsets = np.zeros(n_unique_bins + 1, dtype=np.int64)
+            np.add.at(bin_offsets, remap_idx_a + 1, 1)
+            bin_offsets = np.cumsum(bin_offsets)
+            bin_data_arr = np.empty(int(bin_offsets[-1]), dtype=np.int64)
+            write_cursor = bin_offsets[:-1].copy()
+            for li, ri in enumerate(remap_idx_a):
+                bin_data_arr[write_cursor[ri]] = li
+                write_cursor[ri] += 1
+
+            # Build the bin-key → remap-idx dict (Python-side; only used
+            # to populate nb_bins_arr below — Cython sees only int32 idx).
+            bin_key_to_remap = {int(bk): i for i, bk in enumerate(unique_bin_keys.tolist())}
+
+            # Neighbor-bin matrix [n_una, 9] (remap indices; -1 if a
+            # bin has no assigned-tx).
+            nb_bins_arr = np.full((len(una_idx), 9), -1, dtype=np.int64)
+            for i_una, bk_val_raw in enumerate(una_bin_keys.tolist()):
+                bk_val_int = int(bk_val_raw)
+                # Self bin
+                self_remap = bin_key_to_remap.get(bk_val_int, -1)
+                nb_bins_arr[i_una, 0] = self_remap
+                # 8 neighbor bins
+                nbs = neighbor_bins(bk_val_int, topology="8")
+                for nb_pos, nb_val in enumerate(nbs):
+                    if 1 + nb_pos >= 9:
+                        break
+                    nb_remap = bin_key_to_remap.get(int(nb_val), -1)
+                    nb_bins_arr[i_una, 1 + nb_pos] = nb_remap
+
+    # Run the Cython batch ONLY if all preconditions still hold after
+    # the CSR construction above (which may have set use_cython_batch
+    # to False on degenerate inputs).
+    if use_cython_batch:
+        # Cast inputs to expected dtypes.
+        una_coords_c = una_coords.astype(np.float32)
+        ass_coords_c = assigned_coords.astype(np.float32)
+        W_c = W if (hasattr(W, "dtype") and W.dtype == np.float32) else np.asarray(W, dtype=np.float32)
+        z_bound_for_cy = float(z_bound_eff) if z_col_idx is not None else 0.0
+
+        best_ent_arr, best_dist_arr, reason_arr, sef_arr = (
+            _cy_prune.rescue_per_tx_batch(
+                una_coords_c, una_g_idx, nb_bins_arr,
+                ass_coords_c, ass_ent_id,
+                bin_offsets, bin_data_arr,
+                ent_gene_offsets, ent_gene_idx,
+                W_c,
+                z_bound_for_cy,
+                0 if veto_mode == "min" else 1,
+                float(mean_threshold),
+                int(small_entity_guard_n),
+                float(neg_npmi_threshold),
+            )
+        )
+
+        # Translate codes back into label strings + per-tx stats.
+        for i in range(len(una_idx)):
+            ent_code = int(best_ent_arr[i])
+            if ent_code >= 0:
+                new_labels[i] = id_to_ent[ent_code]
+                matched[i] = True
+                matched_dist[i] = float(best_dist_arr[i])
+            else:
+                if int(reason_arr[i]) == 2:
+                    n_blocked_by_neg_veto += 1
+                else:
+                    n_no_candidates += 1
+        n_small_entity_fallback = int(sef_arr.sum())
+
     n_coord_cols = len(coord_cols)
-    for i, (bk, g_idx) in enumerate(zip(una_bin_keys.tolist(), una_g_idx.tolist())):
+    # Legacy Python loop runs only when the Cython batch was NOT used
+    # (e.g., sparse W, or degenerate bin set). Empty iterator skips.
+    una_iter_for_loop = (
+        list(enumerate(zip(una_bin_keys.tolist(), una_g_idx.tolist())))
+        if not use_cython_batch
+        else []
+    )
+
+    for i, (bk, g_idx) in una_iter_for_loop:
         bk = int(bk)
         # Collect assigned-tx local indices in bin + 8-neighbors, then
         # apply the z-bound to keep only spatially close candidates.
