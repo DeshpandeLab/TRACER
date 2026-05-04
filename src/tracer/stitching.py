@@ -25,8 +25,21 @@ def infer_entity_type(entity_id: str) -> str:
     if entity_id is None or (isinstance(entity_id, float) and np.isnan(entity_id)):
         return "unknown"
     s = str(entity_id)
-    if s == "DROP":
-        return "drop"
+    # Unassigned sentinels — must be checked BEFORE the partial-by-hyphen
+    # rule, otherwise "-1" gets misclassified as a partial (because it
+    # contains a hyphen) and Stitch tries to merge a phantom "-1
+    # partial" entity with real cells.
+    #
+    # The unassigned class includes:
+    #   - fixed sentinels: -1, DROP, UNASSIGNED, nan
+    #   - stage-rejected diagnostics: *_rejected (prune_rejected,
+    #     group_rejected, demote_rejected — see spatial.UNASSIGNED_LABELS)
+    # All map to "unknown" so the cell/partial/component whitelist at the
+    # call sites uniformly excludes them — no label-specific filter
+    # downstream needs updating when a new stage-rejection sentinel is
+    # added.
+    if s in ("-1", "DROP", "UNASSIGNED", "nan") or s.endswith("_rejected"):
+        return "unknown"
     if s.startswith("UNASSIGNED_"):
         return "component"
     if "-" in s:

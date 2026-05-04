@@ -534,10 +534,15 @@ def is_whole_cell_id(s: pd.Series) -> pd.Series:
     Whole cell: NOT UNASSIGNED_*, NOT DROP, NOT -1, and no '-' in the string.
     Example: "123" is whole; "123-1" is partial; "UNASSIGNED_7" is pseudocell.
     """
+    # Exclude all unassigned-class labels (bare "UNASSIGNED" is the
+    # published-output label; "UNASSIGNED_<n>" is a component pseudo-id —
+    # the startswith check below catches the latter, the explicit
+    # check catches the former).
     s = s.astype(str)
     return (
         (s != "-1")
         & (s != "DROP")
+        & (s != "UNASSIGNED")
         & (~s.str.startswith("UNASSIGNED_"))
         & (~s.str.contains("-", regex=False))
         & (s != "nan")
@@ -548,6 +553,7 @@ def is_partial_or_pseudocell_id(s: pd.Series) -> pd.Series:
     return (
         (s != "-1")
         & (s != "DROP")
+        & (s != "UNASSIGNED")
         & (s != "nan")
         & (s.str.startswith("UNASSIGNED_") | s.str.contains("-", regex=False))
     )

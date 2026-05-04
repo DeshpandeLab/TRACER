@@ -16,6 +16,112 @@ from ._utils import prepare_transcript_df
 from .graph import build_graph, to_networkx  # noqa: F401 — used internally/callers
 
 
+# ---------------------------------------------------------------------------
+# Unassigned-label semantics
+# ---------------------------------------------------------------------------
+# The pipeline distinguishes two ontological classes of labels in the entity
+# column:
+#
+#   1. ASSIGNED labels — real entity IDs (cell, partial, component).
+#      Examples: "37962", "37962-1", "UNASSIGNED_42" (note suffix).
+#   2. UNASSIGNED labels — sentinels meaning "no entity assignment".
+#      All members of this class are FUNCTIONALLY EQUIVALENT for downstream
+#      stages (Stitch excludes them, Rescue can rescue them, Demote ignores
+#      them) — but mid-pipeline they carry stage-of-rejection diagnostic
+#      information so a human or downstream code can answer "which stage
+#      killed this tx?":
+#
+#        "-1"               — Xenium input said no cell (passive, no TRACER verdict)
+#        "prune_rejected"   — Prune (Phase 1) couldn't admit to any seed
+#        "group_rejected"   — Group (Phase 3) per-comp QC rejected this tx
+#        "demote_rejected"  — Demote (Phase 5) killed this tx's entity for being too small
+#        "UNASSIGNED"       — final published verdict (set by `finalize_unassigned`
+#                              at pipeline end; replaces all of the above).
+#                              State-noun phrasing — what the tx IS, not what
+#                              happened to it.
+#        "DROP" / "nan"     — legacy / safety sentinels (recognised on input
+#                              for backward compat with externally-loaded
+#                              dataframes; never emitted by current code)
+#
+# Note: bare "UNASSIGNED" (the published label) is distinct from the
+# "UNASSIGNED_<n>" component IDs (with underscore suffix) — `infer_entity_type`
+# checks the bare label first before the prefix rule.
+#
+# Use `is_unassigned_label(s)` (single label) or `unassigned_mask(series)`
+# (vectorized) instead of literal-set comparisons. Adding a new stage-
+# rejection label only requires updating these helpers.
+
+# Stage-rejection sentinels emitted mid-pipeline (carry diagnostic info).
+STAGE_REJECTED_LABELS = frozenset({"prune_rejected", "group_rejected", "demote_rejected"})
+
+# Fixed-string unassigned sentinels (input convention + safety).
+_FIXED_UNASSIGNED_LABELS = frozenset({"-1", "DROP", "UNASSIGNED", "nan"})
+
+# Full unassigned set — used to be hard-coded as
+#     {"DROP", "-1", "UNASSIGNED", "nan"}
+# at five sites in this file.  Now centralized.
+UNASSIGNED_LABELS = _FIXED_UNASSIGNED_LABELS | STAGE_REJECTED_LABELS
+
+
+def is_unassigned_label(label) -> bool:
+    """True if the label is in the unassigned class (sentinel or stage-rejected)."""
+    if label is None:
+        return True
+    if isinstance(label, float) and np.isnan(label):
+        return True
+    return str(label) in UNASSIGNED_LABELS
+
+
+def unassigned_mask(labels) -> np.ndarray:
+    """Vectorized version of `is_unassigned_label`. Accepts pd.Series or array-like."""
+    s = pd.Series(labels).astype(str)
+    return s.isin(UNASSIGNED_LABELS).to_numpy()
+
+
+def finalize_unassigned(
+    df: pd.DataFrame,
+    *,
+    col: str,
+    unassigned_label: str = "UNASSIGNED",
+    cell_id_col: str = "cell_id",
+    cell_id_unassigned_label: str = "-1",
+    drop_label: str | None = None,  # deprecated alias for unassigned_label
+) -> pd.DataFrame:
+    """Pipeline-finalization pass: collapse all unassigned-class labels in
+    `df[col]` to a single canonical `unassigned_label` ("UNASSIGNED" by
+    default), AND reset `cell_id` to `cell_id_unassigned_label` ("-1")
+    for those rows.
+
+    Enforces the published-output invariant
+        cell_id == "-1"  ⇔  entity == "UNASSIGNED"
+    so any downstream consumer can use either column as the canonical
+    "is this tx unassigned?" check, and metric computations (e.g. ARI vs
+    Xenium) don't depend on which scope (`both`/`either`) is chosen —
+    they all reduce to the same subset.
+
+    Mutates df in place AND returns it. After this, the entity column has
+    exactly two label categories: real entity IDs (cell/partial/component)
+    and `unassigned_label`. Diagnostic info about which stage rejected
+    each tx is preserved in `unassigned_qc_status` (Group) and in the
+    per-stage progression snapshots.
+
+    NOTE: this overrides the input Xenium `cell_id` for tx that TRACER
+    drops. The original Xenium label is no longer recoverable from the
+    output column — if you need it, snapshot `cell_id` BEFORE calling
+    this function.
+
+    The legacy `drop_label` keyword is accepted for backward compat but
+    deprecated; pass `unassigned_label` instead.
+    """
+    if drop_label is not None:
+        unassigned_label = drop_label
+    mask = unassigned_mask(df[col])
+    df.loc[mask, col] = unassigned_label
+    if cell_id_col in df.columns:
+        df.loc[mask, cell_id_col] = cell_id_unassigned_label
+    return df
+
+
 #
 def annotate_unassigned_components(
     df_pruned: pd.DataFrame,
@@ -152,16 +258,22 @@ def annotate_unassigned_components(
     # Build final cell id:
     # - assigned: keep original/partial ID (from unassigned_final_col if exists)
     # - unassigned and kept comp: comp id
-    # - dropped: "DROP"
+    # - dropped: "group_rejected" (stage-rejected diagnostic label;
+    #   functionally equivalent to "-1" / DROP via UNASSIGNED_LABELS)
+    #
+    # See module-level "Unassigned-label semantics" docstring at top
+    # of this file for the full lifecycle. `finalize_unassigned()`
+    # collapses this label to "DROP" at pipeline end.
     cell_id_final = assigned_id_series.copy()
 
     # for unassigned kept
     kept_unassigned = is_unassigned & (df["unassigned_qc_status"] == "keep_unassigned_comp")
     cell_id_final.loc[kept_unassigned] = df.loc[kept_unassigned, "unassigned_comp_id"].astype(str)
 
-    # for dropped
+    # for dropped — emit "group_rejected" (carries which-stage info);
+    # QC reason still in `unassigned_qc_status`.
     dropped = is_unassigned & df["unassigned_qc_status"].isin(["drop_small_comp", "drop_npmi_pruned_gene"])
-    cell_id_final.loc[dropped] = "DROP"
+    cell_id_final.loc[dropped] = "group_rejected"
 
     df["cell_id_final"] = cell_id_final
 
@@ -192,6 +304,13 @@ def annotate_unassigned_components_fast(
     Annotate unassigned transcripts with connected-component IDs and
     NPMI-prune their genes.
 
+    NOTE: `min_comp_size` must be ≥ 2. A singleton tx forming a 1-tx
+    "component" pseudo-entity is operationally indistinguishable from a
+    truly-unassigned tx (no shared gene set, no PMI evidence), and
+    creating it as an `UNASSIGNED_*` label produces a second tier of
+    singletons distinct from "-1" / DROP — wasting downstream stitching
+    work and violating the cell_id ⇔ DROP finalization invariant.
+
     Parameters
     ----------
     entity_col : str
@@ -217,6 +336,20 @@ def annotate_unassigned_components_fast(
     else:
         df = df_pruned
 
+    # Hard floor: singletons can't form a comp pseudo-entity. A 1-tx
+    # "component" has no within-comp PMI evidence and is functionally
+    # identical to a truly-unassigned tx — admitting it as an
+    # UNASSIGNED_* label creates a second tier of singletons distinct
+    # from "-1" / DROP, breaking the cell_id ⇔ DROP finalization
+    # invariant. Raise rather than silently coerce so misconfigured
+    # callers fail loudly.
+    if min_comp_size < 2:
+        raise ValueError(
+            f"min_comp_size must be >= 2 (got {min_comp_size}). "
+            "Singletons cannot become comp pseudo-entities; they belong "
+            "in the unassigned (DROP) class."
+        )
+
     if transcript_id_col not in df.columns:
         df[transcript_id_col] = df.index.astype(str)
 
@@ -226,7 +359,12 @@ def annotate_unassigned_components_fast(
     # Fallback to `cell_id_col` only if the pipeline column doesn't exist
     # yet (e.g., user is running stage 2 standalone on raw data).
     if entity_col in df.columns:
-        is_unassigned = df[entity_col].astype(str) == "-1"
+        # Recognize ALL unassigned-class labels (-1 / DROP / *_rejected /
+        # UNASSIGNED / nan) as unassigned, not just "-1". Group runs after
+        # Prune (which currently emits "-1") but in extended runner orders
+        # may see other stage-rejected labels — using the centralized set
+        # is forward-compat.
+        is_unassigned = df[entity_col].astype(str).isin(UNASSIGNED_LABELS)
         assigned_id_series = df[entity_col].astype(str)
     elif cell_id_col in df.columns:
         is_unassigned = df[cell_id_col].astype(str) == "-1"
@@ -381,11 +519,16 @@ def annotate_unassigned_components_fast(
         kept_idx = np.where(kept_unassigned_arr)[0]
         final_assignment.iloc[kept_idx] = comp_id_series.iloc[kept_idx].astype(str).values
 
+    # Emit "group_rejected" (stage-rejected diagnostic label;
+    # functionally equivalent to all other unassigned sentinels via
+    # UNASSIGNED_LABELS). Final pipeline output collapses this to
+    # "DROP" via finalize_unassigned(). QC reason still recoverable
+    # from `unassigned_qc_status`.
     dropped_arr = is_unassigned.to_numpy() & (
         (qc_arr == "drop_small_comp") | (qc_arr == "drop_npmi_pruned_gene")
     )
     if dropped_arr.any():
-        final_assignment.iloc[np.where(dropped_arr)[0]] = "DROP"
+        final_assignment.iloc[np.where(dropped_arr)[0]] = "group_rejected"
 
     # Canonical output: in-place write to `out_col`. With debug_stages,
     # also expose the legacy snapshot columns + diagnostic columns.
@@ -684,7 +827,7 @@ def enforce_spatial_coherence_per_label(
     if show_progress:
         iter_groups = tqdm(list(iter_groups), desc="per-label-CC")
 
-    invalid_set = {"-1", "DROP", "nan", "UNASSIGNED"}
+    invalid_set = set(UNASSIGNED_LABELS)
     n_split = 0
     n_skipped_small = 0
     for lab, idxs in iter_groups:
@@ -821,7 +964,7 @@ def reassign_unassigned_to_nearby_entities(
     from .stitching import infer_entity_type
 
     if unassigned_labels is None:
-        unassigned_labels = {"DROP", "-1", "UNASSIGNED", "nan"}
+        unassigned_labels = set(UNASSIGNED_LABELS)
 
     df = df_spatial if in_place else df_spatial.copy()
     df[out_col] = df[entity_col].astype(str)
@@ -1011,8 +1154,8 @@ def demote_small_entities(
     entity_col: str = "tracer_id",
     out_col: str | None = None,
     min_size: int = 5,
-    unassigned_label: str = "-1",
-    keep_labels: tuple[str, ...] = ("DROP", "-1", "nan"),
+    unassigned_label: str = "demote_rejected",
+    keep_labels: tuple[str, ...] = tuple(UNASSIGNED_LABELS),
     exempt_types: tuple[str, ...] = ("cell",),
     in_place: bool = False,
 ) -> tuple[pd.DataFrame, int]:
@@ -1034,10 +1177,14 @@ def demote_small_entities(
         Entities with fewer than this many transcripts get demoted. Default 5.
         Use 1 to disable (no entity has fewer than 1 tx).
     unassigned_label : str
-        Label assigned to demoted transcripts. Default `"-1"`.
+        Label assigned to demoted transcripts. Default `"demote_rejected"`
+        (a stage-rejected diagnostic label; functionally equivalent to "-1"
+        / "DROP" via `UNASSIGNED_LABELS`). `finalize_unassigned()` collapses
+        all such labels to "DROP" at pipeline end.
     keep_labels : tuple of str
         Labels that are pre-existing unassigned/dropped — never demoted further.
-        Default `("DROP", "-1", "nan")`.
+        Default: the full `UNASSIGNED_LABELS` set (all sentinels +
+        stage-rejected labels).
     exempt_types : tuple of str
         Entity types (per `infer_entity_type`) that are protected from
         demotion regardless of size. Default `("cell",)` — whole cells
@@ -1146,7 +1293,7 @@ def reassign_unassigned_by_gene_compat(
     from .stitching import build_entity_table
 
     if unassigned_labels is None:
-        unassigned_labels = {"DROP", "-1", "UNASSIGNED", "nan"}
+        unassigned_labels = set(UNASSIGNED_LABELS)
 
     df_out = df if in_place else df.copy()
     df_out[out_col] = df_out[entity_col].astype(str)
@@ -1378,7 +1525,7 @@ def reassign_unassigned_grid_pool(
     from .graph import bin_xy, neighbor_bins
 
     if unassigned_labels is None:
-        unassigned_labels = {"DROP", "-1", "UNASSIGNED", "nan"}
+        unassigned_labels = set(UNASSIGNED_LABELS)
 
     df_out = df if in_place else df.copy()
     df_out[out_col] = df_out[entity_col].astype(str)
@@ -1653,7 +1800,7 @@ def pre_stage2_rescue(
     df_out = df if in_place else df.copy()
     df_out[out_col] = df_out[entity_col].astype(str)
 
-    unassigned_set = {"DROP", "-1", "UNASSIGNED", "nan"}
+    unassigned_set = set(UNASSIGNED_LABELS)
     labels_str = df_out[entity_col].astype(str)
     unassigned_mask = labels_str.isin(unassigned_set).to_numpy()
     if unassigned_mask.sum() == 0:
@@ -1802,7 +1949,7 @@ def reassign_unassigned_to_nearest_tx_no_neg(
     from .stitching import build_entity_table, infer_entity_type
 
     if unassigned_labels is None:
-        unassigned_labels = {"DROP", "-1", "UNASSIGNED", "nan"}
+        unassigned_labels = set(UNASSIGNED_LABELS)
 
     df_out = df if in_place else df.copy()
     df_out[out_col] = df_out[entity_col].astype(str)

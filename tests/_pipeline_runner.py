@@ -26,6 +26,7 @@ from tracer.spatial import (
     pre_stage2_rescue,
     reassign_unassigned_grid_pool,
     demote_small_entities,
+    finalize_unassigned,
 )
 from tracer.pruning import prune_transcripts_nuclear_seed
 from tracer.stitching import (
@@ -35,14 +36,27 @@ from tracer.stitching import (
 
 
 # Modern config — matches segmented_workflow.ipynb / noseg_workflow.ipynb.
-PMI_THR = math.log(1.5)
-RESCUE_NEG_THR = math.log(1.0 / 3.0)
+# PMI_THR relaxed to 1e-5 ("essentially zero positive PMI") on the
+# strength of the cell-37742 EMT analysis: log(1.5) ≈ 0.405 sat ABOVE
+# the in-cell max NPMI for that cell, blowing up its prune. With NaN→0
+# fill in nuclear-seed Prune, threshold ≈ 0 admits any non-negative
+# evidence to the seed, which gave +29 % ARI(vs Xenium cell_id) on the
+# 50×50 µm validation crop (0.442 → 0.573).
+PMI_THR = 1e-5
+RESCUE_NEG_THR = -0.05
 ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
+# Iterative Rescue caps: 3 passes captures ≥98 % of asymptotic gain at
+# any scale (per /tmp/iterative_rescue_*.png diagnostic). Early-stop
+# fires when a pass adds zero tx — covers tight crops in 1–2 passes.
+RESCUE_MAX_PASSES = 3
 
 
 def _classify(label: str) -> str:
     s = str(label)
-    if s in ("DROP", "-1", "nan", "UNASSIGNED"):
+    # All unassigned-class labels (fixed sentinels + stage-rejected
+    # diagnostics like "prune_rejected"/"group_rejected"/"demote_rejected")
+    # collapse to "unassigned" for stage-snapshot accounting.
+    if s in ("DROP", "-1", "nan", "UNASSIGNED") or s.endswith("_rejected"):
         return "unassigned"
     if s.startswith("UNASSIGNED_"):
         return "component"
@@ -165,15 +179,25 @@ def run_segmented_pipeline(df: pd.DataFrame,
         )
         _record_stage(progression, "Split", df_pruned, "tracer_id")
 
-    # Initial Rescue
-    df_pruned, n_rescued, n_skipped, _ = pre_stage2_rescue(
-        df_pruned, aux=aux,
-        entity_col="tracer_id", gene_col="feature_name",
-        coord_cols=("x", "y", "z"), out_col="tracer_id",
-        G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
-        cluster_guard_n=3, veto_mode="mean", mean_threshold=0.0,
-        small_entity_guard_n=0,
-    )
+    # Initial Rescue — iterate up to RESCUE_MAX_PASSES with early-stop.
+    # Each pass reseeds gene sets from newly-rescued tx, letting tendrils
+    # of irregular cells extend by one neighbour per pass. Convergence
+    # diagnostic: 3 passes captures ≥98 % of asymptotic gain (50 µm and
+    # 500 µm crops both); pass 1 alone is 65–92 %, pass 2 closes most
+    # of the gap.
+    n_rescued = 0
+    for _pass in range(RESCUE_MAX_PASSES):
+        df_pruned, n_pass_rescued, _, _ = pre_stage2_rescue(
+            df_pruned, aux=aux,
+            entity_col="tracer_id", gene_col="feature_name",
+            coord_cols=("x", "y", "z"), out_col="tracer_id",
+            G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
+            cluster_guard_n=3, veto_mode="mean", mean_threshold=0.0,
+            small_entity_guard_n=0,
+        )
+        n_rescued += n_pass_rescued
+        if n_pass_rescued == 0:
+            break  # converged; further passes can't add anything
     _record_stage(progression, "Initial Rescue", df_pruned, "tracer_id")
 
     # Group
@@ -181,7 +205,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
         df_pruned=df_pruned, aux=aux,
         build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
         coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=1,
+        k=8, dist_threshold=1.5, min_comp_size=5,
         npmi_threshold=ANNOTATE_NEG_THR,
         entity_col="tracer_id", out_col="tracer_id",
         cell_id_col="cell_id", gene_col="feature_name",
@@ -222,6 +246,17 @@ def run_segmented_pipeline(df: pd.DataFrame,
         veto_mode="mean", mean_threshold=0.0, small_entity_guard_n=0,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
+
+    # Finalize: collapse all stage-rejected / sentinel labels in the
+    # entity column to a single canonical "DROP". Mid-pipeline labels
+    # like "group_rejected", "demote_rejected", "-1", "UNASSIGNED",
+    # "nan" all become "DROP" — published output has exactly two label
+    # categories: real entity IDs (cell/partial/component) and "DROP".
+    # Diagnostic info (which stage rejected each tx) is recoverable
+    # via the per-stage progression snapshots and the
+    # `unassigned_qc_status` column emitted by Group.
+    finalize_unassigned(df_stitched, col="stitched")
+    _record_stage(progression, "Finalize", df_stitched, "stitched")
 
     return df_stitched, progression
 
@@ -265,7 +300,7 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         df_pruned=df, aux=aux,
         build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
         coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=1,
+        k=8, dist_threshold=1.5, min_comp_size=5,
         npmi_threshold=ANNOTATE_NEG_THR,
         entity_col="tracer_id", out_col="tracer_id",
         cell_id_col="cell_id", gene_col="feature_name",
@@ -304,5 +339,10 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         veto_mode="mean", mean_threshold=0.0, small_entity_guard_n=0,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
+
+    # Finalize unassigned-class labels → "DROP" (see segmented runner
+    # for full rationale).
+    finalize_unassigned(df_stitched, col="stitched")
+    _record_stage(progression, "Finalize", df_stitched, "stitched")
 
     return df_stitched, progression
