@@ -355,7 +355,12 @@ def build_entity_table(
 
     # centroid (`observed=True` avoids processing empty categorical groups
     # when entity_col is categorical).
-    cent = df.groupby(entity_col, sort=True, observed=True)[list(coord_cols)].mean()
+    grouped_coords = df.groupby(entity_col, sort=True, observed=True)[list(coord_cols)]
+    cent = grouped_coords.mean()
+    # Per-axis min/max — used by the spatial centroid-in-bbox gate at
+    # Stitch time. Cheap O(N_tx) extra pass.
+    bbox_min = grouped_coords.min().rename(columns={c: f"{c}_min" for c in coord_cols})
+    bbox_max = grouped_coords.max().rename(columns={c: f"{c}_max" for c in coord_cols})
 
     # unique genes per entity (sorted for deterministic downstream mapping)
     genes = df.groupby(entity_col, sort=True, observed=True)[gene_col].unique()
@@ -363,7 +368,16 @@ def build_entity_table(
 
     etype = df.groupby(entity_col, observed=True)["_etype"].first()
 
-    summary = cent.join(genes.rename("genes")).join(etype.rename("etype"))
+    # Per-entity tx count — used as the "size" in the asymmetric
+    # smaller-inside-larger spatial test.
+    n_tx = df.groupby(entity_col, observed=True)[gene_col].size().rename("n_tx")
+
+    summary = (
+        cent.join(bbox_min).join(bbox_max)
+            .join(genes.rename("genes"))
+            .join(etype.rename("etype"))
+            .join(n_tx)
+    )
     summary = summary.reset_index().rename(columns={entity_col: "entity_id"})
     return summary
 
@@ -908,6 +922,14 @@ def stitch_entities_hierarchical(
     # tie on suffix → majority-tx-count winner gets the merged label.
     # If None, falls back to lexicographic tiebreak.
     entity_n_tx: dict[str, int] | None = None,
+    # Optional spatial centroid-in-bbox gate at merge time. When True,
+    # `can_merge(ra, rb)` requires the SMALLER entity's centroid to lie
+    # inside the LARGER entity's per-axis tx-coord range. Equivalent
+    # to: for each axis, the larger entity has at least one tx with
+    # coord above and one below the smaller's centroid. Default False
+    # (no spatial constraint beyond what `dist_threshold` already does
+    # at candidate-build time).
+    spatial_centroid_gate: bool = False,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1324,11 +1346,59 @@ def stitch_entities_hierarchical(
             # Any setup failure → fall back gracefully (no primitive path).
             root_prims = None
 
+    # ----------------------------------------------------------------
+    # Per-root spatial state (centroid + axis-aligned bbox + tx count).
+    # Initialised from summary_df columns when the spatial gate is
+    # active. Maintained on union: weighted-mean centroid, axis-aligned
+    # bbox union, tx-count sum.
+    # ----------------------------------------------------------------
+    root_centroid: np.ndarray | None = None  # [N, n_dim]
+    root_bbox_min: np.ndarray | None = None  # [N, n_dim]
+    root_bbox_max: np.ndarray | None = None  # [N, n_dim]
+    root_n_tx: np.ndarray | None = None      # [N]
+    if spatial_centroid_gate:
+        coord_keys = ["x", "y", "z"] if use_3d else ["x", "y"]
+        try:
+            root_centroid = summary_df[coord_keys].to_numpy(dtype=np.float64).copy()
+            min_keys = [f"{c}_min" for c in coord_keys]
+            max_keys = [f"{c}_max" for c in coord_keys]
+            root_bbox_min = summary_df[min_keys].to_numpy(dtype=np.float64).copy()
+            root_bbox_max = summary_df[max_keys].to_numpy(dtype=np.float64).copy()
+            if "n_tx" in summary_df.columns:
+                root_n_tx = summary_df["n_tx"].to_numpy(dtype=np.int64).copy()
+            else:
+                # No tx-count column → fall back to all-1 (gate still
+                # works; smaller-vs-larger ordering becomes lex on idx)
+                root_n_tx = np.ones(N, dtype=np.int64)
+        except KeyError:
+            # Bbox columns missing in older summary_df builds → disable
+            spatial_centroid_gate = False
+            root_centroid = root_bbox_min = root_bbox_max = root_n_tx = None
+
+    def _centroid_in_bbox(c: np.ndarray, bb_min: np.ndarray, bb_max: np.ndarray) -> bool:
+        """All-axis containment: c[d] ∈ [bb_min[d], bb_max[d]] for all d."""
+        return bool(np.all(c >= bb_min) and np.all(c <= bb_max))
+
     # constraint: can we merge clusters A and B?
     def can_merge(ra, rb):
         # never merge two clusters that both contain a cell
         if has_cell[ra] and has_cell[rb]:
             return False
+        # Optional spatial gate: smaller entity's centroid must lie
+        # inside the larger entity's bbox.
+        if spatial_centroid_gate and root_centroid is not None:
+            n_a = int(root_n_tx[ra])
+            n_b = int(root_n_tx[rb])
+            if n_a <= n_b:
+                small_idx, large_idx = ra, rb
+            else:
+                small_idx, large_idx = rb, ra
+            if not _centroid_in_bbox(
+                root_centroid[small_idx],
+                root_bbox_min[large_idx],
+                root_bbox_max[large_idx],
+            ):
+                return False
         return True
 
     # ----------------------------------------------------------------
@@ -1521,6 +1591,21 @@ def stitch_entities_hierarchical(
         cell_ids[rnew] |= cell_ids[rold]
         partial_ids[rnew] |= partial_ids[rold]
         comp_ids[rnew] |= comp_ids[rold]
+
+        # Spatial state update on union (when gate is active).
+        if (spatial_centroid_gate and root_centroid is not None
+                and root_n_tx is not None):
+            n_new = root_n_tx[rnew]
+            n_old = root_n_tx[rold]
+            n_total = n_new + n_old
+            if n_total > 0:
+                root_centroid[rnew] = (
+                    (root_centroid[rnew] * n_new + root_centroid[rold] * n_old) / n_total
+                )
+            root_bbox_min[rnew] = np.minimum(root_bbox_min[rnew], root_bbox_min[rold])
+            root_bbox_max[rnew] = np.maximum(root_bbox_max[rnew], root_bbox_max[rold])
+            root_n_tx[rnew] = n_total
+            root_n_tx[rold] = 0
 
         # union genes (and primitive sums when in decomposable mode).
         # In decomposable mode we already computed _combine_prims for
@@ -1924,6 +2009,12 @@ def apply_stitching_to_transcripts_memory_efficient(
     # strong-negative top-clique cross-PMI before expensive ΔC eval.
     fast_gate_top_k: int = 0,
     fast_gate_mean_threshold: float = 0.0,
+    # Experimental: spatial centroid-in-bbox gate at merge time.
+    # When True, smaller entity's centroid must lie inside the larger
+    # entity's per-axis tx-coord range (axis-aligned bbox). Default
+    # False (no spatial constraint beyond Stitch's existing
+    # `dist_threshold` Delaunay-edge filter at candidate-build time).
+    spatial_centroid_gate: bool = False,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -2062,6 +2153,7 @@ def apply_stitching_to_transcripts_memory_efficient(
         fast_gate_top_k=fast_gate_top_k,
         fast_gate_mean_threshold=fast_gate_mean_threshold,
         entity_n_tx=entity_n_tx_dict,
+        spatial_centroid_gate=spatial_centroid_gate,
         **legacy_kwargs,
     )
 
