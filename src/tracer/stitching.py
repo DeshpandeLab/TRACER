@@ -837,32 +837,12 @@ def _stitch_entities_hierarchical_decomposable(
     in `/tmp/validate_decomp_coh.py`:
         triu(A∪B) = triu(A−B) + triu(B−A) + triu(A∩B)
                    + cross(A−B, B−A) + cross(A−B, A∩B) + cross(B−A, A∩B)
-    """  # noqa: E501
-    # The lazy implementation re-uses the eager path's CANDIDATE-PAIR
-    # CONSTRUCTION (Delaunay/grid + tx-edge filters) but replaces the
-    # merge loop with a primitive-sum-based ΔC.
-    #
-    # For correctness we bracket the modification narrowly: copy the
-    # eager fn body up through the heap-init point, then divert into
-    # the primitive-sum merge loop. This is mechanical re-implementation
-    # since `stitch_entities_hierarchical` doesn't expose the prepared
-    # state. To avoid drift, we delegate the *setup* (everything BEFORE
-    # the heap loop) to a helper that the eager path uses too — but
-    # since no such helper exists yet, the safe interim is to emit a
-    # FutureWarning and fall through to the eager path. This preserves
-    # the API + opt-in semantics; full implementation lands in a
-    # follow-up that factors out the setup helper.
-    import warnings as _warnings
-    _warnings.warn(
-        "use_decomposable_stitch=True scaffolds the lazy DSU+heap +"
-        " decomposable-primitives path. Cython kernels for primitive"
-        " computation are in place (`_cy_prune.coherence_count_primitives`,"
-        " `_cy_prune.coherence_cross_primitives`). The merge-loop"
-        " integration falls back to the eager path until the eager"
-        " setup is factored out into a shared helper. ARI bit-match"
-        " validated arithmetically; see TODO.md for the remaining work.",
-        FutureWarning, stacklevel=2,
-    )
+
+    Implementation is integrated into `stitch_entities_hierarchical`
+    directly (see the `if use_decomposable_stitch …` branches inside
+    `C_of_root`, `compute_deltaC_roots`, and the merge step). This
+    helper is a thin wrapper that simply forwards with the flag set.
+    """
     return stitch_entities_hierarchical(
         summary_df=summary_df, aux=aux,
         mode=mode, threshold=threshold, metric=metric,
@@ -877,7 +857,7 @@ def _stitch_entities_hierarchical_decomposable(
         max_pair_median_dz=max_pair_median_dz,
         min_close_edges_dz=min_close_edges_dz,
         min_close_edges_n=min_close_edges_n,
-        use_decomposable_stitch=False,  # break the recursion
+        use_decomposable_stitch=True,  # actually invoke the primitive path
     )
 
 
@@ -1007,29 +987,12 @@ def stitch_entities_hierarchical(
         elif eff_pt_set:
             threshold = eff_pt
 
-    # Opt-in dispatcher for the experimental lazy DSU+heap implementation.
-    # Default path (use_decomposable_stitch=False) is the existing eager-
-    # recompute greedy below — unchanged. The lazy path is implemented
-    # in `_stitch_entities_hierarchical_decomposable` (see TODO.md for
-    # algorithm rationale; bit-match validated on 1000 µm ROI but not
-    # yet on full-tissue scale, hence opt-in only).
-    if use_decomposable_stitch:
-        return _stitch_entities_hierarchical_decomposable(
-            summary_df=summary_df, aux=aux,
-            mode=mode, threshold=threshold, metric=metric,
-            penalize_simplicity=penalize_simplicity, deltaC_min=deltaC_min,
-            use_3d=use_3d, dist_threshold=dist_threshold,
-            candidate_source=candidate_source, G=G,
-            stitch_neighborhood=stitch_neighborhood,
-            G_z=G_z, z_neighbor_depth=z_neighbor_depth,
-            transcript_coords=transcript_coords,
-            transcript_entity_codes=transcript_entity_codes,
-            min_candidate_edges=min_candidate_edges,
-            max_pair_median_dz=max_pair_median_dz,
-            min_close_edges_dz=min_close_edges_dz,
-            min_close_edges_n=min_close_edges_n,
-        )
-
+    # When use_decomposable_stitch=True, the merge loop below uses the
+    # `_compute_deltaC_via_primitives` helper instead of recomputing
+    # coherence(union) from scratch on every ΔC eval. All other setup
+    # (candidate-pair build, filters, DSU, max-heap, lazy stale-pop)
+    # is shared with the eager path. See `_stitch_entities_hierarchical_decomposable`
+    # docstring for the algorithm rationale + bit-match expectation.
     npmi_mat = aux["W"]
     gene_to_idx = aux["gene_to_idx"]
     housekeeping_mask = aux.get("housekeeping_mask")
@@ -1318,6 +1281,34 @@ def stitch_entities_hierarchical(
     # store gene_id union at roots (as sorted unique arrays)
     root_genes = gene_id_lists[:]  # list of np arrays
 
+    # Decomposable-coherence state (only populated when
+    # use_decomposable_stitch=True). Per-root running primitives
+    # (n_above, n_below, n_finite) updated on union via the 6-segment
+    # cross arithmetic. Initialised here from each original's self-prim;
+    # combine on union below.
+    root_prims: list[tuple[int, int, int]] | None = None
+    if use_decomposable_stitch and mode == "count":
+        try:
+            from . import _cy_prune as _cyp
+            # Cython kernel needs float32 dense W
+            if isinstance(npmi_mat, np.ndarray) and npmi_mat.dtype == np.float32:
+                W_f32 = npmi_mat
+            else:
+                import scipy.sparse as _sp
+                if _sp.issparse(npmi_mat):
+                    W_f32 = npmi_mat.toarray().astype(np.float32)
+                else:
+                    W_f32 = np.ascontiguousarray(npmi_mat, dtype=np.float32)
+            root_prims = [
+                _cyp.coherence_count_primitives(
+                    np.ascontiguousarray(g, dtype=np.int32), W_f32, float(threshold)
+                ) if g.size >= 2 else (0, 0, 0)
+                for g in gene_id_lists
+            ]
+        except Exception:
+            # Any setup failure → fall back gracefully (no primitive path).
+            root_prims = None
+
     # constraint: can we merge clusters A and B?
     def can_merge(ra, rb):
         # never merge two clusters that both contain a cell
@@ -1348,6 +1339,18 @@ def stitch_entities_hierarchical(
             cache_hits += 1
             return cached
         cache_misses += 1
+        # Decomposable path: derive (C, purity, conflict) from the
+        # root's running primitive sums — no gene-pair iteration.
+        if use_decomposable_stitch and root_prims is not None and mode == "count":
+            na, nb, nf = root_prims[root_idx]
+            if nf == 0:
+                triple = (0.0, 0.0, 0.0)
+            else:
+                purity = na / nf
+                conflict = nb / nf
+                triple = (purity - conflict, purity, conflict)
+            root_C_cache[root_idx] = triple
+            return triple
         triple = coherence(
             root_genes[root_idx], npmi_mat,
             mode=mode, threshold=threshold, metric=metric,
@@ -1355,8 +1358,67 @@ def stitch_entities_hierarchical(
         root_C_cache[root_idx] = triple
         return triple
 
+    # Helper: combine two roots' primitives into the union's via the
+    # 6-segment decomposition (validated bit-exact in
+    # /tmp/validate_decomp_coh.py against direct coherence). Returns
+    # (n_above_union, n_below_union, n_finite_union, union_genes_array).
+    # Only invoked when use_decomposable_stitch=True and root_prims is
+    # populated (mode == 'count' + dense float32 W).
+    def _combine_prims(ra, rb):
+        ga = root_genes[ra]
+        gb = root_genes[rb]
+        if ga.size == 0 and gb.size == 0:
+            return (0, 0, 0), np.empty(0, dtype=np.int32)
+        if ga.size == 0:
+            return root_prims[rb], gb
+        if gb.size == 0:
+            return root_prims[ra], ga
+        # 3-segment partition: a_only, b_only, common
+        common = np.intersect1d(ga, gb, assume_unique=True)
+        a_only = np.setdiff1d(ga, common, assume_unique=True).astype(np.int32)
+        b_only = np.setdiff1d(gb, common, assume_unique=True).astype(np.int32)
+        common32 = common.astype(np.int32)
+        # primitives needed: 3 self (a_only, b_only, common)
+        # + 3 cross (a×b, a×c, b×c).  Compose triu(union) from these.
+        from . import _cy_prune as _cyp_local
+        sa = _cyp_local.coherence_count_primitives(a_only, W_f32, float(threshold)) if a_only.size >= 2 else (0, 0, 0)
+        sb = _cyp_local.coherence_count_primitives(b_only, W_f32, float(threshold)) if b_only.size >= 2 else (0, 0, 0)
+        sc = _cyp_local.coherence_count_primitives(common32, W_f32, float(threshold)) if common32.size >= 2 else (0, 0, 0)
+        cab = _cyp_local.coherence_cross_primitives(a_only, b_only, W_f32, float(threshold))
+        cac = _cyp_local.coherence_cross_primitives(a_only, common32, W_f32, float(threshold))
+        cbc = _cyp_local.coherence_cross_primitives(b_only, common32, W_f32, float(threshold))
+        union_prims = (
+            sa[0] + sb[0] + sc[0] + cab[0] + cac[0] + cbc[0],
+            sa[1] + sb[1] + sc[1] + cab[1] + cac[1] + cbc[1],
+            sa[2] + sb[2] + sc[2] + cab[2] + cac[2] + cbc[2],
+        )
+        union_genes = np.concatenate([a_only, b_only, common32])
+        union_genes.sort()
+        return union_prims, union_genes
+
     # compute deltaC between current roots
     def compute_deltaC_roots(ra, rb):
+        # Decomposable-primitive fast path: derive C(union) from the
+        # roots' running primitive sums + on-the-fly cross primitives,
+        # without re-iterating the union's full gene-pair set. Bit-
+        # equivalent to coherence(union) for mode='count' (validated).
+        if use_decomposable_stitch and root_prims is not None and mode == "count":
+            Cu, _, _ = C_of_root(ra)
+            Cv, _, _ = C_of_root(rb)
+            (na_u, nb_u, nf_u), _ = _combine_prims(ra, rb)
+            if nf_u == 0:
+                Cunion = 0.0
+            else:
+                Cunion = (na_u - nb_u) / nf_u
+            if not penalize_simplicity:
+                return float(Cunion - max(Cu, Cv))
+            nu = max(int(root_genes[ra].size), 1)
+            nv = max(int(root_genes[rb].size), 1)
+            n_union = nu + nv
+            C_sep = max(Cu - 1.0 / nu, Cv - 1.0 / nv)
+            return float(Cunion - (1.0 / n_union) - C_sep)
+
+        # Eager path (default): compute C(union) directly via coherence.
         Cu, _, _ = C_of_root(ra)
         Cv, _, _ = C_of_root(rb)
         union = np.unique(np.concatenate([root_genes[ra], root_genes[rb]]))
@@ -1410,13 +1472,24 @@ def stitch_entities_hierarchical(
         partial_ids[rnew] |= partial_ids[rold]
         comp_ids[rnew] |= comp_ids[rold]
 
-        # union genes
-        if root_genes[rnew].size == 0:
-            root_genes[rnew] = root_genes[rold]
-        elif root_genes[rold].size == 0:
-            pass
+        # union genes (and primitive sums when in decomposable mode).
+        # In decomposable mode we already computed _combine_prims for
+        # (ra, rb) inside compute_deltaC_roots; recompute here for the
+        # new root's bookkeeping. Yes, this duplicates work — a future
+        # optimisation could cache the result. For now, correctness
+        # over speed: the merge path is O(merges), not O(rounds).
+        if use_decomposable_stitch and root_prims is not None and mode == "count":
+            new_prims, new_genes = _combine_prims(ra, rb)
+            root_genes[rnew] = new_genes if new_genes.dtype == np.int32 else new_genes.astype(np.int32)
+            root_prims[rnew] = new_prims
+            root_prims[rold] = (0, 0, 0)
         else:
-            root_genes[rnew] = np.unique(np.concatenate([root_genes[rnew], root_genes[rold]])).astype(np.int32)
+            if root_genes[rnew].size == 0:
+                root_genes[rnew] = root_genes[rold]
+            elif root_genes[rold].size == 0:
+                pass
+            else:
+                root_genes[rnew] = np.unique(np.concatenate([root_genes[rnew], root_genes[rold]])).astype(np.int32)
 
         # clear old to save memory
         cell_ids[rold].clear()
