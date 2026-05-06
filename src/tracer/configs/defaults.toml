@@ -1,0 +1,184 @@
+# TRACER pipeline defaults — production Xenium 3D config.
+#
+# This file mirrors the dataclass defaults in `src/tracer/config.py`.
+# Values here are loaded by `load_config()` as the base layer; platform
+# presets and user overrides patch keys on top.
+#
+# Tests verify defaults.toml values match the dataclass defaults — keep
+# the two in lock-step.
+
+# ---------------------------------------------------------------------
+# Phase 1 — nuclear-anchored greedy bad-edge prune + admission.
+# ---------------------------------------------------------------------
+[phase1]
+# PMI cutoff for "compatible" gene pairs in the bad-edge graph.
+pmi_threshold = 0.05
+
+# Minimum mean-PMI within a Phase-1c sub-seed for it to be accepted.
+# Rejects degenerate small seeds (e.g. a 4-gene cluster carried by a
+# single noisy-PMI edge).
+seed_coherence_floor = 0.10
+
+# Tx-weighted greedy prune: score[i] = sum_j(bad[i,j] * n_tx[j]) with
+# the safeguard "skip if n_tx[i] > score[i]". Prevents a single
+# multi-tx gene from being killed by a peer module.
+tx_weighted_prune = true
+
+# Restrict Phase-1b/1c admission to nuclear tx; cytoplasmic tx are
+# left for Rescue. Cuts Phase-1 cost ~50% on segmented data.
+nuclear_only_admit = true
+
+
+# ---------------------------------------------------------------------
+# Split-Phase1 — z-gap-based splitter for Phase-1 entities.
+# (No-op when the z column is absent; auto-detected at runtime.)
+# ---------------------------------------------------------------------
+[split_phase1]
+# Sort tx of each entity by z; if a consecutive Δz exceeds this (µm),
+# split into two sub-entities at that gap.
+dz_threshold_um = 2.0
+
+# Minimum tx count for a split-out sub-cluster to be retained.
+min_tx = 1
+
+# Entity below this size is not split (keeps singletons / pairs intact).
+min_entity_size = 2
+
+
+# ---------------------------------------------------------------------
+# Phase1-QC — post-split QC; demotes any Phase-1 entity smaller than
+# `min_tx`. Catches singleton seeds on sparse cells.
+# ---------------------------------------------------------------------
+[phase1_qc]
+min_tx = 3
+
+
+# ---------------------------------------------------------------------
+# Rescue — spatial-prior reassignment of Phase-1 unassigned tx.
+# Used by both the main 3-pass Rescue and the post-Demote Final Rescue.
+# ---------------------------------------------------------------------
+[rescue]
+# Veto mode: "min" | "mean" | "hybrid".
+#   min:    legacy — reject if any g' in E has PMI(g, g') ≤ neg_threshold.
+#   mean:   reject if mean PMI(g, E.genes \ {g}) ≤ mean_admit_threshold.
+#   hybrid: g ∈ E.genes → admit; else min > min_admit → admit;
+#           else mean > mean_admit → admit; else reject.
+veto_mode = "hybrid"
+
+# Hybrid: unanimous-positive fast-pass cutoff. Every g' in E with
+# finite PMI(g, g') > this → admit without computing the mean.
+min_admit_threshold = 0.0
+
+# Hybrid/mean: aggregate-positive slow-pass cutoff. Admit if mean PMI
+# exceeds this. Setting > 0 demands real evidence (not just "absence
+# of negative evidence") for cross-gene admission.
+mean_admit_threshold = 0.1
+
+# Min-mode veto cutoff and cluster-guard threshold.
+neg_threshold = -0.05
+
+# Iterative rescue cap. Pipeline early-stops if a pass admits zero tx.
+max_passes = 3
+
+# Spatial-gate xy bin size in µm. The 9-cell Moore neighborhood at
+# this scale defines the candidate-tx pool; candidates outside the
+# z_bound are dropped.
+bin_size_um = 2.0
+
+# Maximum |Δz| from unassigned tx to candidate tx in µm.
+# Omitted (or set null) → use bin_size_um * sqrt(2), matching the
+# implicit xy reach of the bin neighborhood.
+# z_bound_um = 2.83
+
+# Cluster-guard: if an unassigned tx has ≥ N same-bin same-gene peers,
+# shield it from Rescue so Stage 2 (Group) can form an UNASSIGNED_*
+# component instead. 0 disables the guard.
+cluster_guard_n = 3
+
+# Mean-mode small-entity fallback: if an entity has fewer than this
+# many observed-PMI pairs against g, fall back to min-mode for that
+# entity. 0 disables (pure mean / hybrid). Main Rescue uses 0 here.
+small_entity_guard_n = 0
+
+
+# ---------------------------------------------------------------------
+# Group — Stage-2 connected-components on a bad-edge-pruned k-NN graph
+# of the residual unassigned tx.
+# ---------------------------------------------------------------------
+[group]
+# Bad-edge cutoff for Group's gene-prune (count-blind greedy).
+neighbor_threshold = -0.1
+
+# k for the spatial k-NN (excluding self).
+k_neighbors = 8
+
+# Distance cap on the spatial k-NN (µm).
+dist_threshold_um = 1.5
+
+# Minimum component size to retain. Smaller comps are demoted to "-1".
+min_comp_size = 4
+
+
+# ---------------------------------------------------------------------
+# Stitch — Stage-3 entity-pair merger (partial→partial, partial→cell,
+# cell→cell). Coherence-gated, distance-bounded.
+# ---------------------------------------------------------------------
+[stitch]
+# Coherence metric for the merger acceptance test.
+metric = "pmi"
+
+# Coherence threshold (PMI). The merged entity must score above this
+# AND beat the parents by at least delta_c_min.
+threshold = 0.05
+
+# Maximum centroid–centroid distance for candidate pairs (µm).
+dist_threshold_um = 5.0
+
+# xy bin size for the candidate-pair grid (µm).
+bin_size_xy_um = 2.0
+
+# z bin size (µm). Omit / null → auto-derive from data z-spacing.
+# bin_size_z_um = 1.0
+
+# Number of z-bins above/below to include as candidate neighbors.
+z_neighbor_depth = 1
+
+# Close-edge gating: minimum number of edges with Δz ≤ this between
+# the two entities for them to be considered close in z. null → auto.
+# min_close_edges_dz = 1.0
+min_close_edges_n = 5
+
+# Penalize merging two entities whose existing genes are nearly
+# identical (favors complementary phenotype mergers).
+penalize_simplicity = true
+
+# Minimum coherence improvement over the better parent for accept.
+delta_c_min = 0.0
+
+# Candidate-pair generator: "grid" (binned spatial) or "knn" (k-NN tree).
+candidate_source = "grid"
+
+# 4-connected or 8-connected (Moore) xy neighborhood for the grid.
+neighborhood = "8"
+
+# Coherence accumulation mode.
+mode = "count"
+
+
+# ---------------------------------------------------------------------
+# Demote — drop entities below this size after Stitch.
+# ---------------------------------------------------------------------
+[demote]
+min_entity_size = 5
+
+
+# ---------------------------------------------------------------------
+# Final Rescue — single-pass rescue of post-Demote unassigned tx.
+# Inherits all keys from [rescue] then applies the deltas below.
+# ---------------------------------------------------------------------
+[final_rescue]
+inherit = "rescue"
+
+# Stricter than main Rescue: no fallback-to-min for small entities.
+# (Already 0 in [rescue], explicit here for documentation.)
+small_entity_guard_n = 0
