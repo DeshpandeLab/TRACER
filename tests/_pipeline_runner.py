@@ -425,6 +425,20 @@ STITCH_GZ_UM: float | None = None
 MID_SPLIT_UNASSIGNED_DZ: float | None = None
 MID_QC_C_FLOOR: float = 0.0
 
+# Post-Group Rescue (between Group and Stitch). Closes the gap where
+# Group's UNASSIGNED_* components — freshly created — cannot serve as
+# Rescue targets in the main 3-pass Rescue (which runs BEFORE Group).
+# Without this stage, tx that "belong" to a Group component sit as
+# "-1" through Stitch (which then sees an incomplete component) and
+# Demote (which may cull on size before the component is fully grown),
+# only getting a chance at Final Rescue.
+#
+#   0 = off (current production behavior)
+#  >0 = number of post-Group rescue passes; admits "-1" tx to BOTH
+#        Phase-1 entities AND Group components via the same hybrid
+#        veto used elsewhere. Same compute profile as the main Rescue.
+RESCUE_POST_GROUP_PASSES: int = 0
+
 
 def _classify(label: str) -> str:
     s = str(label)
@@ -639,6 +653,27 @@ def run_segmented_pipeline(df: pd.DataFrame,
     if mid_did_anything:
         _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
 
+    # Post-Group Rescue (opt-in). Admits any remaining "-1" tx to
+    # Phase-1 entities AND Group components — closing the gap where
+    # Group's UNASSIGNED_* couldn't be Rescue targets in the main pass.
+    if RESCUE_POST_GROUP_PASSES > 0:
+        for _pass in range(RESCUE_POST_GROUP_PASSES):
+            df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
+                df_grouped, aux=aux,
+                entity_col="tracer_id", gene_col="feature_name",
+                coord_cols=("x", "y", "z"), out_col="tracer_id",
+                G=2.0, pos_npmi_threshold=PMI_THR,
+                neg_npmi_threshold=RESCUE_NEG_THR,
+                cluster_guard_n=3,
+                veto_mode=RESCUE_VETO_MODE,
+                mean_threshold=RESCUE_MEAN_ADMIT,
+                min_admit_threshold=RESCUE_MIN_ADMIT,
+                small_entity_guard_n=0,
+            )
+            if n_pass_rescued == 0:
+                break
+        _record_stage(progression, "Post-Group Rescue", df_grouped, "tracer_id")
+
     # Stitch — uses the same dz_stats computed before Split.
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
@@ -758,6 +793,25 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         mid_did_anything = True
     if mid_did_anything:
         _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
+
+    # Post-Group Rescue (opt-in) — see segmented runner for rationale.
+    if RESCUE_POST_GROUP_PASSES > 0:
+        for _pass in range(RESCUE_POST_GROUP_PASSES):
+            df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
+                df_grouped, aux=aux,
+                entity_col="tracer_id", gene_col="feature_name",
+                coord_cols=("x", "y", "z"), out_col="tracer_id",
+                G=2.0, pos_npmi_threshold=PMI_THR,
+                neg_npmi_threshold=RESCUE_NEG_THR,
+                cluster_guard_n=3,
+                veto_mode=RESCUE_VETO_MODE,
+                mean_threshold=RESCUE_MEAN_ADMIT,
+                min_admit_threshold=RESCUE_MIN_ADMIT,
+                small_entity_guard_n=0,
+            )
+            if n_pass_rescued == 0:
+                break
+        _record_stage(progression, "Post-Group Rescue", df_grouped, "tracer_id")
 
     # Stitch
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
