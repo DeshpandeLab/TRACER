@@ -1,11 +1,11 @@
 {
   "ami_vs_truth": NaN,
   "ari_vs_truth": NaN,
-  "coverage_pct": 57.0,
+  "coverage_pct": 60.5,
   "n_cells": 0,
-  "n_components": 4,
+  "n_components": 5,
   "n_partials": 0,
-  "n_unassigned_tx": 86,
+  "n_unassigned_tx": 79,
   "stage_progression": [
     {
       "n_cells": 0,
@@ -30,30 +30,44 @@
     },
     {
       "n_cells": 0,
-      "n_components": 4,
+      "n_components": 5,
       "n_partials": 0,
       "n_unassigned_tx": 97,
+      "stage": "Mid-QC"
+    },
+    {
+      "n_cells": 0,
+      "n_components": 5,
+      "n_partials": 0,
+      "n_unassigned_tx": 79,
+      "stage": "Post-Group Rescue"
+    },
+    {
+      "n_cells": 0,
+      "n_components": 5,
+      "n_partials": 0,
+      "n_unassigned_tx": 79,
       "stage": "Stitch"
     },
     {
       "n_cells": 0,
-      "n_components": 4,
+      "n_components": 5,
       "n_partials": 0,
-      "n_unassigned_tx": 97,
+      "n_unassigned_tx": 79,
       "stage": "Demote"
     },
     {
       "n_cells": 0,
-      "n_components": 4,
+      "n_components": 5,
       "n_partials": 0,
-      "n_unassigned_tx": 86,
+      "n_unassigned_tx": 79,
       "stage": "Final Rescue"
     },
     {
       "n_cells": 0,
-      "n_components": 4,
+      "n_components": 5,
       "n_partials": 0,
-      "n_unassigned_tx": 86,
+      "n_unassigned_tx": 79,
       "stage": "Finalize"
     }
   ]

@@ -60,7 +60,21 @@
     {
       "n_cells": 7,
       "n_components": 0,
-      "n_partials": 2,
+      "n_partials": 1,
+      "n_unassigned_tx": 7,
+      "stage": "Mid-QC"
+    },
+    {
+      "n_cells": 7,
+      "n_components": 0,
+      "n_partials": 1,
+      "n_unassigned_tx": 6,
+      "stage": "Post-Group Rescue"
+    },
+    {
+      "n_cells": 7,
+      "n_components": 0,
+      "n_partials": 1,
       "n_unassigned_tx": 6,
       "stage": "Stitch"
     },

@@ -401,8 +401,8 @@ RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
 #   STITCH_GZ_UM            None = use auto (current). 1.0 → max
 #                              Δz reach in candidate enumeration =
 #                              2·G_z = 2 µm, matching SPLIT_PHASE1_DZ.
-STITCH_MIN_LOCAL_TX: int = 0
-STITCH_GZ_UM: float | None = None
+STITCH_MIN_LOCAL_TX: int = 3
+STITCH_GZ_UM: float | None = 1.0
 
 # Mid-pipeline QC (after Group, before Stitch). Two opt-in controls;
 # both default off so current production behavior is unchanged.
@@ -422,8 +422,8 @@ STITCH_GZ_UM: float | None = None
 #                            n_genes < 2. Catches incoherent Phase-1
 #                            entities that survived size QC and any
 #                            low-C Group components.
-MID_SPLIT_UNASSIGNED_DZ: float | None = None
-MID_QC_C_FLOOR: float = 0.0
+MID_SPLIT_UNASSIGNED_DZ: float | None = 2.0
+MID_QC_C_FLOOR: float = 0.05
 
 # Post-Group Rescue (between Group and Stitch). Closes the gap where
 # Group's UNASSIGNED_* components — freshly created — cannot serve as
@@ -437,7 +437,7 @@ MID_QC_C_FLOOR: float = 0.0
 #  >0 = number of post-Group rescue passes; admits "-1" tx to BOTH
 #        Phase-1 entities AND Group components via the same hybrid
 #        veto used elsewhere. Same compute profile as the main Rescue.
-RESCUE_POST_GROUP_PASSES: int = 0
+RESCUE_POST_GROUP_PASSES: int = 3
 
 
 def _classify(label: str) -> str:
