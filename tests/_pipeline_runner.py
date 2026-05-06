@@ -221,6 +221,14 @@ ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
 # any scale (per /tmp/iterative_rescue_*.png diagnostic). Early-stop
 # fires when a pass adds zero tx — covers tight crops in 1–2 passes.
 RESCUE_MAX_PASSES = 3
+# Rescue veto: hybrid two-stage admission for tx of gene g into entity E:
+#   1. If g ∈ E.genes  → admit (no test; E was deemed compatible w/ g earlier).
+#   2. Else if min PMI(g, E.genes) > RESCUE_MIN_ADMIT → admit (unanimous-pos).
+#   3. Else if mean PMI(g, E.genes, finite) > RESCUE_MEAN_ADMIT → admit.
+#   4. Else → reject. Tx remains "-1".
+RESCUE_VETO_MODE = "hybrid"
+RESCUE_MIN_ADMIT = 0.0      # any negative pair drops to mean-stage
+RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
 
 
 def _classify(label: str) -> str:
@@ -393,7 +401,10 @@ def run_segmented_pipeline(df: pd.DataFrame,
             entity_col="tracer_id", gene_col="feature_name",
             coord_cols=("x", "y", "z"), out_col="tracer_id",
             G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
-            cluster_guard_n=3, veto_mode="mean", mean_threshold=0.0,
+            cluster_guard_n=3,
+            veto_mode=RESCUE_VETO_MODE,
+            mean_threshold=RESCUE_MEAN_ADMIT,
+            min_admit_threshold=RESCUE_MIN_ADMIT,
             small_entity_guard_n=0,
         )
         n_rescued += n_pass_rescued
@@ -443,7 +454,10 @@ def run_segmented_pipeline(df: pd.DataFrame,
         coord_cols=("x", "y", "z"), out_col="stitched",
         G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
         only_partial_component=False,
-        veto_mode="mean", mean_threshold=0.0, small_entity_guard_n=0,
+        veto_mode=RESCUE_VETO_MODE,
+        mean_threshold=RESCUE_MEAN_ADMIT,
+        min_admit_threshold=RESCUE_MIN_ADMIT,
+        small_entity_guard_n=0,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
@@ -536,7 +550,10 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         coord_cols=("x", "y", "z"), out_col="stitched",
         G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
         only_partial_component=False,
-        veto_mode="mean", mean_threshold=0.0, small_entity_guard_n=0,
+        veto_mode=RESCUE_VETO_MODE,
+        mean_threshold=RESCUE_MEAN_ADMIT,
+        min_admit_threshold=RESCUE_MIN_ADMIT,
+        small_entity_guard_n=0,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 

@@ -1464,6 +1464,7 @@ def reassign_unassigned_grid_pool(
     veto_mode: str = "min",
     mean_threshold: float = 0.0,
     small_entity_guard_n: int = 3,
+    min_admit_threshold: float = 0.0,
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, dict]:
     """Grid-bin rescue: distance-priority with NPMI as a negative veto.
@@ -1533,8 +1534,10 @@ def reassign_unassigned_grid_pool(
         PREFERRED/NEUTRAL API; unused under the distance-priority
         algorithm.
     """
-    if veto_mode not in ("min", "mean"):
-        raise ValueError(f"veto_mode must be 'min' or 'mean', got {veto_mode!r}")
+    if veto_mode not in ("min", "mean", "hybrid"):
+        raise ValueError(
+            f"veto_mode must be 'min', 'mean', or 'hybrid'; got {veto_mode!r}"
+        )
     _ensure_reproducibility_seed()
     from .stitching import build_entity_table, infer_entity_type
     from .graph import bin_xy, neighbor_bins
@@ -1644,7 +1647,7 @@ def reassign_unassigned_grid_pool(
     use_cython_batch = (
         not W_is_sparse
         and len(coord_cols) >= 2
-        and veto_mode in ("min", "mean")
+        and veto_mode in ("min", "mean", "hybrid")
     )
     if use_cython_batch:
         from . import _cy_prune
@@ -1720,6 +1723,11 @@ def reassign_unassigned_grid_pool(
         W_c = W if (hasattr(W, "dtype") and W.dtype == np.float32) else np.asarray(W, dtype=np.float32)
         z_bound_for_cy = float(z_bound_eff) if z_col_idx is not None else 0.0
 
+        veto_mode_int = (
+            0 if veto_mode == "min"
+            else 1 if veto_mode == "mean"
+            else 2  # hybrid
+        )
         best_ent_arr, best_dist_arr, reason_arr, sef_arr = (
             _cy_prune.rescue_per_tx_batch(
                 una_coords_c, una_g_idx, nb_bins_arr,
@@ -1728,10 +1736,11 @@ def reassign_unassigned_grid_pool(
                 ent_gene_offsets, ent_gene_idx,
                 W_c,
                 z_bound_for_cy,
-                0 if veto_mode == "min" else 1,
+                veto_mode_int,
                 float(mean_threshold),
                 int(small_entity_guard_n),
                 float(neg_npmi_threshold),
+                float(min_admit_threshold),
             )
         )
 
@@ -1784,13 +1793,10 @@ def reassign_unassigned_grid_pool(
         else:
             local_li = np.fromiter(local_idxs_raw, dtype=np.int64)
 
-        # PMI veto setup. Both modes need the negative_set for the small-
-        # entity fallback (mean) or the primary check (min).
+        # PMI veto setup. min/mean need the negative_set; hybrid needs row_g.
         neg = negative_set(int(g_idx))
-        # In mean mode, also fetch the full PMI row for vectorised entity-
-        # mean computation.
         row_g: np.ndarray | None = None
-        if veto_mode == "mean":
+        if veto_mode in ("mean", "hybrid"):
             if W_is_sparse:
                 row_g = np.asarray(W.getrow(int(g_idx)).todense()).ravel()
             else:
@@ -1812,7 +1818,7 @@ def reassign_unassigned_grid_pool(
 
             if veto_mode == "min":
                 vetoed = bool(ent_set and (ent_set & neg))
-            else:
+            elif veto_mode == "mean":
                 cached = ent_decision_cache.get(ent)
                 if cached is not None:
                     vetoed = cached
@@ -1841,6 +1847,35 @@ def reassign_unassigned_grid_pool(
                                 vetoed = True
                             else:
                                 mean_p = float(pmis[finite].mean())
+                                vetoed = mean_p <= mean_threshold
+                    ent_decision_cache[ent] = vetoed
+            else:
+                # hybrid mode: g ∈ E → admit. Else min-fast-pass, mean-slow-pass.
+                cached = ent_decision_cache.get(ent)
+                if cached is not None:
+                    vetoed = cached
+                else:
+                    if not ent_set:
+                        vetoed = False
+                    elif int(g_idx) in ent_set:
+                        # Same-gene admission: E already contains g; the
+                        # rest of E.genes was deemed compatible with g
+                        # by an earlier pipeline stage. No re-test.
+                        vetoed = False
+                    else:
+                        ent_arr = np.asarray(sorted(ent_set), dtype=np.int64)
+                        pmis = row_g[ent_arr]
+                        finite = np.isfinite(pmis)
+                        n_valid = int(finite.sum())
+                        if n_valid == 0:
+                            vetoed = True  # no evidence → reject
+                        else:
+                            pmis_f = pmis[finite]
+                            min_p = float(pmis_f.min())
+                            if min_p > min_admit_threshold:
+                                vetoed = False  # unanimous fast-pass
+                            else:
+                                mean_p = float(pmis_f.mean())
                                 vetoed = mean_p <= mean_threshold
                     ent_decision_cache[ent] = vetoed
 
@@ -1909,6 +1944,7 @@ def pre_stage2_rescue(
     veto_mode: str = "min",
     mean_threshold: float = 0.0,
     small_entity_guard_n: int = 3,
+    min_admit_threshold: float = 0.0,
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, int, dict]:
     """Pre-Stage-2 rescue: tight-scale NPMI-categorical reassignment of
@@ -1997,6 +2033,7 @@ def pre_stage2_rescue(
         veto_mode=veto_mode,
         mean_threshold=mean_threshold,
         small_entity_guard_n=small_entity_guard_n,
+        min_admit_threshold=min_admit_threshold,
     )
 
     # Restore: any tx still holding SHIELD_LABEL after rescue → reset to

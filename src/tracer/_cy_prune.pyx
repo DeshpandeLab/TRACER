@@ -748,10 +748,11 @@ def rescue_per_tx_batch(
     cnp.ndarray[cnp.int32_t, ndim=1] ent_gene_idx,       # CSR data (sorted gene idxs)
     cnp.ndarray[cnp.float32_t, ndim=2] W,                # PMI matrix (NaN-filled = 0 ok)
     double z_bound,                                       # 0.0 ⇒ no z-bound
-    int veto_mode,                                        # 0=min, 1=mean
+    int veto_mode,                                        # 0=min, 1=mean, 2=hybrid
     double mean_threshold,
     int small_entity_guard_n,
     double neg_npmi_threshold,
+    double min_admit_threshold = 0.0,                     # hybrid: min-PMI fast-pass cutoff
 ):
     """Per-unassigned-tx Rescue batch.
 
@@ -808,7 +809,8 @@ def rescue_per_tx_batch(
     cdef int i, j, b, off_lo, off_hi, ass_li, ent
     cdef int e_off_lo, e_off_hi, n_ent_genes, ig, eg
     cdef int g_idx, vetoed, any_vetoed, found_neg, n_finite, used_fallback
-    cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p
+    cdef int g_in_E
+    cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p, min_pmi
 
     for i in range(n_una):
         current_gen += 1
@@ -864,7 +866,7 @@ def rescue_per_tx_batch(
                             if W_mv[g_idx, eg] < neg_npmi_threshold:
                                 vetoed = 1
                                 break
-                    else:
+                    elif veto_mode == 1:
                         # mean-mode
                         pmi_sum = 0.0
                         n_finite = 0
@@ -889,6 +891,39 @@ def rescue_per_tx_batch(
                         else:
                             mean_p = pmi_sum / n_finite
                             vetoed = 1 if mean_p <= mean_threshold else 0
+                    else:
+                        # hybrid mode (veto_mode == 2):
+                        #   if g ∈ E.genes → admit (no test).
+                        #   else if min PMI(g, E\{g}) > min_admit_threshold → admit.
+                        #   else if mean PMI(g, E\{g}, finite) > mean_threshold → admit.
+                        #   else → veto.
+                        g_in_E = 0
+                        for ig in range(e_off_lo, e_off_hi):
+                            if ent_g_mv[ig] == g_idx:
+                                g_in_E = 1
+                                break
+                        if g_in_E:
+                            vetoed = 0
+                        else:
+                            pmi_sum = 0.0
+                            n_finite = 0
+                            min_pmi = 1e300
+                            for ig in range(e_off_lo, e_off_hi):
+                                eg = ent_g_mv[ig]
+                                pmi_val = W_mv[g_idx, eg]
+                                if pmi_val == pmi_val:  # not NaN
+                                    pmi_sum += pmi_val
+                                    n_finite += 1
+                                    if pmi_val < min_pmi:
+                                        min_pmi = pmi_val
+                            if n_finite == 0:
+                                vetoed = 1
+                            elif min_pmi > min_admit_threshold:
+                                vetoed = 0  # unanimous-positive fast-pass
+                            elif pmi_sum / n_finite > mean_threshold:
+                                vetoed = 0  # aggregate-positive slow-pass
+                            else:
+                                vetoed = 1
 
                     cache_mv[ent] = 1 if vetoed else 2
                     gen_mv[ent] = current_gen
