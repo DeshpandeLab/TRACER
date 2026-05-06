@@ -31,6 +31,7 @@ from tracer.spatial import (
 from tracer.pruning import prune_transcripts_nuclear_seed
 from tracer.stitching import (
     apply_stitching_to_transcripts_memory_efficient,
+    coherence,
     estimate_within_cell_dz_threshold,
 )
 
@@ -214,6 +215,165 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
 
     df_out[entity_col] = out_labels
     return df_out, stats
+
+
+def _split_unassigned_components(df_in: pd.DataFrame, *,
+                                   entity_col: str,
+                                   coord_cols=("x", "y", "z"),
+                                   dz_threshold: float,
+                                   min_size: int = 1,
+                                   min_entity_size: int = 2,
+                                   unassigned_id: str = "-1"
+                                   ) -> tuple[pd.DataFrame, dict]:
+    """Sort tx by z within each UNASSIGNED_* component; split where
+    consecutive Δz > dz_threshold.
+
+    Mirrors `_spatial_split_phase1_entities` but operates on
+    UNASSIGNED_<base> labels emitted by Group. Group's spatial graph
+    is essentially 2D (xy bins + d ≤ 1.5 µm in xy), so its components
+    can span large z gaps; this stage catches that.
+
+    Largest sub-cluster keeps the original label; smaller ones get a
+    fresh suffix `UNASSIGNED_<base>-<k>` for k = 1, 2, ...
+    Sub-clusters smaller than ``min_size`` demote to ``unassigned_id``.
+    """
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    out_labels = df_out[entity_col].to_numpy().copy()
+    z_arr = df_out[coord_cols[2]].to_numpy(dtype=np.float64)
+
+    stats = {
+        "components_examined": 0,
+        "components_split": 0,
+        "subcomps_minted": 0,
+        "tx_demoted_singletons": 0,
+        "tx_total_relabelled": 0,
+    }
+
+    # Track existing UNASSIGNED_<base>-<k> suffixes to avoid collisions
+    next_subidx: dict[str, int] = {}
+    for lab in df_out[entity_col].unique():
+        m = _re.match(r"^(UNASSIGNED_\d+)-(\d+)$", str(lab))
+        if m:
+            base, k = m.group(1), int(m.group(2))
+            next_subidx[base] = max(next_subidx.get(base, 0), k)
+
+    for ent, group in df_out.groupby(entity_col, sort=False):
+        if not isinstance(ent, str) or not ent.startswith("UNASSIGNED_"):
+            continue
+        # Only base labels — already-suffixed labels (e.g. UNASSIGNED_42-1)
+        # were emitted by a prior split; skip to avoid recursion.
+        if "-" in ent.replace("UNASSIGNED_", "", 1):
+            continue
+        rows = group.index.to_numpy()
+        if len(rows) < min_entity_size:
+            continue
+        stats["components_examined"] += 1
+
+        z_vals = z_arr[rows]
+        sort_order = np.argsort(z_vals, kind="stable")
+        rows_sorted = rows[sort_order]
+        z_sorted = z_vals[sort_order]
+        diffs = np.diff(z_sorted)
+        split_positions = np.where(diffs > dz_threshold)[0]
+        if split_positions.size == 0:
+            continue
+
+        groups_rows = []
+        prev = 0
+        for sp in split_positions:
+            groups_rows.append(rows_sorted[prev: sp + 1])
+            prev = sp + 1
+        groups_rows.append(rows_sorted[prev:])
+
+        # Sort by size desc — largest keeps the original label
+        groups_rows.sort(key=lambda a: -len(a))
+        stats["components_split"] += 1
+
+        for k, gr in enumerate(groups_rows):
+            sz = len(gr)
+            if sz < min_size:
+                out_labels[gr] = unassigned_id
+                stats["tx_demoted_singletons"] += sz
+                continue
+            if k == 0:
+                continue  # largest keeps original label
+            next_subidx[ent] = next_subidx.get(ent, 0) + 1
+            new_label = f"{ent}-{next_subidx[ent]}"
+            out_labels[gr] = new_label
+            stats["subcomps_minted"] += 1
+            stats["tx_total_relabelled"] += sz
+
+    df_out[entity_col] = out_labels
+    return df_out, stats
+
+
+def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
+                               entity_col: str,
+                               aux: dict,
+                               min_C: float,
+                               min_n_genes: int = 2,
+                               threshold: float = 0.05,
+                               metric: str = "pmi",
+                               unassigned_id: str = "-1"
+                               ) -> tuple[pd.DataFrame, dict]:
+    """Demote any entity (cell, partial, or component) whose internal
+    coherence is below ``min_C``, OR whose distinct-gene count is
+    below ``min_n_genes``. The latter forces single-gene entities
+    to fail (coherence is undefined for n_genes < 2).
+
+    Returns (df_out, stats). When ``min_C <= 0`` AND
+    ``min_n_genes <= 1``, the function is a no-op.
+    """
+    import re as _re
+
+    if min_C <= 0 and min_n_genes <= 1:
+        return df_in.copy(), {
+            "entities_examined": 0, "entities_demoted_low_C": 0,
+            "entities_demoted_few_genes": 0, "tx_demoted": 0,
+        }
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    gene_to_idx = aux["gene_to_idx"]
+    W = aux["W"]
+
+    bad_low_C = []
+    bad_few_genes = []
+    for ent, grp in df_out.groupby(entity_col, sort=False):
+        if ent in (unassigned_id, "UNASSIGNED", "DROP", "nan"):
+            continue
+        # Don't demote pre-emitted base UNASSIGNED labels for empty entities
+        genes = grp["feature_name"].astype(str).unique()
+        g_idx = np.array(
+            [gene_to_idx[g] for g in genes if g in gene_to_idx],
+            dtype=np.int32,
+        )
+        if g_idx.size < min_n_genes:
+            bad_few_genes.append(ent)
+            continue
+        C, _, _ = coherence(g_idx, W, mode="count",
+                              threshold=threshold, metric=metric)
+        if C <= min_C:
+            bad_low_C.append(ent)
+
+    bad = bad_low_C + bad_few_genes
+    n_demoted = 0
+    if bad:
+        mask = df_out[entity_col].isin(bad)
+        df_out.loc[mask, entity_col] = unassigned_id
+        n_demoted = int(mask.sum())
+
+    return df_out, {
+        "entities_examined": int(df_out[entity_col].nunique()),
+        "entities_demoted_low_C": len(bad_low_C),
+        "entities_demoted_few_genes": len(bad_few_genes),
+        "tx_demoted": n_demoted,
+    }
+
+
 NUCLEAR_ONLY_ADMIT = True   # restrict 1b/1c to nuclear tx; cyto via Rescue
 RESCUE_NEG_THR = -0.05
 ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
@@ -243,6 +403,27 @@ RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
 #                              2·G_z = 2 µm, matching SPLIT_PHASE1_DZ.
 STITCH_MIN_LOCAL_TX: int = 0
 STITCH_GZ_UM: float | None = None
+
+# Mid-pipeline QC (after Group, before Stitch). Two opt-in controls;
+# both default off so current production behavior is unchanged.
+#
+#   MID_SPLIT_UNASSIGNED_DZ  None = off (current). Float (e.g. 2.0)
+#                            applies sorted-Δz fragmentation to
+#                            UNASSIGNED_<base> components from Group,
+#                            mirroring Split-Phase1's logic. Group's
+#                            spatial graph is essentially 2D, so its
+#                            components routinely span > 2 µm in z.
+#                            ROI data: 57 % of components have max-gap
+#                            > 2 µm without this stage.
+#
+#   MID_QC_C_FLOOR           0.0 = off (current). Float (e.g. 0.05)
+#                            demotes any entity (cell / partial /
+#                            component) with coherence ≤ floor OR
+#                            n_genes < 2. Catches incoherent Phase-1
+#                            entities that survived size QC and any
+#                            low-C Group components.
+MID_SPLIT_UNASSIGNED_DZ: float | None = None
+MID_QC_C_FLOOR: float = 0.0
 
 
 def _classify(label: str) -> str:
@@ -438,6 +619,26 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
+    # Mid-pipeline QC (after Group, before Stitch). Both stages are
+    # opt-in via constants at the top of this module.
+    mid_did_anything = False
+    if MID_SPLIT_UNASSIGNED_DZ is not None:
+        df_grouped, _ = _split_unassigned_components(
+            df_grouped, entity_col="tracer_id", coord_cols=("x", "y", "z"),
+            dz_threshold=float(MID_SPLIT_UNASSIGNED_DZ),
+            min_size=1, min_entity_size=2, unassigned_id="-1",
+        )
+        mid_did_anything = True
+    if MID_QC_C_FLOOR > 0:
+        df_grouped, _ = _qc_demote_low_coherence(
+            df_grouped, entity_col="tracer_id", aux=aux,
+            min_C=float(MID_QC_C_FLOOR), min_n_genes=2,
+            threshold=PMI_THR, metric="pmi", unassigned_id="-1",
+        )
+        mid_did_anything = True
+    if mid_did_anything:
+        _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
+
     # Stitch — uses the same dz_stats computed before Split.
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
@@ -537,6 +738,26 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         transcript_id_col="transcript_id", show_progress=False,
     )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
+
+    # Mid-pipeline QC (after Group, before Stitch). Same opt-in
+    # knobs as the segmented path.
+    mid_did_anything = False
+    if MID_SPLIT_UNASSIGNED_DZ is not None:
+        df_grouped, _ = _split_unassigned_components(
+            df_grouped, entity_col="tracer_id", coord_cols=("x", "y", "z"),
+            dz_threshold=float(MID_SPLIT_UNASSIGNED_DZ),
+            min_size=1, min_entity_size=2, unassigned_id="-1",
+        )
+        mid_did_anything = True
+    if MID_QC_C_FLOOR > 0:
+        df_grouped, _ = _qc_demote_low_coherence(
+            df_grouped, entity_col="tracer_id", aux=aux,
+            min_C=float(MID_QC_C_FLOOR), min_n_genes=2,
+            threshold=PMI_THR, metric="pmi", unassigned_id="-1",
+        )
+        mid_did_anything = True
+    if mid_did_anything:
+        _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
 
     # Stitch
     df_grouped["post_stage4"] = df_grouped["tracer_id"]
