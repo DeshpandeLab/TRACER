@@ -810,6 +810,14 @@ def _stitch_entities_hierarchical_decomposable(
     transcript_coords: np.ndarray | None = None,
     transcript_entity_codes: np.ndarray | None = None,
     min_candidate_edges: int | str = 0,
+    # Optional per-entity-witness count: drop candidate pair (E1, E2)
+    # unless EACH entity contributes at least `min_local_tx_per_entity`
+    # unique tx in the shared bin neighborhood (xy 8-Moore + ±depth z
+    # bins). Catches single-bridging-tx candidates that sneak through
+    # the diagonal-Moore reach (~5.66 µm at G=2). Symmetric in (E1, E2)
+    # — resistant to mass-dominated cross-product counts.
+    # Default 0 = off (current behavior unchanged).
+    min_local_tx_per_entity: int = 0,
     max_pair_median_dz: float | None = None,
     min_close_edges_dz: float | None = None,
     min_close_edges_n: int = 0,
@@ -875,6 +883,7 @@ def _stitch_entities_hierarchical_decomposable(
         transcript_coords=transcript_coords,
         transcript_entity_codes=transcript_entity_codes,
         min_candidate_edges=min_candidate_edges,
+        min_local_tx_per_entity=min_local_tx_per_entity,
         max_pair_median_dz=max_pair_median_dz,
         min_close_edges_dz=min_close_edges_dz,
         min_close_edges_n=min_close_edges_n,
@@ -901,6 +910,14 @@ def stitch_entities_hierarchical(
     transcript_coords: np.ndarray | None = None,
     transcript_entity_codes: np.ndarray | None = None,
     min_candidate_edges: int | str = 0,
+    # Optional per-entity-witness count: drop candidate pair (E1, E2)
+    # unless EACH entity contributes at least `min_local_tx_per_entity`
+    # unique tx in the shared bin neighborhood (xy 8-Moore + ±depth z
+    # bins). Catches single-bridging-tx candidates that sneak through
+    # the diagonal-Moore reach (~5.66 µm at G=2). Symmetric in (E1, E2)
+    # — resistant to mass-dominated cross-product counts.
+    # Default 0 = off (current behavior unchanged).
+    min_local_tx_per_entity: int = 0,
     max_pair_median_dz: float | None = None,
     min_close_edges_dz: float | None = None,
     min_close_edges_n: int = 0,
@@ -1200,19 +1217,39 @@ def stitch_entities_hierarchical(
         # the optional min_candidate_edges filter below.
         pair_tx_edges: dict[tuple[int, int], int] = defaultdict(int)
 
-        def _record(a, b, n_tx):
+        # Per-entity unique-bin tracking for the optional
+        # `min_local_tx_per_entity` filter. Maps (lo, hi) → set of bin
+        # keys where lo (resp. hi) contributed. Empty when the filter
+        # is off (no memory cost).
+        track_local = int(min_local_tx_per_entity) > 0
+        pair_lo_bins: dict[tuple[int, int], set] = (
+            defaultdict(set) if track_local else {}
+        )
+        pair_hi_bins: dict[tuple[int, int], set] = (
+            defaultdict(set) if track_local else {}
+        )
+
+        def _record(a, b, n_tx, bk_a=None, bk_b=None):
             if a == b or n_tx <= 0:
                 return
-            lo, hi = (a, b) if a < b else (b, a)
+            if a < b:
+                lo, hi = a, b
+                bk_lo, bk_hi = bk_a, bk_b
+            else:
+                lo, hi = b, a
+                bk_lo, bk_hi = bk_b, bk_a
             candidate_pairs.add((lo, hi))
             pair_tx_edges[(lo, hi)] += int(n_tx)
+            if track_local and bk_lo is not None and bk_hi is not None:
+                pair_lo_bins[(lo, hi)].add(bk_lo)
+                pair_hi_bins[(lo, hi)].add(bk_hi)
 
         for bk, comps in bin_to_comps.items():
             cc_a = bin_to_comp_counts[bk]
             # within-bin: all unordered pairs of distinct components
             if len(comps) > 1:
                 for a, b in itertools.combinations(sorted(comps), 2):
-                    _record(a, b, cc_a[a] * cc_a[b])
+                    _record(a, b, cc_a[a] * cc_a[b], bk_a=bk, bk_b=bk)
 
             # Cross-bin: emit each unordered (bin_a, bin_b) exactly once.
             # In the 2D path we use the "half" xy offsets at dz=0.
@@ -1234,7 +1271,8 @@ def stitch_entities_hierarchical(
                     cc_b = bin_to_comp_counts[nb_xy_int]
                     for a in comps:
                         for b in nb_comps:
-                            _record(a, b, cc_a[a] * cc_b[b])
+                            _record(a, b, cc_a[a] * cc_b[b],
+                                    bk_a=bk, bk_b=nb_xy_int)
             else:
                 xy_packed, bz = bk
                 bx, by = unpack_bin(xy_packed)
@@ -1252,7 +1290,8 @@ def stitch_entities_hierarchical(
                         cc_b = bin_to_comp_counts[nb_key]
                         for a in comps:
                             for b in nb_comps:
-                                _record(a, b, cc_a[a] * cc_b[b])
+                                _record(a, b, cc_a[a] * cc_b[b],
+                                        bk_a=bk, bk_b=nb_key)
                 # (b) same xy bin (dx=dy=0), strictly-positive dz
                 for dz in z_offsets_strict_pos:
                     nb_key = (xy_packed, bz + dz)
@@ -1262,7 +1301,8 @@ def stitch_entities_hierarchical(
                     cc_b = bin_to_comp_counts[nb_key]
                     for a in comps:
                         for b in nb_comps:
-                            _record(a, b, cc_a[a] * cc_b[b])
+                            _record(a, b, cc_a[a] * cc_b[b],
+                                    bk_a=bk, bk_b=nb_key)
 
         # Optional minimum-supporting-edges filter.
         if min_candidate_edges:
@@ -1280,6 +1320,27 @@ def stitch_entities_hierarchical(
                 thr = int(min_candidate_edges)
                 kept = {p for p, n in pair_tx_edges.items() if n >= thr}
             candidate_pairs = kept
+
+        # Optional per-entity-witness count filter. Drop a candidate
+        # pair (E1, E2) unless EACH entity contributes at least
+        # `min_local_tx_per_entity` UNIQUE tx in the bins where they
+        # co-occur (xy 8-Moore + z window). Symmetric in (E1, E2) —
+        # not fooled by a 1-tx × N-tx bridging pair where the cross-
+        # product count alone would pass `min_candidate_edges`.
+        if track_local:
+            mlt = int(min_local_tx_per_entity)
+            kept_local = set()
+            for (lo, hi) in candidate_pairs:
+                lo_bins = pair_lo_bins.get((lo, hi), ())
+                hi_bins = pair_hi_bins.get((lo, hi), ())
+                # Each tx is in exactly one bin (we floored coords), so
+                # summing per-bin per-entity tx counts over UNIQUE bins
+                # = the unique-tx witness count for that entity.
+                n_lo = sum(bin_to_comp_counts[b][lo] for b in lo_bins)
+                n_hi = sum(bin_to_comp_counts[b][hi] for b in hi_bins)
+                if n_lo >= mlt and n_hi >= mlt:
+                    kept_local.add((lo, hi))
+            candidate_pairs = kept_local
 
         # Optional per-pair median |Δz| guard. Reject candidate pairs
         # whose member tx have a median pairwise |Δz| larger than the
@@ -2157,6 +2218,14 @@ def apply_stitching_to_transcripts_memory_efficient(
     G_z: float | None = None,
     z_neighbor_depth: int = 0,
     min_candidate_edges: int | str = 0,
+    # Optional per-entity-witness count: drop candidate pair (E1, E2)
+    # unless EACH entity contributes at least `min_local_tx_per_entity`
+    # unique tx in the shared bin neighborhood (xy 8-Moore + ±depth z
+    # bins). Catches single-bridging-tx candidates that sneak through
+    # the diagonal-Moore reach (~5.66 µm at G=2). Symmetric in (E1, E2)
+    # — resistant to mass-dominated cross-product counts.
+    # Default 0 = off (current behavior unchanged).
+    min_local_tx_per_entity: int = 0,
     max_pair_median_dz: float | None = None,
     min_close_edges_dz: float | None = None,
     min_close_edges_n: int = 0,
@@ -2341,6 +2410,7 @@ def apply_stitching_to_transcripts_memory_efficient(
         transcript_coords=transcript_coords,
         transcript_entity_codes=transcript_entity_codes,
         min_candidate_edges=min_candidate_edges,
+        min_local_tx_per_entity=min_local_tx_per_entity,
         max_pair_median_dz=max_pair_median_dz,
         min_close_edges_dz=min_close_edges_dz,
         min_close_edges_n=min_close_edges_n,

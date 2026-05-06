@@ -230,6 +230,20 @@ RESCUE_VETO_MODE = "hybrid"
 RESCUE_MIN_ADMIT = 0.0      # any negative pair drops to mean-stage
 RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
 
+# Stitch spatial-gate tightening — opt-in knobs. Defaults preserve
+# current production behavior; raise values to tighten.
+#   STITCH_MIN_LOCAL_TX     0 = off (current). >=1 requires that many
+#                              UNIQUE tx of EACH candidate entity in
+#                              the shared xy 8-Moore + z-window bins.
+#                              Catches single-bridging-tx pairs where
+#                              two spatially-separated entities are
+#                              glued by one diagonal-Moore pair.
+#   STITCH_GZ_UM            None = use auto (current). 1.0 → max
+#                              Δz reach in candidate enumeration =
+#                              2·G_z = 2 µm, matching SPLIT_PHASE1_DZ.
+STITCH_MIN_LOCAL_TX: int = 0
+STITCH_GZ_UM: float | None = None
+
 
 def _classify(label: str) -> str:
     s = str(label)
@@ -434,9 +448,11 @@ def run_segmented_pipeline(df: pd.DataFrame,
         penalize_simplicity=True, deltaC_min=0.0,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
-        G_z=auto_Gz, z_neighbor_depth=1,
+        G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else auto_Gz),
+        z_neighbor_depth=1,
         min_close_edges_dz=auto_dz,
         min_close_edges_n=5 if auto_dz is not None else 0,
+        min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
@@ -532,7 +548,9 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         penalize_simplicity=True, deltaC_min=0.0,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
-        G_z=1.0, z_neighbor_depth=1,
+        G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else 1.0),
+        z_neighbor_depth=1,
+        min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
