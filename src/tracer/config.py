@@ -112,59 +112,12 @@ class RescueConfig:
             )
 
 
-@dataclass(frozen=True)
-class GroupConfig:
-    """Stage-2 grouping — connected-components on bad-edge-pruned k-NN graph."""
-    neighbor_threshold: float = -0.1
-    k_neighbors: int = 8
-    dist_threshold_um: float = 1.5
-    min_comp_size: int = 4
-
-    def __post_init__(self) -> None:
-        if self.k_neighbors < 1:
-            raise ValueError(f"group.k_neighbors must be >= 1; got {self.k_neighbors}")
-        if self.min_comp_size < 1:
-            raise ValueError(
-                f"group.min_comp_size must be >= 1; got {self.min_comp_size}"
-            )
-
-
-@dataclass(frozen=True)
-class StitchConfig:
-    """Stage-3 stitcher — partial→partial, partial→cell, cell→cell merges."""
-    metric: Literal["pmi", "magnitude", "pmi_sym"] = "pmi"
-    threshold: float = 0.05
-    dist_threshold_um: float = 5.0
-    bin_size_xy_um: float = 2.0
-    bin_size_z_um: float | None = None    # None → auto from data
-    z_neighbor_depth: int = 1
-    min_close_edges_dz: float | None = None   # None → auto
-    min_close_edges_n: int = 5
-    penalize_simplicity: bool = True
-    delta_c_min: float = 0.0
-    candidate_source: Literal["grid", "knn"] = "grid"
-    neighborhood: Literal["4", "8"] = "8"
-    mode: Literal["count", "tx"] = "count"
-
-    def __post_init__(self) -> None:
-        if self.metric not in ("pmi", "magnitude", "pmi_sym"):
-            raise ValueError(f"stitch.metric invalid: {self.metric!r}")
-        if self.candidate_source not in ("grid", "knn"):
-            raise ValueError(
-                f"stitch.candidate_source invalid: {self.candidate_source!r}"
-            )
-
-
-@dataclass(frozen=True)
-class DemoteConfig:
-    """Post-Stitch entity-size cutoff."""
-    min_entity_size: int = 5
-
-    def __post_init__(self) -> None:
-        if self.min_entity_size < 1:
-            raise ValueError(
-                f"demote.min_entity_size must be >= 1; got {self.min_entity_size}"
-            )
+# Group, Stitch, and Demote are deliberately NOT represented as
+# dataclasses here yet. Adding them while their parameters are still
+# being tuned would create a drift trap (every parameter tweak in
+# those modules would need to be mirrored in the config). They will
+# be added when those stages freeze. Until then, their knobs live as
+# kwargs at the call site.
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +135,6 @@ class PipelineConfig:
     split_phase1: SplitPhase1Config = field(default_factory=SplitPhase1Config)
     phase1_qc: Phase1QcConfig = field(default_factory=Phase1QcConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
-    group: GroupConfig = field(default_factory=GroupConfig)
-    stitch: StitchConfig = field(default_factory=StitchConfig)
-    demote: DemoteConfig = field(default_factory=DemoteConfig)
     final_rescue: RescueConfig = field(
         default_factory=lambda: RescueConfig(small_entity_guard_n=0)
     )
@@ -203,9 +153,6 @@ _SECTION_TO_CLS: dict[str, type] = {
     "split_phase1": SplitPhase1Config,
     "phase1_qc": Phase1QcConfig,
     "rescue": RescueConfig,
-    "group": GroupConfig,
-    "stitch": StitchConfig,
-    "demote": DemoteConfig,
     "final_rescue": RescueConfig,
 }
 
@@ -348,9 +295,6 @@ __all__ = [
     "SplitPhase1Config",
     "Phase1QcConfig",
     "RescueConfig",
-    "GroupConfig",
-    "StitchConfig",
-    "DemoteConfig",
     "PipelineConfig",
     "load_config",
     "to_dict",

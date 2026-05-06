@@ -102,76 +102,13 @@ small_entity_guard_n = 0
 
 
 # ---------------------------------------------------------------------
-# Group — Stage-2 connected-components on a bad-edge-pruned k-NN graph
-# of the residual unassigned tx.
-# ---------------------------------------------------------------------
-[group]
-# Bad-edge cutoff for Group's gene-prune (count-blind greedy).
-neighbor_threshold = -0.1
-
-# k for the spatial k-NN (excluding self).
-k_neighbors = 8
-
-# Distance cap on the spatial k-NN (µm).
-dist_threshold_um = 1.5
-
-# Minimum component size to retain. Smaller comps are demoted to "-1".
-min_comp_size = 4
-
-
-# ---------------------------------------------------------------------
-# Stitch — Stage-3 entity-pair merger (partial→partial, partial→cell,
-# cell→cell). Coherence-gated, distance-bounded.
-# ---------------------------------------------------------------------
-[stitch]
-# Coherence metric for the merger acceptance test.
-metric = "pmi"
-
-# Coherence threshold (PMI). The merged entity must score above this
-# AND beat the parents by at least delta_c_min.
-threshold = 0.05
-
-# Maximum centroid–centroid distance for candidate pairs (µm).
-dist_threshold_um = 5.0
-
-# xy bin size for the candidate-pair grid (µm).
-bin_size_xy_um = 2.0
-
-# z bin size (µm). Omit / null → auto-derive from data z-spacing.
-# bin_size_z_um = 1.0
-
-# Number of z-bins above/below to include as candidate neighbors.
-z_neighbor_depth = 1
-
-# Close-edge gating: minimum number of edges with Δz ≤ this between
-# the two entities for them to be considered close in z. null → auto.
-# min_close_edges_dz = 1.0
-min_close_edges_n = 5
-
-# Penalize merging two entities whose existing genes are nearly
-# identical (favors complementary phenotype mergers).
-penalize_simplicity = true
-
-# Minimum coherence improvement over the better parent for accept.
-delta_c_min = 0.0
-
-# Candidate-pair generator: "grid" (binned spatial) or "knn" (k-NN tree).
-candidate_source = "grid"
-
-# 4-connected or 8-connected (Moore) xy neighborhood for the grid.
-neighborhood = "8"
-
-# Coherence accumulation mode.
-mode = "count"
-
-
-# ---------------------------------------------------------------------
-# Demote — drop entities below this size after Stitch.
-# ---------------------------------------------------------------------
-[demote]
-min_entity_size = 5
-
-
+# Group, Stitch, Demote — NOT yet config-driven.
+#
+# These stages are still being tuned. Their parameters live as kwargs
+# at the call site in tests/_pipeline_runner.py until the stages
+# freeze, at which point dedicated [group], [stitch], [demote]
+# sections will be added here.
+#
 # ---------------------------------------------------------------------
 # Final Rescue — single-pass rescue of post-Demote unassigned tx.
 # Inherits all keys from [rescue] then applies the deltas below.

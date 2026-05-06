@@ -19,14 +19,11 @@ from pathlib import Path
 import pytest
 
 from tracer.config import (
-    DemoteConfig,
-    GroupConfig,
     Phase1Config,
     Phase1QcConfig,
     PipelineConfig,
     RescueConfig,
     SplitPhase1Config,
-    StitchConfig,
     dump_receipt,
     load_config,
     to_dict,
@@ -83,17 +80,17 @@ def test_user_override_patches_keys(tmp_path: Path):
         veto_mode = "min"
         max_passes = 5
 
-        [stitch]
-        threshold = 0.10
+        [phase1]
+        tx_weighted_prune = false
     """))
     cfg = load_config(path=user)
     # patched keys
     assert cfg.rescue.veto_mode == "min"
     assert cfg.rescue.max_passes == 5
-    assert cfg.stitch.threshold == 0.10
+    assert cfg.phase1.tx_weighted_prune is False
     # unpatched keys still at defaults
     assert cfg.rescue.mean_admit_threshold == 0.1
-    assert cfg.stitch.dist_threshold_um == 5.0
+    assert cfg.phase1.pmi_threshold == 0.05
 
 
 def test_user_override_runs_validation(tmp_path: Path):
@@ -179,7 +176,7 @@ def test_phase1_invariants():
 def test_receipt_roundtrip(tmp_path: Path):
     cfg = PipelineConfig(
         rescue=RescueConfig(veto_mode="mean", max_passes=2),
-        stitch=StitchConfig(threshold=0.15),
+        phase1=Phase1Config(pmi_threshold=0.10, tx_weighted_prune=False),
     )
     receipt = tmp_path / "receipt.json"
     dump_receipt(cfg, receipt)
@@ -187,9 +184,10 @@ def test_receipt_roundtrip(tmp_path: Path):
     loaded = json.loads(receipt.read_text())
     assert loaded["rescue"]["veto_mode"] == "mean"
     assert loaded["rescue"]["max_passes"] == 2
-    assert loaded["stitch"]["threshold"] == 0.15
+    assert loaded["phase1"]["pmi_threshold"] == 0.10
+    assert loaded["phase1"]["tx_weighted_prune"] is False
     # unchanged sections still present
-    assert loaded["phase1"]["pmi_threshold"] == 0.05
+    assert loaded["phase1_qc"]["min_tx"] == 3
 
     # And the dict matches asdict(cfg) by value
     assert loaded == asdict(cfg)
