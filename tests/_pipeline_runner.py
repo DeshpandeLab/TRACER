@@ -42,7 +42,179 @@ from tracer.stitching import (
 # fill in nuclear-seed Prune, threshold ≈ 0 admits any non-negative
 # evidence to the seed, which gave +29 % ARI(vs Xenium cell_id) on the
 # 50×50 µm validation crop (0.442 → 0.573).
-PMI_THR = 1e-5
+PMI_THR = 0.05
+SEED_COHERENCE_FLOOR = 0.10
+TX_WEIGHTED_PRUNE = True   # tx-weighted greedy bad-edge prune (1a/1c)
+SPLIT_PHASE1_DZ = 2.0      # µm; if consecutive z-sorted tx gap > this,
+                            #     split entity at that point.
+SPLIT_PHASE1_MIN_TX = 1     # min tx per sub-group during the split itself
+                            #     (1 = keep singletons; QC pass below
+                            #     handles the actual demotion).
+SPLIT_PHASE1_MIN_ENTITY = 2 # minimum entity size to consider (2 = bare
+                            #     minimum to compute a diff).
+PHASE1_QC_MIN_TX = 3        # post-split QC: any Phase 1 entity (main or
+                            #     partial) with < this tx → unassigned.
+                            #     Prevents 1- and 2-tx degenerate seeds
+                            #     from anchoring Rescue admissions.
+
+
+def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
+                                       entity_col: str,
+                                       min_size: int = PHASE1_QC_MIN_TX,
+                                       unassigned_id: str = "-1"
+                                       ) -> tuple[pd.DataFrame, dict]:
+    """Demote any Phase 1 entity (main `{cell}` or partial) with < min_size tx
+    to unassigned. Skips already-unassigned labels (`-1`, `UNASSIGNED`,
+    `UNASSIGNED_*`) — these are not seeded entities."""
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    counts = df_out[entity_col].value_counts()
+    bad = []
+    for ent, n in counts.items():
+        if n >= min_size:
+            continue
+        if ent == unassigned_id or ent == "UNASSIGNED" or ent.startswith("UNASSIGNED_"):
+            continue
+        bad.append(ent)
+    n_demoted = 0
+    if bad:
+        mask = df_out[entity_col].isin(bad)
+        df_out.loc[mask, entity_col] = unassigned_id
+        n_demoted = int(mask.sum())
+    return df_out, {
+        "entities_demoted": len(bad),
+        "tx_demoted": n_demoted,
+    }
+
+
+def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
+                                     entity_col: str,
+                                     coord_cols=("x", "y", "z"),
+                                     dz_threshold: float = SPLIT_PHASE1_DZ,
+                                     min_size: int = SPLIT_PHASE1_MIN_TX,
+                                     min_entity_size: int = SPLIT_PHASE1_MIN_ENTITY,
+                                     unassigned_id: str = "-1") -> tuple[pd.DataFrame, dict]:
+    """Sort tx by z within each entity; split where Δz > dz_threshold.
+
+    Applies to all main cells and partials (≥ min_entity_size tx).
+    Largest sub-group keeps the original label; smaller groups get a
+    fresh appended suffix; groups < min_size demoted to unassigned_id.
+
+    Returns (df_out, stats) where stats reports counts of entities
+    examined / split / demoted etc.
+    """
+    import re as _re_inner
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import pdist
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    coords_arr = df_out[list(coord_cols)].to_numpy(dtype=np.float64)
+
+    # Pre-compute next-suffix-counter per (cell, depth1) namespace so
+    # split-emitted labels don't collide with existing partials.
+    #   "37962"     in_partials → next_suffix["37962"] = 1 + max(d1)
+    #   "37962-1"   exists      → next_subsuffix["37962-1"] = 1 + max(d2)
+    next_suffix: dict[str, int] = {}
+    next_subsuffix: dict[str, int] = {}
+    for lab in df_out[entity_col].unique():
+        m = _re.match(r"^(\d+)-(\d+)(?:-(\d+))?$", str(lab))
+        if not m:
+            continue
+        cell, d1 = m.group(1), int(m.group(2))
+        d2 = int(m.group(3)) if m.group(3) else 0
+        next_suffix[cell] = max(next_suffix.get(cell, 0), d1) + 1 if cell in next_suffix or d1 >= next_suffix.get(cell, 0) else next_suffix.get(cell, 1)
+        # simpler: just track max d1, max d2 per (cell, d1)
+        next_suffix[cell] = max(next_suffix.get(cell, 0), d1)
+        if d2:
+            key = f"{cell}-{d1}"
+            next_subsuffix[key] = max(next_subsuffix.get(key, 0), d2)
+
+    out_labels = df_out[entity_col].to_numpy().copy()
+    z_arr = df_out[coord_cols[2]].to_numpy(dtype=np.float64)
+
+    stats = {
+        "entities_examined": 0,
+        "entities_split": 0,
+        "subgroups_minted": 0,
+        "tx_demoted_singletons": 0,
+        "tx_total_relabelled": 0,
+    }
+
+    for ent, group in df_out.groupby(entity_col, sort=False):
+        if ent == unassigned_id or ent == "UNASSIGNED" or ent.startswith("UNASSIGNED_"):
+            continue
+        if not _re.match(r"^\d+(-\d+){0,2}$", ent):
+            continue  # not a known cell/partial label
+        rows = group.index.to_numpy()
+        if len(rows) < min_entity_size:
+            continue
+        stats["entities_examined"] += 1
+
+        # Sort tx by z; find gaps > dz_threshold in the sorted sequence.
+        z_vals = z_arr[rows]
+        sort_order = np.argsort(z_vals, kind="stable")
+        rows_sorted = rows[sort_order]
+        z_sorted = z_vals[sort_order]
+        diffs = np.diff(z_sorted)
+        split_positions = np.where(diffs > dz_threshold)[0]
+        if len(split_positions) == 0:
+            continue
+
+        # Slice rows_sorted into contiguous z-groups at split positions.
+        # split_positions[i] is the last index of group i (group boundaries
+        # are between i and i+1 in the sorted array).
+        groups_rows = []
+        prev = 0
+        for sp in split_positions:
+            groups_rows.append(rows_sorted[prev : sp + 1])
+            prev = sp + 1
+        groups_rows.append(rows_sorted[prev:])
+
+        # Rank groups by size descending — largest keeps original label.
+        groups_rows.sort(key=lambda a: -len(a))
+        stats["entities_split"] += 1
+
+        # Pre-parse the parent label for relabel logic
+        m_main = _re.match(r"^(\d+)$", ent)
+        m_part = _re.match(r"^(\d+)-(\d+)$", ent)
+        m_sub = _re.match(r"^(\d+)-(\d+)-(\d+)$", ent)
+
+        for k, gr in enumerate(groups_rows):
+            sz = len(gr)
+            if sz < min_size:
+                out_labels[gr] = unassigned_id
+                stats["tx_demoted_singletons"] += sz
+                continue
+            if k == 0:
+                continue  # largest keeps original label
+
+            # Mint fresh label without colliding with existing partials
+            if m_main is not None:
+                cell = m_main.group(1)
+                next_suffix[cell] = next_suffix.get(cell, 0) + 1
+                new_label = f"{cell}-{next_suffix[cell]}"
+            elif m_part is not None:
+                cell, d1 = m_part.group(1), m_part.group(2)
+                key = f"{cell}-{d1}"
+                next_subsuffix[key] = next_subsuffix.get(key, 0) + 1
+                new_label = f"{cell}-{d1}-{next_subsuffix[key]}"
+            elif m_sub is not None:
+                cell, d1, d2 = m_sub.group(1), m_sub.group(2), m_sub.group(3)
+                key = f"{cell}-{d1}-{d2}"
+                next_subsuffix[key] = next_subsuffix.get(key, 0) + 1
+                new_label = f"{key}-{next_subsuffix[key]}"
+            else:
+                continue
+
+            out_labels[gr] = new_label
+            stats["subgroups_minted"] += 1
+            stats["tx_total_relabelled"] += sz
+
+    df_out[entity_col] = out_labels
+    return df_out, stats
+NUCLEAR_ONLY_ADMIT = True   # restrict 1b/1c to nuclear tx; cyto via Rescue
 RESCUE_NEG_THR = -0.05
 ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
 # Iterative Rescue caps: 3 passes captures ≥98 % of asymptotic gain at
@@ -148,6 +320,9 @@ def run_segmented_pipeline(df: pd.DataFrame,
             threshold=PMI_THR, unassigned_id="-1",
             metric_col=metric_col, nan_fill=0.0,
             min_nuclear_genes=3,
+            seed_coherence_floor=SEED_COHERENCE_FLOOR,
+            nuclear_only_admit=NUCLEAR_ONLY_ADMIT,
+            tx_weighted=TX_WEIGHTED_PRUNE,
             n_jobs=-1, show_progress=False,
         )
     else:
@@ -159,6 +334,31 @@ def run_segmented_pipeline(df: pd.DataFrame,
             n_jobs=-1, show_progress=False,
         )
     _record_stage(progression, "Prune", df_pruned, "tracer_id")
+
+    # Spatial-split Phase 1 entities. Phase 1c is purely gene-based —
+    # if a cell has TWO contamination sources contributing similar
+    # gene programs (e.g. lymphoid tx from cells above AND below the
+    # target cell in z), Phase 1c emits one merged partial. Split it
+    # into spatially-distinct sub-partials so downstream Stitch sees
+    # them as separate entities.
+    df_pruned, _split_stats = _spatial_split_phase1_entities(
+        df_pruned, entity_col="tracer_id",
+        coord_cols=("x", "y", "z"),
+        dz_threshold=SPLIT_PHASE1_DZ,
+        min_size=SPLIT_PHASE1_MIN_TX,
+        min_entity_size=SPLIT_PHASE1_MIN_ENTITY,
+        unassigned_id="-1",
+    )
+    _record_stage(progression, "Split-Phase1", df_pruned, "tracer_id")
+
+    # Post-split QC: demote tiny Phase 1 entities (1-2 tx) so they
+    # don't act as degenerate routing anchors in Rescue.
+    df_pruned, _qc_stats = _qc_demote_small_phase1_entities(
+        df_pruned, entity_col="tracer_id",
+        min_size=PHASE1_QC_MIN_TX,
+        unassigned_id="-1",
+    )
+    _record_stage(progression, "Phase1-QC", df_pruned, "tracer_id")
 
     # Split stage REMOVED. The nuclear-seed prune emits spatially
     # compact entities by construction (anchored on the nucleus), so
@@ -179,39 +379,17 @@ def run_segmented_pipeline(df: pd.DataFrame,
         )
         _record_stage(progression, "Split", df_pruned, "tracer_id")
 
-    # Group BEFORE Rescue (variant C / yield-optimal default).
-    #
-    # Empirically (lung 500 µm ROI, post-DROP-retirement sweep):
-    #   A baseline (Prune → Rescue → Group → Stitch → ...): ARI 0.798, unas 6,106
-    #   B skip-IR  (Prune → Group → Stitch → ...):           ARI 0.813, unas 6,738
-    #   C swap     (Prune → Group → Rescue → Stitch → ...):  ARI 0.793, unas 5,557 ← yield-optimal
-    #
-    # C wins on yield (~−500 to −1,200 unas vs A/B): Group assembles
-    # spatially-coherent unassigned tx into comp pseudo-entities, then
-    # Rescue picks up the leftovers (incl. group_rejected DROP-pile tx
-    # whose individual gene happens to fit a nearby cell). Two passes at
-    # the unassigned pool — one entity-level (Group), one tx-level
-    # (Rescue) — recover more than either alone.
-    df_grouped = annotate_unassigned_components_fast(
-        df_pruned=df_pruned, aux=aux,
-        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
-        coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=4,
-        npmi_threshold=ANNOTATE_NEG_THR,
-        entity_col="tracer_id", out_col="tracer_id",
-        cell_id_col="cell_id", gene_col="feature_name",
-        transcript_id_col="transcript_id", show_progress=False,
-    )
-    _record_stage(progression, "Group", df_grouped, "tracer_id")
-
-    # Rescue — iterate up to RESCUE_MAX_PASSES with early-stop. Each pass
-    # reseeds gene sets from newly-rescued tx, letting tendrils of
-    # irregular cells extend by one neighbour per pass. Convergence
-    # diagnostic: 3 passes captures ≥98 % of asymptotic gain.
+    # Prune → Rescue → Group → Stitch (re-ordered for nuclear-only
+    # Phase 1). Rationale: under nuclear-only admission, ~50% of tx
+    # exit Phase 1 unassigned — most are cyto tx of cells that already
+    # have a nuclear-anchored seed. Running Rescue first lets those tx
+    # attach to nearby seeded entities before Group clusters the
+    # residual into orphan UNASSIGNED_* components.
+    df_rescued = df_pruned
     n_rescued = 0
     for _pass in range(RESCUE_MAX_PASSES):
-        df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
-            df_grouped, aux=aux,
+        df_rescued, n_pass_rescued, _, _ = pre_stage2_rescue(
+            df_rescued, aux=aux,
             entity_col="tracer_id", gene_col="feature_name",
             coord_cols=("x", "y", "z"), out_col="tracer_id",
             G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
@@ -221,7 +399,19 @@ def run_segmented_pipeline(df: pd.DataFrame,
         n_rescued += n_pass_rescued
         if n_pass_rescued == 0:
             break
-    _record_stage(progression, "Rescue", df_grouped, "tracer_id")
+    _record_stage(progression, "Rescue", df_rescued, "tracer_id")
+
+    df_grouped = annotate_unassigned_components_fast(
+        df_pruned=df_rescued, aux=aux,
+        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
+        coord_cols=("x", "y", "z"),
+        k=8, dist_threshold=1.5, min_comp_size=4,
+        npmi_threshold=ANNOTATE_NEG_THR,
+        entity_col="tracer_id", out_col="tracer_id",
+        cell_id_col="cell_id", gene_col="feature_name",
+        transcript_id_col="transcript_id", show_progress=False,
+    )
+    _record_stage(progression, "Group", df_grouped, "tracer_id")
 
     # Stitch — uses the same dz_stats computed before Split.
     df_grouped["post_stage4"] = df_grouped["tracer_id"]

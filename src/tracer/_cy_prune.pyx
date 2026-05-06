@@ -123,6 +123,32 @@ def prune_single(cnp.ndarray[cnp.int32_t, ndim=1] g_local, cnp.ndarray[cnp.float
     return removed
 
 
+cdef inline double _mean_internal_pmi(
+    cnp.int32_t[:] genes,
+    int n_genes,
+    cnp.float32_t[:, :] W,
+) nogil:
+    """Mean PMI over off-diagonal pairs within a gene set. Returns
+    +inf when the set has <2 genes (caller treats as "trivially
+    coherent": no pairs means no internal incoherence). NaN entries
+    in W are skipped."""
+    cdef int i, j
+    cdef double total = 0.0
+    cdef int count = 0
+    cdef float v
+    if n_genes < 2:
+        return 1e30
+    for i in range(n_genes):
+        for j in range(i + 1, n_genes):
+            v = W[genes[i], genes[j]]
+            if v == v:  # NaN check
+                total += v
+                count += 1
+    if count == 0:
+        return 0.0
+    return total / count
+
+
 cdef inline int _mean_pmi_test(
     int gene_idx,
     cnp.int32_t[:] seed,
@@ -152,23 +178,30 @@ cdef inline int _mean_pmi_test(
 
 cdef cnp.ndarray _greedy_prune_to_retained(
     cnp.int32_t[:] g_local,
+    cnp.int32_t[:] tx_counts,
     cnp.float32_t[:, :] W,
     double threshold,
 ):
-    """One pass of greedy bad-edge prune; returns retained gene indices
-    (the seed) as int32 ndarray. Mirrors prune_single's algorithm but
-    returns retained instead of removed."""
+    """Greedy bad-edge prune with TX-WEIGHTED conflict scoring.
+
+    For each gene i, compute score[i] = sum_j (bad[i,j] * tx_counts[j])
+    — i.e., total tx of conflicting other-genes. Strip the gene with
+    max score. Safeguard: a gene with own tx count > score is
+    PROTECTED from being stripped (its own evidence majority-outweighs
+    its conflicts). Returns retained gene indices as int32 ndarray.
+    """
     cdef int k = g_local.shape[0]
     if k <= 1:
         return np.asarray(g_local).copy()
     cdef cnp.ndarray[cnp.uint8_t, ndim=1] active = np.ones(k, dtype=np.uint8)
     cdef cnp.ndarray[cnp.uint8_t, ndim=2] bad = np.zeros((k, k), dtype=np.uint8)
-    cdef cnp.ndarray[cnp.int32_t, ndim=1] bad_counts = np.zeros(k, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] bad_score = np.zeros(k, dtype=np.int32)
     cdef cnp.uint8_t[:] active_mv = active
     cdef cnp.uint8_t[:, :] bad_mv = bad
-    cdef cnp.int32_t[:] badc_mv = bad_counts
+    cdef cnp.int32_t[:] badscore_mv = bad_score
     cdef int i, j, gi, gj, active_count, maxc, argmax
     cdef float val
+    # Build bad-edge matrix and tx-weighted score per gene.
     for i in range(k):
         gi = int(g_local[i])
         for j in range(k):
@@ -180,24 +213,32 @@ cdef cnp.ndarray _greedy_prune_to_retained(
                 continue
             if val < threshold:
                 bad_mv[i, j] = 1
-                badc_mv[i] += 1
+                badscore_mv[i] += tx_counts[j]
     active_count = k
     while active_count > 1:
+        # Find gene with max tx-weighted bad-score among ACTIVE genes
+        # NOT protected by the own-tx safeguard.
         maxc = -1
         argmax = -1
         for i in range(k):
-            if active_mv[i]:
-                if badc_mv[i] > maxc:
-                    maxc = badc_mv[i]
-                    argmax = i
-        if maxc <= 0:
+            if not active_mv[i]:
+                continue
+            # Safeguard: own evidence > conflict-tx → protected, skip.
+            if tx_counts[i] > badscore_mv[i]:
+                continue
+            if badscore_mv[i] > maxc:
+                maxc = badscore_mv[i]
+                argmax = i
+        if maxc <= 0 or argmax < 0:
             break
         active_mv[argmax] = 0
         active_count -= 1
+        # On strip: every neighbour j with bad[argmax,j]=1 loses
+        # tx_counts[argmax] worth of conflict from their score.
         for j in range(k):
             if active_mv[j] and bad_mv[argmax, j]:
-                badc_mv[j] -= 1
-        badc_mv[argmax] = 0
+                badscore_mv[j] -= tx_counts[argmax]
+        badscore_mv[argmax] = 0
     # collect retained (active) gene indices
     cdef int n_kept = 0
     for i in range(k):
@@ -221,6 +262,9 @@ def prune_cells_nuclear_seed(
     double threshold,
     int min_nuclear_genes,
     int skip_phase_1c,
+    double seed_coherence_floor=-1e30,
+    int nuclear_only_admit=0,
+    int tx_weighted=1,
 ):
     """Batch nuclear-seed prune over many cells.
 
@@ -235,11 +279,25 @@ def prune_cells_nuclear_seed(
     W : float32 2D ndarray
         PMI matrix.
     threshold : float
-        Admission threshold for mean PMI to seed.
+        Admission threshold for mean PMI to seed (also bad-edge threshold
+        for the greedy prune).
     min_nuclear_genes : int
         Skip Phase 1a / 1c if a cell has fewer than this many unique nuclear genes.
     skip_phase_1c : int
         If non-zero, skip Phase 1c (rejected tx → unassigned directly).
+    seed_coherence_floor : float
+        Minimum mean internal PMI required for a seed (1a) or sub-seed
+        (1c) to be accepted. Seeds below this floor are rejected:
+        for the primary seed, all that cell's tx → unassigned; for the
+        sub-seed, all rest-pile tx → unassigned (no partial formed).
+        Default -1e30 disables the check (back-compat).
+    nuclear_only_admit : int
+        If non-zero, restrict 1b admission and 1c re-test to NUCLEAR
+        tx only — cytoplasmic tx leave Phase 1 as unassigned (code 2)
+        regardless of gene-fit. Group/Rescue/Stitch then route them
+        downstream by spatial+gene proximity. Establishes per-cell
+        identity exclusively from spatially-trusted nuclear tx.
+        Default 0 disables (back-compat: cyto admitted by gene-fit).
 
     Returns
     -------
@@ -306,22 +364,46 @@ def prune_cells_nuclear_seed(
                 g = tx_gene_mv[tx_row]
                 if g >= 0:
                     all_genes.append(g)
-            uniq_all = np.unique(np.asarray(all_genes, dtype=np.int32))
+            uniq_all_arr = np.asarray(all_genes, dtype=np.int32)
+            uniq_all = np.unique(uniq_all_arr)
             n_unique_all = uniq_all.shape[0]
             if n_unique_all == 0:
                 continue
-            seed = _greedy_prune_to_retained(uniq_all, W_mv, threshold)
+            # Whole-cell tx counts: all tx contribute (nuc + cyto).
+            tx_counts_all = np.zeros(n_unique_all, dtype=np.int32)
+            for ti in range(n_unique_all):
+                tx_counts_all[ti] = int(np.sum(uniq_all_arr == uniq_all[ti]))
+            if not tx_weighted:
+                tx_counts_all = np.ones(n_unique_all, dtype=np.int32)
+            seed = _greedy_prune_to_retained(uniq_all, tx_counts_all, W_mv, threshold)
         else:
-            # ---- Phase 1a: nuclear seed ----
-            seed = _greedy_prune_to_retained(uniq_nuc, W_mv, threshold)
+            # ---- Phase 1a: nuclear seed (tx-weighted) ----
+            # Per-gene nuclear tx counts for the tx-weighted greedy.
+            nuc_arr = np.asarray(nuc_genes, dtype=np.int32)
+            tx_counts_nuc = np.zeros(n_unique_nuc, dtype=np.int32)
+            for ti in range(n_unique_nuc):
+                tx_counts_nuc[ti] = int(np.sum(nuc_arr == uniq_nuc[ti]))
+            if not tx_weighted:
+                tx_counts_nuc = np.ones(n_unique_nuc, dtype=np.int32)
+            seed = _greedy_prune_to_retained(uniq_nuc, tx_counts_nuc, W_mv, threshold)
         seed_mv = seed
         seed_len = seed.shape[0]
         if seed_len == 0:
             # No seed found; all tx → unassigned (code 2 already default)
             continue
 
+        # Coherence floor on primary seed: reject seeds whose internal
+        # mean PMI is below the floor (avoids accepting a clique that
+        # is merely "non-conflicting" but biologically degenerate).
+        if _mean_internal_pmi(seed_mv, seed_len, W_mv) < seed_coherence_floor:
+            continue
+
         # ---- Phase 1b: per-tx admit by mean PMI to seed ----
-        # rejected accumulator (Python list, per-cell, OK overhead)
+        # rejected accumulator (Python list, per-cell, OK overhead).
+        # When nuclear_only_admit is set, cytoplasmic tx are not eligible
+        # for admission to main here — they stay unassigned (code 2)
+        # for downstream Group/Rescue/Stitch to route by spatial+gene
+        # proximity. Identity is established exclusively from nuclear tx.
         rejected_rows = []
         for ti in range(n_cell_tx):
             tx_row = tx_inds_mv[ti]
@@ -329,6 +411,9 @@ def prune_cells_nuclear_seed(
             if g < 0:
                 # No gene index — leave as unassigned (already default 2)
                 rejected_rows.append(tx_row)
+                continue
+            if nuclear_only_admit and not tx_nuc_mv[tx_row]:
+                # Cytoplasmic tx skipped — stays unassigned for Rescue.
                 continue
             # Check if g is in seed (linear scan; seed_len typically tiny)
             fitted = 0
@@ -355,20 +440,40 @@ def prune_cells_nuclear_seed(
                     rej_nuc.append(g)
         if len(rej_nuc) == 0:
             continue
-        uniq_rej_nuc = np.unique(np.asarray(rej_nuc, dtype=np.int32))
+        rej_nuc_arr = np.asarray(rej_nuc, dtype=np.int32)
+        uniq_rej_nuc = np.unique(rej_nuc_arr)
         if uniq_rej_nuc.shape[0] < min_nuclear_genes:
             continue
 
-        sub_seed = _greedy_prune_to_retained(uniq_rej_nuc, W_mv, threshold)
+        # Tx-weighted prune for sub-seed too.
+        n_uniq_rej = uniq_rej_nuc.shape[0]
+        tx_counts_rej = np.zeros(n_uniq_rej, dtype=np.int32)
+        for ti in range(n_uniq_rej):
+            tx_counts_rej[ti] = int(np.sum(rej_nuc_arr == uniq_rej_nuc[ti]))
+        if not tx_weighted:
+            tx_counts_rej = np.ones(n_uniq_rej, dtype=np.int32)
+        sub_seed = _greedy_prune_to_retained(uniq_rej_nuc, tx_counts_rej, W_mv, threshold)
         sub_seed_mv = sub_seed
         sub_seed_len = sub_seed.shape[0]
         if sub_seed_len == 0:
             continue
 
-        # Re-test rejected tx against sub-seed
+        # Coherence floor on sub-seed: reject if internal mean PMI is
+        # below the floor — prevents degenerate "any non-conflicting
+        # clique" sub-seeds from forming spurious partials. Rest-pile
+        # tx stay unassigned (code 2, already default) for downstream
+        # Rescue to route based on neighbour gene composition.
+        if _mean_internal_pmi(sub_seed_mv, sub_seed_len, W_mv) < seed_coherence_floor:
+            continue
+
+        # Re-test rejected tx against sub-seed. When nuclear_only_admit
+        # is set, cytoplasmic rejected tx are not eligible for partial
+        # admission either — they stay unassigned for Rescue.
         for tx_row in rejected_rows:
             g = tx_gene_mv[tx_row]
             if g < 0:
+                continue
+            if nuclear_only_admit and not tx_nuc_mv[tx_row]:
                 continue
             fitted = 0
             for j in range(sub_seed_len):

@@ -784,6 +784,13 @@ class DSU:
 _LEGACY_STITCH_KWARG_SENTINEL = object()
 
 
+# Diagnostic counters populated by stitch_entities_hierarchical when the
+# spatial-centroid bypass gate is active. Reset at the start of each
+# call. Read by callers after the call returns (e.g. CLI / sweep tooling
+# that wants to log how many pairs the gate captured).
+_LAST_GATE_STATS: dict[str, int] = {}
+
+
 def _stitch_entities_hierarchical_decomposable(
     summary_df: pd.DataFrame,
     aux: dict,
@@ -935,6 +942,25 @@ def stitch_entities_hierarchical(
     # Per-entity tx-coord arrays. Required for K≥2.
     # dict[entity_id -> (n_tx, n_dim) ndarray].
     entity_tx_coords: dict | None = None,
+    # Spatial gate mode (only when spatial_centroid_gate=True):
+    #   "pre"  — current behavior: spatial bypass returns sentinel ΔC,
+    #            so spatial-overlap pairs MERGE FIRST regardless of ΔC.
+    #            Spatial overrides any ΔC verdict, including rejections.
+    #   "post" — spatial gate fires only as a tiebreaker on ΔC-rejected
+    #            pairs. ΔC takes priority for accepting and ranking; if
+    #            a pair fails the ΔC test (dc < deltaC_min), THEN check
+    #            the spatial gate; if centroids match, merge anyway.
+    #            More conservative — lets ΔC do its job, only uses
+    #            spatial as a fallback for marginal-but-co-located pairs.
+    spatial_gate_mode: str = "pre",
+    # Flipped spatial test: instead of "smaller's centroid inside larger's
+    # tx cloud", check "larger's centroid inside smaller's tx cloud".
+    # Effective K is dynamically capped at floor(n_smaller / 3) so small
+    # partials use a lighter K. This is the right test for detecting
+    # whether the cell's tx are arranged AROUND the partial (i.e., the
+    # partial is a real fragment of the cell), as opposed to the partial
+    # being embedded INSIDE the cell (the contamination case).
+    spatial_gate_flipped: bool = False,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1351,6 +1377,18 @@ def stitch_entities_hierarchical(
             # Any setup failure → fall back gracefully (no primitive path).
             root_prims = None
 
+    # Reset diagnostic gate-fire counters (visible to caller via
+    # tracer.stitching._LAST_GATE_STATS after the call returns).
+    _LAST_GATE_STATS.clear()
+    _LAST_GATE_STATS.update({
+        "K": int(spatial_centroid_k) if spatial_centroid_gate else 0,
+        "checks_total": 0,        # _spatial_overlap calls
+        "checks_pass": 0,         # _spatial_overlap returned True
+        "init_bypasses": 0,       # heap-init pairs that took the bypass
+        "merges_via_bypass": 0,   # actual unions that fired through bypass
+        "merges_total": 0,        # all unions
+    })
+
     # ----------------------------------------------------------------
     # Per-root spatial state.
     # K=1 (default): bbox check via min/max columns from summary_df.
@@ -1392,38 +1430,71 @@ def stitch_entities_hierarchical(
             root_tx_coords = None
 
     def _spatial_overlap(ra: int, rb: int) -> bool:
-        """Smaller entity's centroid lies inside larger entity's
-        spatial extent. K=1 → bbox containment. K≥2 → need ≥K tx
-        coords above AND ≥K below per axis (more interior).
+        """Default rule: smaller's centroid inside larger's tx cloud.
+        K=1 → bbox check. K≥2 → ≥K tx of larger above AND below
+        smaller's centroid per axis.
+
+        Flipped rule (spatial_gate_flipped=True): swap roles. Test
+        whether the LARGER's centroid lies inside the SMALLER's tx
+        cloud. Effective K capped at floor(n_smaller / 3) so a small
+        partial uses a lighter K. Detects "cell arranged AROUND
+        partial" (legitimate fragment) instead of "partial embedded
+        IN cell" (often contamination).
         """
+        _LAST_GATE_STATS["checks_total"] += 1
         n_a = int(root_n_tx[ra])
         n_b = int(root_n_tx[rb])
         if n_a <= n_b:
             small_idx, large_idx = ra, rb
+            n_small, n_large = n_a, n_b
         else:
             small_idx, large_idx = rb, ra
-        c = root_centroid[small_idx]
+            n_small, n_large = n_b, n_a
 
-        if spatial_centroid_k <= 1:
+        if spatial_gate_flipped:
+            # test point = larger's centroid; reference cloud = smaller's tx
+            c = root_centroid[large_idx]
+            ref_idx = small_idx
+            # Dynamic K cap: small partial → lighter K. Uses ceiling
+            # division (n+2)//3 so a 5-tx partial gets K=2, not K=1
+            # (bbox-only). Floor gave K=1 for n∈{3,4,5} — too permissive.
+            k_eff = min(int(spatial_centroid_k),
+                         max(1, (n_small + 2) // 3))
+        else:
+            c = root_centroid[small_idx]
+            ref_idx = large_idx
+            # Original "smaller's centroid in larger" rule with dynamic
+            # floor based on LARGER entity's size:
+            #   K_eff = max(K, ceil(n_larger / 3))
+            # For a 105-tx cell merging with a small partial, K_eff = 35
+            # — requires 35 cell tx straddling the partial centroid in
+            # each axis. Stricter for big cells (the typical contamination
+            # host), no-op for small (n<30) cells.
+            k_eff = max(int(spatial_centroid_k),
+                         (n_large + 2) // 3)
+
+        if k_eff <= 1:
             # Bbox check (cheap)
-            bb_min = root_bbox_min[large_idx]
-            bb_max = root_bbox_max[large_idx]
-            return bool(np.all(c >= bb_min) and np.all(c <= bb_max))
+            bb_min = root_bbox_min[ref_idx]
+            bb_max = root_bbox_max[ref_idx]
+            ok = bool(np.all(c >= bb_min) and np.all(c <= bb_max))
+            if ok:
+                _LAST_GATE_STATS["checks_pass"] += 1
+            return ok
 
-        # K≥2: per-axis count of tx in larger entity above/below c.
-        large_coords = root_tx_coords[large_idx]
-        if large_coords.size == 0 or large_coords.shape[0] < 2 * spatial_centroid_k:
-            # Larger entity has fewer than 2K tx → can't satisfy
-            # rule. Reject (treat as no overlap).
+        # K≥2: per-axis count of tx in reference cloud above/below c.
+        ref_coords = root_tx_coords[ref_idx]
+        if ref_coords.size == 0 or ref_coords.shape[0] < 2 * k_eff:
             return False
         for d in range(c.shape[0]):
-            col = large_coords[:, d]
+            col = ref_coords[:, d]
             n_above = int(np.sum(col > c[d]))
-            if n_above < spatial_centroid_k:
+            if n_above < k_eff:
                 return False
             n_below = int(np.sum(col < c[d]))
-            if n_below < spatial_centroid_k:
+            if n_below < k_eff:
                 return False
+        _LAST_GATE_STATS["checks_pass"] += 1
         return True
 
     # constraint: can we merge clusters A and B?
@@ -1520,12 +1591,14 @@ def stitch_entities_hierarchical(
 
     # compute deltaC between current roots
     def compute_deltaC_roots(ra, rb):
-        # Spatial bypass (Tier 1): if the smaller entity's centroid is
-        # inside the larger entity's bbox, treat the pair as a
-        # GUARANTEED merge — return a high sentinel ΔC. No coherence /
-        # gene-PMI evaluation is performed. The merge still must
-        # satisfy `can_merge` (cell-cell rule) at pop time.
-        if (spatial_centroid_gate and root_centroid is not None
+        # Spatial bypass (Tier 1): in mode="pre", if the smaller
+        # entity's centroid is inside the larger entity's bbox, treat
+        # the pair as a GUARANTEED merge — return a high sentinel ΔC.
+        # No coherence / gene-PMI evaluation is performed. In
+        # mode="post", we never short-circuit here; the spatial test
+        # is checked at pop time as a fallback for ΔC-rejected pairs.
+        if (spatial_centroid_gate and spatial_gate_mode == "pre"
+                and root_centroid is not None
                 and _spatial_overlap(ra, rb)):
             return _SPATIAL_OVERLAP_DC
 
@@ -1614,13 +1687,23 @@ def stitch_entities_hierarchical(
             spatial_centroid_gate and root_centroid is not None
             and _spatial_overlap(i, j)
         )
+        if is_spatial:
+            _LAST_GATE_STATS["init_bypasses"] += 1
         # Tier 2 (cheap rejection): fast-gate skips expensive eval ONLY
-        # when there's no spatial bypass.
+        # when there's no spatial bypass. In "post" mode, spatial is a
+        # fallback at pop time, so still let the fast-gate cull these.
         if (not is_spatial) and gate_keep_mask is not None and not gate_keep_mask[ei]:
             continue
-        # Tier 3 (full ΔC eval, or sentinel 1e9 if spatial-overlap)
+        # Tier 3 (full ΔC eval; sentinel 1e9 only in "pre" mode)
         di = compute_deltaC_roots(i, j)
         if np.isfinite(di) and di >= deltaC_min:
+            heapq.heappush(heap, _heap_item(di, i, j))
+        elif (is_spatial and spatial_gate_mode == "post"
+              and np.isfinite(di)):
+            # Post-mode rescue: ΔC says reject, but spatial matches.
+            # Push at the real (low/negative) ΔC priority so genuine
+            # ΔC merges happen first; this pair gets revisited at pop
+            # time and merged via the spatial-override path.
             heapq.heappush(heap, _heap_item(di, i, j))
 
     # greedy merging
@@ -1636,12 +1719,30 @@ def stitch_entities_hierarchical(
 
         # recompute deltaC for current clusters (because a,b may have merged)
         dc_now = compute_deltaC_roots(ra, rb)
+        post_override = False
         if not (np.isfinite(dc_now) and dc_now >= deltaC_min):
-            continue
+            # ΔC says reject. In "post" mode, give the spatial gate
+            # one chance: if the (current-root) centroid test still
+            # matches, force the merge anyway. This is the only way
+            # spatial can intervene in post-mode.
+            if (spatial_centroid_gate and spatial_gate_mode == "post"
+                    and root_centroid is not None
+                    and _spatial_overlap(ra, rb)):
+                post_override = True
+            else:
+                continue
 
         # merge (choose new root)
         rnew = dsu.union(ra, rb)
         rold = rb if rnew == ra else ra
+        _LAST_GATE_STATS["merges_total"] += 1
+        # Track which gate drove the merge:
+        #   pre-mode bypass → dc_now == 1e9 sentinel
+        #   post-mode override → ΔC failed but spatial said merge
+        if dc_now >= _SPATIAL_OVERLAP_DC * 0.5:
+            _LAST_GATE_STATS["merges_via_bypass"] += 1
+        elif post_override:
+            _LAST_GATE_STATS["merges_via_bypass"] += 1
 
         # update cluster metadata onto rnew
         has_cell[rnew] = has_cell[rnew] or has_cell[rold]
@@ -2090,6 +2191,13 @@ def apply_stitching_to_transcripts_memory_efficient(
     # the gate falls back to bbox check using `summary_df`'s min/max
     # columns. dict[entity_id_str -> (n_tx, n_dim) ndarray].
     entity_tx_coords: dict | None = None,
+    # Spatial gate mode: "pre" (current default — spatial bypass overrides
+    # ΔC and merges first) or "post" (spatial fires only as a fallback
+    # for ΔC-rejected pairs).
+    spatial_gate_mode: str = "pre",
+    # Flipped overlap test: larger's centroid inside smaller's tx cloud.
+    # Effective K capped at floor(n_smaller / 3).
+    spatial_gate_flipped: bool = False,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -2243,6 +2351,8 @@ def apply_stitching_to_transcripts_memory_efficient(
         spatial_centroid_gate=spatial_centroid_gate,
         spatial_centroid_k=spatial_centroid_k,
         entity_tx_coords=entity_tx_coords_dict,
+        spatial_gate_mode=spatial_gate_mode,
+        spatial_gate_flipped=spatial_gate_flipped,
         **legacy_kwargs,
     )
 

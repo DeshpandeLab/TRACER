@@ -497,6 +497,9 @@ def prune_transcripts_nuclear_seed(
     housekeeping_neg_thresh: float = -0.05,
     housekeeping_min_strong_count: int = 5,
     skip_phase_1c: bool = False,
+    seed_coherence_floor: float = -1e30,
+    nuclear_only_admit: bool = False,
+    tx_weighted: bool = True,
 ):
     """Nuclear-seed Prune: anchor cell identity on the spatially-compact
     nucleus, then admit cytoplasmic tx whose gene fits the seed by PMI.
@@ -602,6 +605,9 @@ def prune_transcripts_nuclear_seed(
         float(threshold),
         int(min_nuclear_genes),
         1 if skip_phase_1c else 0,
+        float(seed_coherence_floor),
+        1 if nuclear_only_admit else 0,
+        1 if tx_weighted else 0,
     )
 
     # Apply codes to out_col. Default state of out_col is the cell_id
