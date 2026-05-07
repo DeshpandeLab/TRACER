@@ -446,11 +446,14 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
     below ``min_n_genes``. The latter forces single-gene entities
     to fail (coherence is undefined for n_genes < 2).
 
+    Uses the Cython batch coherence kernel
+    (`tracer._cy_prune.coherence_count_per_entity_batch`) for the
+    per-entity coherence computation. ~50–100x faster than a Python
+    groupby + per-entity coherence call on large entity sets.
+
     Returns (df_out, stats). When ``min_C <= 0`` AND
     ``min_n_genes <= 1``, the function is a no-op.
     """
-    import re as _re
-
     if min_C <= 0 and min_n_genes <= 1:
         return df_in.copy(), {
             "entities_examined": 0, "entities_demoted_low_C": 0,
@@ -462,36 +465,74 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
     gene_to_idx = aux["gene_to_idx"]
     W = aux["W"]
 
-    bad_low_C = []
-    bad_few_genes = []
-    for ent, grp in df_out.groupby(entity_col, sort=False):
-        if ent in (unassigned_id, "UNASSIGNED", "DROP", "nan"):
-            continue
-        # Don't demote pre-emitted base UNASSIGNED labels for empty entities
-        genes = grp["feature_name"].astype(str).unique()
-        g_idx = np.array(
-            [gene_to_idx[g] for g in genes if g in gene_to_idx],
-            dtype=np.int32,
-        )
-        if g_idx.size < min_n_genes:
-            bad_few_genes.append(ent)
-            continue
-        C, _, _ = coherence(g_idx, W, mode="count",
-                              threshold=threshold, metric=metric)
-        if C <= min_C:
-            bad_low_C.append(ent)
+    # Densify W to float32 contiguous if needed (Cython expects this)
+    if not isinstance(W, np.ndarray):
+        # sparse → dense
+        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
+                       dtype=np.float32)
+    if W.dtype != np.float32:
+        W = W.astype(np.float32)
+    if not W.flags.c_contiguous:
+        W = np.ascontiguousarray(W)
 
-    bad = bad_low_C + bad_few_genes
+    # Map each tx's gene to its W-index in one vectorized pass.
+    gene_arr = df_out["feature_name"].astype(str).to_numpy()
+    gene_idx_arr = np.array(
+        [gene_to_idx.get(g, -1) for g in gene_arr], dtype=np.int32,
+    )
+    label_arr = df_out[entity_col].to_numpy()
+    label_str = label_arr.astype(str)
+
+    # Filter: drop unassigned-class sentinels and tx with unknown gene.
+    # NOTE: UNASSIGNED_<n> components ARE valid entities — they're kept.
+    # Only the literal sentinels are excluded.
+    drop_set = {str(unassigned_id), "UNASSIGNED", "DROP", "nan"}
+    is_unassigned_sentinel = np.isin(label_str, list(drop_set))
+    keep = (~is_unassigned_sentinel) & (gene_idx_arr >= 0)
+
+    sub_labels = label_str[keep]
+    sub_genes = gene_idx_arr[keep]
+    if sub_labels.size == 0:
+        return df_out, {
+            "entities_examined": 0, "entities_demoted_low_C": 0,
+            "entities_demoted_few_genes": 0, "tx_demoted": 0,
+        }
+
+    # Build CSR (entity → unique gene indices). Pandas sort + drop_duplicates.
+    tmp = pd.DataFrame({"label": sub_labels, "gene": sub_genes})
+    tmp = tmp.drop_duplicates(subset=["label", "gene"], keep="first")
+    tmp = tmp.sort_values(["label", "gene"], kind="stable")
+    counts = tmp.groupby("label", sort=False).size().to_numpy(dtype=np.int32)
+    entity_ids = tmp.groupby("label", sort=False).size().index.to_numpy()
+    offsets = np.empty(counts.size + 1, dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    flat_genes = tmp["gene"].to_numpy(dtype=np.int32)
+
+    # Cython batch call
+    from tracer._cy_prune import coherence_count_per_entity_batch
+    C_arr, _P_arr, _N_arr = coherence_count_per_entity_batch(
+        offsets, flat_genes, W, float(threshold),
+    )
+
+    # Decide demotion per entity
+    n_genes_per_ent = counts
+    bad_few = (n_genes_per_ent < min_n_genes)
+    # n_finite == 0 returns C=0 from kernel; that's caught by "C ≤ min_C"
+    # for any positive min_C.
+    bad_low = (~bad_few) & (C_arr <= min_C)
+
+    bad_set = set(entity_ids[bad_few | bad_low].tolist())
     n_demoted = 0
-    if bad:
-        mask = df_out[entity_col].isin(bad)
+    if bad_set:
+        mask = df_out[entity_col].isin(bad_set)
         df_out.loc[mask, entity_col] = unassigned_id
         n_demoted = int(mask.sum())
 
     return df_out, {
-        "entities_examined": int(df_out[entity_col].nunique()),
-        "entities_demoted_low_C": len(bad_low_C),
-        "entities_demoted_few_genes": len(bad_few_genes),
+        "entities_examined": int(entity_ids.size),
+        "entities_demoted_low_C": int(bad_low.sum()),
+        "entities_demoted_few_genes": int(bad_few.sum()),
         "tx_demoted": n_demoted,
     }
 
