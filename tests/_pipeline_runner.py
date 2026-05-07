@@ -217,6 +217,128 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
     return df_out, stats
 
 
+def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
+                                entity_col: str,
+                                aux: dict,
+                                cell_id_col: str = "cell_id",
+                                gene_col: str = "feature_name",
+                                nuclear_col: str = "overlaps_nucleus",
+                                margin: float = 0.05,
+                                threshold: float = 0.05,
+                                ) -> tuple[pd.DataFrame, dict]:
+    """Re-evaluate nuclear tx admitted to main entities against any
+    sibling partials emitted by Phase 1c. If a partial sibling has a
+    strictly higher mean-PMI fit than the main entity (by at least
+    `margin`), MOVE the tx to that partial.
+
+    Operates only on NUCLEAR tx (consistent with Phase 1's nuclear-only
+    admission policy). Cyto tx are left alone for downstream Rescue.
+
+    Closes Gap B: a nuclear tx weakly admitted to the main seed via
+    mean-PMI test (its gene NOT a true seed member) might fit a
+    1c-emitted partial's sub-seed strictly better. Currently it's
+    locked in the main entity; this stage frees it to the partial.
+
+    Returns (df_out, stats).
+    """
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    label_arr = df_out[entity_col].to_numpy(dtype=object).copy()
+
+    gene_to_idx = aux["gene_to_idx"]
+    W = aux["W"]
+    if hasattr(W, "dtype") and W.dtype != np.float32:
+        W = W.astype(np.float32)
+    if not isinstance(W, np.ndarray):
+        # sparse matrices: densify for the per-tx mean-PMI lookups
+        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
+                       dtype=np.float32)
+
+    # Build per-entity nuclear-gene set (using nuclear tx only)
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+    nuc_idx = np.where(is_nuclear)[0]
+    nuc_genes = df_out[gene_col].astype(str).to_numpy()
+    nuc_labels = df_out[entity_col].to_numpy(dtype=object)
+
+    entity_to_genes: dict[str, set[int]] = {}
+    for i in nuc_idx:
+        e = nuc_labels[i]
+        if e in ("-1", "DROP", "UNASSIGNED", "nan") or str(e).startswith("UNASSIGNED_"):
+            continue
+        g = nuc_genes[i]
+        gi = gene_to_idx.get(g, -1)
+        if gi < 0:
+            continue
+        entity_to_genes.setdefault(str(e), set()).add(int(gi))
+
+    # Group by parent cell_id (first numeric token of the label)
+    parent_to_entities: dict[str, list[str]] = {}
+    for ent in entity_to_genes:
+        m = _re.match(r"^(\d+)(?:-\d+){0,2}$", ent)
+        if not m:
+            continue
+        parent_to_entities.setdefault(m.group(1), []).append(ent)
+
+    def _mean_pmi(g_idx: int, gene_set: set[int]) -> float:
+        if not gene_set:
+            return float("nan")
+        others = [x for x in gene_set if x != g_idx]
+        if not others:
+            return float("nan")
+        vals = W[g_idx, np.asarray(list(others), dtype=np.int64)]
+        finite = np.isfinite(vals)
+        if not finite.any():
+            return float("nan")
+        return float(vals[finite].mean())
+
+    n_moves = 0
+    cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
+
+    for parent, ent_list in parent_to_entities.items():
+        if len(ent_list) < 2:
+            continue
+        main = parent
+        if main not in entity_to_genes:
+            continue
+        partials = [e for e in ent_list if e != main]
+        if not partials:
+            continue
+
+        S_main = entity_to_genes[main]
+        S_partials = {p: entity_to_genes[p] for p in partials}
+
+        # Examine each NUCLEAR tx currently in the main entity
+        main_mask = (label_arr == main) & is_nuclear & (cell_id_arr == parent)
+        for tx_idx in np.where(main_mask)[0]:
+            g = nuc_genes[tx_idx]
+            gi = gene_to_idx.get(g, -1)
+            if gi < 0:
+                continue
+            mean_main = _mean_pmi(gi, S_main)
+            if not np.isfinite(mean_main):
+                continue
+            best_p = None
+            best_mean = mean_main
+            for p, S_p in S_partials.items():
+                mp = _mean_pmi(gi, S_p)
+                if np.isfinite(mp) and mp > best_mean + margin:
+                    best_mean = mp
+                    best_p = p
+            if best_p is not None:
+                label_arr[tx_idx] = best_p
+                n_moves += 1
+
+    df_out[entity_col] = label_arr
+    return df_out, {
+        "n_tx_moved": n_moves,
+        "n_parents_with_partials": int(sum(
+            1 for ents in parent_to_entities.values() if len(ents) >= 2
+        )),
+    }
+
+
 def _split_unassigned_components(df_in: pd.DataFrame, *,
                                    entity_col: str,
                                    coord_cols=("x", "y", "z"),
@@ -439,6 +561,16 @@ MID_QC_C_FLOOR: float = 0.05
 #        veto used elsewhere. Same compute profile as the main Rescue.
 RESCUE_POST_GROUP_PASSES: int = 3
 
+# Phase-1 post-1c nuclear reassignment (opt-in). Gap B: a nuclear tx
+# weakly admitted to the main seed via mean-PMI test, whose gene later
+# turns out to be a STRONG fit to a Phase-1c-emitted partial's
+# sub-seed, is currently locked in the main entity. This stage moves
+# such tx to the partial sibling that gives strictly higher mean PMI.
+#
+#   False = off (current).
+#   True  = enable post-1c reassignment.
+PHASE1_REASSIGN_AFTER_1C: bool = False
+
 
 def _classify(label: str) -> str:
     s = str(label)
@@ -551,6 +683,18 @@ def run_segmented_pipeline(df: pd.DataFrame,
             n_jobs=-1, show_progress=False,
         )
     _record_stage(progression, "Prune", df_pruned, "tracer_id")
+
+    # Phase-1 post-1c nuclear reassignment (opt-in). Closes Gap B:
+    # nuclear tx weakly admitted to the main seed, whose gene fits a
+    # 1c partial's sub-seed strictly better, get moved to the partial.
+    if PHASE1_REASSIGN_AFTER_1C:
+        df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
+            df_pruned, entity_col="tracer_id", aux=aux,
+            cell_id_col="cell_id", gene_col="feature_name",
+            nuclear_col="overlaps_nucleus",
+            margin=0.05, threshold=PMI_THR,
+        )
+        _record_stage(progression, "Phase1-Reassign-1c", df_pruned, "tracer_id")
 
     # Spatial-split Phase 1 entities. Phase 1c is purely gene-based —
     # if a cell has TWO contamination sources contributing similar
