@@ -34,6 +34,7 @@ from tracer.stitching import (
     coherence,
     estimate_within_cell_dz_threshold,
 )
+from tracer.density_cascade import cascade_as_residual_handler
 
 
 # Modern config — matches segmented_workflow.ipynb / noseg_workflow.ipynb.
@@ -613,6 +614,53 @@ RESCUE_POST_GROUP_PASSES: int = 3
 PHASE1_REASSIGN_AFTER_1C: bool = False
 
 
+# Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
+# spatial-only connected components) with the density-cascade Phase 1 on
+# the same post-Rescue residual. Cascade emits `cascade_<n>` synthetic
+# anchors, classified as 'cell' by `_classify`. Floor is selected at runtime
+# from runtime tx-coverage in the residual pool — no hand-tuned thresholds.
+#
+# On 500 µm Xenium ROI, head-to-head:
+#   default Group (G=8 self):     1,826 components,  ARI vs raw +0.6808
+#   cascade-residual ('auto'):     ~602 components,  ARI vs raw +0.6877
+#       (3x fewer components, ~99 % of default's assignment, equal-or-better ARI)
+#
+# See density-cascade-handoff.md for full design and bench results.
+#
+#   False = off (legacy: spatial-only annotate_unassigned_components_fast).
+#   True  = on (default 2026-05-07 onward): cascade as Group replacement.
+#
+# Default flip rationale (full-tissue Xenium, /tmp/bench_cascade_step6.py):
+#   default Group  : V_β=2 +0.9410, ARI +0.6896, 62,980 entities
+#   cascade partial: V_β=2 +0.9435, ARI +0.6987, 59,207 entities (closest
+#                    to input cell_id's 58,405).
+# Cascade emits `cascade_<n>-1` labels; downstream Stitch merges fragments
+# of the same biological cell via the existing two-dash partial-merger logic.
+PHASE1_SEG_RESIDUAL_CASCADE: bool = True
+# Cascade auto-floor target: fraction of residual tx mass to capture in
+# the R=1 Moore-dilated anchor mask. 0.65 was reverse-engineered from the
+# empirical NOSEG winner (66.5 % cov at floor=4 on full Xenium tissue) and
+# also lands on floor=2 on the SEG-residual ROI (which can't reach 65 %
+# coverage at any floor, so falls back to hard_min=2).
+PHASE1_SEG_RESIDUAL_CASCADE_TARGET_COV: float = 0.65
+PHASE1_SEG_RESIDUAL_CASCADE_HARD_MIN: int = 2
+
+
+# Opt-in: replace the NOSEG path's Group call (de-facto cell-finder, not
+# residual handler) with the density-cascade. NOSEG runs at higher density
+# than SEG-residual since the entire pool is the input — auto-floor will
+# typically pick floor=4 (~66 % tx coverage) on Xenium full pool.
+#
+# See density-cascade-handoff.md for ROI ARI improvements (+0.085 over
+# baseline NOSEG) and full-tissue homogeneity bench results.
+#
+#   False = off (current default — preserves existing test references).
+#   True  = enable cascade in place of Group in the NOSEG path.
+PHASE1_NOSEG_CASCADE: bool = False
+PHASE1_NOSEG_CASCADE_TARGET_COV: float = 0.65
+PHASE1_NOSEG_CASCADE_HARD_MIN: int = 2
+
+
 def _classify(label: str) -> str:
     s = str(label)
     # All unassigned-class labels (fixed sentinels + stage-rejected
@@ -806,16 +854,28 @@ def run_segmented_pipeline(df: pd.DataFrame,
             break
     _record_stage(progression, "Rescue", df_rescued, "tracer_id")
 
-    df_grouped = annotate_unassigned_components_fast(
-        df_pruned=df_rescued, aux=aux,
-        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
-        coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=4,
-        npmi_threshold=ANNOTATE_NEG_THR,
-        entity_col="tracer_id", out_col="tracer_id",
-        cell_id_col="cell_id", gene_col="feature_name",
-        transcript_id_col="transcript_id", show_progress=False,
-    )
+    if PHASE1_SEG_RESIDUAL_CASCADE:
+        df_grouped = cascade_as_residual_handler(
+            df_pruned=df_rescued, aux=aux,
+            entity_col="tracer_id",
+            G=2.0, thresholds="auto",
+            territory_radius_bins=1,
+            pmi_threshold=PMI_THR,
+            min_anchor_tx=3,
+            auto_target_cov=PHASE1_SEG_RESIDUAL_CASCADE_TARGET_COV,
+            auto_hard_min=PHASE1_SEG_RESIDUAL_CASCADE_HARD_MIN,
+        )
+    else:
+        df_grouped = annotate_unassigned_components_fast(
+            df_pruned=df_rescued, aux=aux,
+            build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
+            coord_cols=("x", "y", "z"),
+            k=8, dist_threshold=1.5, min_comp_size=4,
+            npmi_threshold=ANNOTATE_NEG_THR,
+            entity_col="tracer_id", out_col="tracer_id",
+            cell_id_col="cell_id", gene_col="feature_name",
+            transcript_id_col="transcript_id", show_progress=False,
+        )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
     # Mid-pipeline QC (after Group, before Stitch). Both stages are
@@ -946,17 +1006,29 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
     df["tracer_id"] = "-1"
     _record_stage(progression, "after init", df, "tracer_id")
 
-    # Group
-    df_grouped = annotate_unassigned_components_fast(
-        df_pruned=df, aux=aux,
-        build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
-        coord_cols=("x", "y", "z"),
-        k=8, dist_threshold=1.5, min_comp_size=5,
-        npmi_threshold=ANNOTATE_NEG_THR,
-        entity_col="tracer_id", out_col="tracer_id",
-        cell_id_col="cell_id", gene_col="feature_name",
-        transcript_id_col="transcript_id", show_progress=False,
-    )
+    # Group (or cascade replacement for cell-finding in NOSEG)
+    if PHASE1_NOSEG_CASCADE:
+        df_grouped = cascade_as_residual_handler(
+            df_pruned=df, aux=aux,
+            entity_col="tracer_id",
+            G=2.0, thresholds="auto",
+            territory_radius_bins=1,
+            pmi_threshold=PMI_THR,
+            min_anchor_tx=3,
+            auto_target_cov=PHASE1_NOSEG_CASCADE_TARGET_COV,
+            auto_hard_min=PHASE1_NOSEG_CASCADE_HARD_MIN,
+        )
+    else:
+        df_grouped = annotate_unassigned_components_fast(
+            df_pruned=df, aux=aux,
+            build_graph_fn=_grid_self_graph_fn, prune_fn=prune_genes_by_npmi_greedy,
+            coord_cols=("x", "y", "z"),
+            k=8, dist_threshold=1.5, min_comp_size=5,
+            npmi_threshold=ANNOTATE_NEG_THR,
+            entity_col="tracer_id", out_col="tracer_id",
+            cell_id_col="cell_id", gene_col="feature_name",
+            transcript_id_col="transcript_id", show_progress=False,
+        )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
 
     # Mid-pipeline QC (after Group, before Stitch). Same opt-in
