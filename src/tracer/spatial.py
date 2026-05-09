@@ -1465,6 +1465,9 @@ def reassign_unassigned_grid_pool(
     mean_threshold: float = 0.0,
     small_entity_guard_n: int = 3,
     min_admit_threshold: float = 0.0,
+    real_signal_threshold: float = 0.05,   # noise floor for "real player" PMI
+    aggregator_percentile: float = 50.0,   # percentile of real-signal PMIs to gate on
+                                            #   <50 = stricter, 50 = median, >50 = liberal
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, dict]:
     """Grid-bin rescue: distance-priority with NPMI as a negative veto.
@@ -1741,6 +1744,8 @@ def reassign_unassigned_grid_pool(
                 int(small_entity_guard_n),
                 float(neg_npmi_threshold),
                 float(min_admit_threshold),
+                float(real_signal_threshold),
+                float(aggregator_percentile),
             )
         )
 
@@ -1839,15 +1844,26 @@ def reassign_unassigned_grid_pool(
                                 vetoed = bool(ent_set & neg)
                                 if not (ent_set & neg) and n_valid > 0:
                                     n_small_entity_fallback += 1
-                            elif n_valid == 0:
-                                # No observed-PMI evidence at all — block by
-                                # default. (Absence of evidence ≠ evidence of
-                                # presence: don't grow E into g without any
-                                # positive signal.)
-                                vetoed = True
                             else:
-                                mean_p = float(pmis[finite].mean())
-                                vetoed = mean_p <= mean_threshold
+                                # "Real players": pairs with |PMI| above noise
+                                # floor. Both NaN (missing) and explicit zeros
+                                # (dead_zone, tight_null, panel-absent in sparse
+                                # W) collapse to "not a real player" — neither
+                                # contributes meaningfully to the gate. Decide
+                                # on a percentile of the signal pairs: lower
+                                # percentile = stricter (more pairs must be
+                                # positive); 50 = median; higher = liberal.
+                                signal_thr = float(real_signal_threshold)
+                                is_signal = np.abs(pmis) > signal_thr
+                                n_signal = int(is_signal.sum())
+                                if n_signal == 0:
+                                    # No real-signal pairs — defer to spatial.
+                                    vetoed = False
+                                else:
+                                    p_aggregate = float(np.percentile(
+                                        pmis[is_signal], aggregator_percentile
+                                    ))
+                                    vetoed = p_aggregate <= mean_threshold
                     ent_decision_cache[ent] = vetoed
             else:
                 # hybrid mode: g ∈ E → admit. Else min-fast-pass, mean-slow-pass.
@@ -1867,16 +1883,27 @@ def reassign_unassigned_grid_pool(
                         pmis = row_g[ent_arr]
                         finite = np.isfinite(pmis)
                         n_valid = int(finite.sum())
-                        if n_valid == 0:
-                            vetoed = True  # no evidence → reject
+                        # "Real players" gate: same logic as the non-hybrid
+                        # branch above. Pairs with |PMI| above noise floor
+                        # vote; everything else is irrelevant. Hybrid mode
+                        # still keeps the unanimous min-fast-pass for the
+                        # case where every real-signal pair is decisively
+                        # above the admit threshold.
+                        signal_thr = float(real_signal_threshold)
+                        is_signal = np.abs(pmis) > signal_thr
+                        n_signal = int(is_signal.sum())
+                        if n_signal == 0:
+                            vetoed = False  # defer to spatial
                         else:
-                            pmis_f = pmis[finite]
-                            min_p = float(pmis_f.min())
+                            sig_pmis = pmis[is_signal]
+                            min_p = float(sig_pmis.min())
                             if min_p > min_admit_threshold:
-                                vetoed = False  # unanimous fast-pass
+                                vetoed = False   # unanimous-strong fast-pass
                             else:
-                                mean_p = float(pmis_f.mean())
-                                vetoed = mean_p <= mean_threshold
+                                p_aggregate = float(np.percentile(
+                                    sig_pmis, aggregator_percentile
+                                ))
+                                vetoed = p_aggregate <= mean_threshold
                     ent_decision_cache[ent] = vetoed
 
             if vetoed:
@@ -1945,6 +1972,9 @@ def pre_stage2_rescue(
     mean_threshold: float = 0.0,
     small_entity_guard_n: int = 3,
     min_admit_threshold: float = 0.0,
+    real_signal_threshold: float = 0.05,   # noise floor for "real player" PMI
+    aggregator_percentile: float = 50.0,   # percentile of real-signal PMIs to gate on
+                                            #   <50 = stricter, 50 = median, >50 = liberal
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, int, dict]:
     """Pre-Stage-2 rescue: tight-scale NPMI-categorical reassignment of
@@ -2034,6 +2064,8 @@ def pre_stage2_rescue(
         mean_threshold=mean_threshold,
         small_entity_guard_n=small_entity_guard_n,
         min_admit_threshold=min_admit_threshold,
+        real_signal_threshold=real_signal_threshold,
+        aggregator_percentile=aggregator_percentile,
     )
 
     # Restore: any tx still holding SHIELD_LABEL after rescue → reset to

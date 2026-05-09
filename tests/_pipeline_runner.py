@@ -440,7 +440,8 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
                                min_n_genes: int = 2,
                                threshold: float = 0.05,
                                metric: str = "pmi",
-                               unassigned_id: str = "-1"
+                               unassigned_id: str = "-1",
+                               real_signal_threshold: float = 0.0,
                                ) -> tuple[pd.DataFrame, dict]:
     """Demote any entity (cell, partial, or component) whose internal
     coherence is below ``min_C``, OR whose distinct-gene count is
@@ -510,10 +511,14 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
     np.cumsum(counts, out=offsets[1:])
     flat_genes = tmp["gene"].to_numpy(dtype=np.int32)
 
-    # Cython batch call
+    # Cython batch call. When real_signal_threshold > 0, the kernel
+    # uses the "real players" denominator (only pairs with |W| above
+    # the noise floor count) — making C panel-shape-agnostic across
+    # dense (legacy) and sparse (bootstrap, Visium HD) W matrices.
     from tracer._cy_prune import coherence_count_per_entity_batch
     C_arr, _P_arr, _N_arr = coherence_count_per_entity_batch(
         offsets, flat_genes, W, float(threshold),
+        float(real_signal_threshold),
     )
 
     # Decide demotion per entity
@@ -588,6 +593,22 @@ STITCH_GZ_UM: float | None = 1.0
 #                            low-C Group components.
 MID_SPLIT_UNASSIGNED_DZ: float | None = 2.0
 MID_QC_C_FLOOR: float = 0.05
+
+# "Real players" gate for Mid-QC coherence + Rescue veto.
+#   0.0 = legacy n_finite-denominator (every non-NaN pair counts —
+#         this conflates explicit zeros, tight_nulls, and dead_zones
+#         with informative pairs, biasing C toward 0 on sparse W).
+#   >0  = panel-shape-agnostic gate. Pairs with |W[i,j]| ≤ floor are
+#         excluded from BOTH numerator and denominator; coherence
+#         and rescue-veto reflect the (signed) strength of pairs
+#         that actually carry information. Required for sparse
+#         bootstrap / Visium HD panels where most off-diagonal cells
+#         are implicit zero rather than NaN.
+REAL_SIGNAL_THRESHOLD: float = 0.05
+# Percentile of real-signal PMIs used in the Rescue mean/hybrid veto.
+# 50 = median. <50 = stricter (more pairs must clear mean_threshold).
+# >50 = liberal (tolerates a long left tail of weak/negative pairs).
+RESCUE_AGGREGATOR_PERCENTILE: float = 50.0
 
 # Post-Group Rescue (between Group and Stitch). Closes the gap where
 # Group's UNASSIGNED_* components — freshly created — cannot serve as
@@ -848,6 +869,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
             mean_threshold=RESCUE_MEAN_ADMIT,
             min_admit_threshold=RESCUE_MIN_ADMIT,
             small_entity_guard_n=0,
+            real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+            aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
         )
         n_rescued += n_pass_rescued
         if n_pass_rescued == 0:
@@ -893,6 +916,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
             df_grouped, entity_col="tracer_id", aux=aux,
             min_C=float(MID_QC_C_FLOOR), min_n_genes=2,
             threshold=PMI_THR, metric="pmi", unassigned_id="-1",
+            real_signal_threshold=REAL_SIGNAL_THRESHOLD,
         )
         mid_did_anything = True
     if mid_did_anything:
@@ -914,6 +938,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
                 mean_threshold=RESCUE_MEAN_ADMIT,
                 min_admit_threshold=RESCUE_MIN_ADMIT,
                 small_entity_guard_n=0,
+                real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+                aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
             )
             if n_pass_rescued == 0:
                 break
@@ -955,6 +981,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
         mean_threshold=RESCUE_MEAN_ADMIT,
         min_admit_threshold=RESCUE_MIN_ADMIT,
         small_entity_guard_n=0,
+        real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+        aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
@@ -1046,6 +1074,7 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
             df_grouped, entity_col="tracer_id", aux=aux,
             min_C=float(MID_QC_C_FLOOR), min_n_genes=2,
             threshold=PMI_THR, metric="pmi", unassigned_id="-1",
+            real_signal_threshold=REAL_SIGNAL_THRESHOLD,
         )
         mid_did_anything = True
     if mid_did_anything:
@@ -1065,6 +1094,8 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
                 mean_threshold=RESCUE_MEAN_ADMIT,
                 min_admit_threshold=RESCUE_MIN_ADMIT,
                 small_entity_guard_n=0,
+                real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+                aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
             )
             if n_pass_rescued == 0:
                 break
@@ -1104,6 +1135,8 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         mean_threshold=RESCUE_MEAN_ADMIT,
         min_admit_threshold=RESCUE_MIN_ADMIT,
         small_entity_guard_n=0,
+        real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+        aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 

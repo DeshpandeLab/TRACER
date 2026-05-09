@@ -614,12 +614,19 @@ def coherence_count_kernel(
     cnp.ndarray[cnp.int32_t, ndim=1] gene_ids,
     cnp.ndarray[cnp.float32_t, ndim=2] W,
     double threshold,
+    double real_signal_threshold = 0.0,
 ):
     """Count-mode coherence in pure C. Returns (C, purity, conflict).
 
     Equivalent to coherence(gene_ids, W, mode='count', threshold=...)
     in stitching.py — single C loop over the upper-triangular gene-pair
     submatrix, no numpy intermediates. ~5-10× faster per call.
+
+    When ``real_signal_threshold > 0``, pairs with
+    ``|W[i,j]| <= real_signal_threshold`` are excluded from BOTH
+    numerator and denominator (the "real players" gate; see
+    ``coherence_count_per_entity_batch`` for full semantics).
+    Default 0.0 preserves legacy ``n_finite``-denominator behaviour.
     """
     cdef int k = gene_ids.shape[0]
     if k < 2:
@@ -630,8 +637,12 @@ def coherence_count_kernel(
     cdef int n_above = 0
     cdef int n_below = 0
     cdef int n_finite = 0
-    cdef float v
+    cdef int n_real_signal = 0
+    cdef int denom
+    cdef float v, av
     cdef double neg_thr = -threshold
+    cdef double rs_thr = real_signal_threshold
+    cdef int rs_active = 1 if rs_thr > 0.0 else 0
     cdef double purity, conflict
     for i in range(k):
         gi = g_mv[i]
@@ -641,14 +652,20 @@ def coherence_count_kernel(
             if v != v:  # NaN
                 continue
             n_finite += 1
+            if rs_active:
+                av = v if v >= 0 else -v
+                if av <= rs_thr:
+                    continue
+                n_real_signal += 1
             if v > threshold:
                 n_above += 1
             elif v < neg_thr:
                 n_below += 1
-    if n_finite == 0:
+    denom = n_real_signal if rs_active else n_finite
+    if denom == 0:
         return 0.0, 0.0, 0.0
-    purity = <double> n_above / n_finite
-    conflict = <double> n_below / n_finite
+    purity = <double> n_above / denom
+    conflict = <double> n_below / denom
     return (purity - conflict), purity, conflict
 
 
@@ -656,11 +673,20 @@ def coherence_count_primitives(
     cnp.ndarray[cnp.int32_t, ndim=1] gene_ids,
     cnp.ndarray[cnp.float32_t, ndim=2] W,
     double threshold,
+    double real_signal_threshold = 0.0,
 ):
     """Like `coherence_count_kernel` but returns the raw counts
-    (n_above, n_below, n_finite) instead of (C, purity, conflict).
+    (n_above, n_below, n_denom) instead of (C, purity, conflict).
     Used by the decomposable-coherence Stitch path for primitive-sum
-    arithmetic across merges."""
+    arithmetic across merges.
+
+    When ``real_signal_threshold > 0``, the third element is
+    ``n_real_signal`` (count of pairs above the noise floor) rather
+    than ``n_finite``. The sum-of-primitives identity used in
+    Stitch's union-coherence composition still holds: a pair excluded
+    from numerator AND denominator stays excluded after summing
+    self/cross primitives.
+    """
     cdef int k = gene_ids.shape[0]
     if k < 2:
         return 0, 0, 0
@@ -670,8 +696,11 @@ def coherence_count_primitives(
     cdef int n_above = 0
     cdef int n_below = 0
     cdef int n_finite = 0
-    cdef float v
+    cdef int n_real_signal = 0
+    cdef float v, av
     cdef double neg_thr = -threshold
+    cdef double rs_thr = real_signal_threshold
+    cdef int rs_active = 1 if rs_thr > 0.0 else 0
     for i in range(k):
         gi = g_mv[i]
         for j in range(i + 1, k):
@@ -680,11 +709,16 @@ def coherence_count_primitives(
             if v != v:  # NaN
                 continue
             n_finite += 1
+            if rs_active:
+                av = v if v >= 0 else -v
+                if av <= rs_thr:
+                    continue
+                n_real_signal += 1
             if v > threshold:
                 n_above += 1
             elif v < neg_thr:
                 n_below += 1
-    return n_above, n_below, n_finite
+    return n_above, n_below, (n_real_signal if rs_active else n_finite)
 
 
 def coherence_count_per_entity_batch(
@@ -692,6 +726,7 @@ def coherence_count_per_entity_batch(
     cnp.ndarray[cnp.int32_t, ndim=1] ent_genes,
     cnp.ndarray[cnp.float32_t, ndim=2] W,
     double threshold,
+    double real_signal_threshold = 0.0,
 ):
     """Count-mode coherence for many entities in one C-level batch.
 
@@ -709,6 +744,20 @@ def coherence_count_per_entity_batch(
     threshold : double
         Count cutoff. Pairs with |W[i,j]| > threshold count as
         purity (positive) or conflict (negative).
+    real_signal_threshold : double, default 0.0
+        Noise floor for the "real players" gate. Pairs with
+        ``|W[i,j]| <= real_signal_threshold`` are excluded from BOTH
+        the numerator AND the denominator — they are treated as
+        "not a real player" (NaN, sparse-implicit zero, tight_null,
+        and dead_zone all collapse to the same bucket). When
+        ``real_signal_threshold == 0.0`` (legacy default), the
+        denominator is ``n_finite`` (all non-NaN pairs), preserving
+        backward-compatible behaviour. When > 0, the denominator
+        is ``n_real_signal`` and ``C`` reflects the (signed)
+        majority direction among pairs that actually carry
+        information — making coherence panel-shape-agnostic
+        across dense (legacy) and sparse (bootstrap, Visium HD)
+        W matrices.
 
     Returns
     -------
@@ -734,9 +783,11 @@ def coherence_count_per_entity_batch(
     cdef cnp.float32_t[:] N_mv = N_out
 
     cdef int e, lo, hi, i, j, gi, gj, n_genes
-    cdef int n_above, n_below, n_finite
-    cdef float v
+    cdef int n_above, n_below, n_finite, n_real_signal, denom
+    cdef float v, av
     cdef double neg_thr = -threshold
+    cdef double rs_thr = real_signal_threshold
+    cdef int rs_active = 1 if rs_thr > 0.0 else 0
 
     for e in range(n_ents):
         lo = off_mv[e]
@@ -748,6 +799,7 @@ def coherence_count_per_entity_batch(
         n_above = 0
         n_below = 0
         n_finite = 0
+        n_real_signal = 0
         for i in range(lo, hi):
             gi = g_mv[i]
             for j in range(i + 1, hi):
@@ -756,14 +808,21 @@ def coherence_count_per_entity_batch(
                 if v != v:  # NaN
                     continue
                 n_finite += 1
+                if rs_active:
+                    av = v if v >= 0 else -v
+                    if av <= rs_thr:
+                        # Not a real player — skip from both num and denom.
+                        continue
+                    n_real_signal += 1
                 if v > threshold:
                     n_above += 1
                 elif v < neg_thr:
                     n_below += 1
-        if n_finite == 0:
+        denom = n_real_signal if rs_active else n_finite
+        if denom == 0:
             continue
-        P_mv[e] = (<float> n_above) / n_finite
-        N_mv[e] = (<float> n_below) / n_finite
+        P_mv[e] = (<float> n_above) / denom
+        N_mv[e] = (<float> n_below) / denom
         C_mv[e] = P_mv[e] - N_mv[e]
 
     return C_out, P_out, N_out
@@ -774,10 +833,11 @@ def coherence_cross_primitives(
     cnp.ndarray[cnp.int32_t, ndim=1] gene_ids_b,
     cnp.ndarray[cnp.float32_t, ndim=2] W,
     double threshold,
+    double real_signal_threshold = 0.0,
 ):
     """Cross-set primitives: count of (g_a, g_b) pairs with g_a in
     gene_ids_a, g_b in gene_ids_b, g_a != g_b, where W[g_a, g_b] is
-    above/below threshold. Returns (n_above, n_below, n_finite).
+    above/below threshold. Returns (n_above, n_below, n_denom).
 
     Used to compute coh(union) from primitives:
       coh(P ∪ Q) = (a + b + a×b - common_internal_double_count) / ...
@@ -787,6 +847,12 @@ def coherence_cross_primitives(
     the simple-sum semantics. For overlap-aware union, decompose
     P ∪ Q = (P\Q) ∪ (Q\P) ∪ (P∩Q) into 3 disjoint segments and call
     this kernel pairwise.
+
+    When ``real_signal_threshold > 0``, the third element is
+    ``n_real_signal`` (count of cross pairs with ``|W|`` above the
+    noise floor) rather than ``n_finite``. Pass the SAME
+    ``real_signal_threshold`` to all self/cross primitive calls in
+    a Stitch union to keep the primitive-sum arithmetic consistent.
     """
     cdef int ka = gene_ids_a.shape[0]
     cdef int kb = gene_ids_b.shape[0]
@@ -799,8 +865,11 @@ def coherence_cross_primitives(
     cdef int n_above = 0
     cdef int n_below = 0
     cdef int n_finite = 0
-    cdef float v
+    cdef int n_real_signal = 0
+    cdef float v, av
     cdef double neg_thr = -threshold
+    cdef double rs_thr = real_signal_threshold
+    cdef int rs_active = 1 if rs_thr > 0.0 else 0
     for i in range(ka):
         gi = ga_mv[i]
         for j in range(kb):
@@ -811,11 +880,51 @@ def coherence_cross_primitives(
             if v != v:
                 continue
             n_finite += 1
+            if rs_active:
+                av = v if v >= 0 else -v
+                if av <= rs_thr:
+                    continue
+                n_real_signal += 1
             if v > threshold:
                 n_above += 1
             elif v < neg_thr:
                 n_below += 1
-    return n_above, n_below, n_finite
+    return n_above, n_below, (n_real_signal if rs_active else n_finite)
+
+
+cdef inline void _insertion_sort_floats(float *buf, int n) noexcept nogil:
+    """In-place ascending insertion sort. O(n^2), fine for n ≤ ~300
+    (panel-bounded). No GIL — safe to call from any context."""
+    cdef int i, j
+    cdef float tmp
+    for i in range(1, n):
+        tmp = buf[i]
+        j = i - 1
+        while j >= 0 and buf[j] > tmp:
+            buf[j + 1] = buf[j]
+            j -= 1
+        buf[j + 1] = tmp
+
+
+cdef inline double _percentile_sorted(float *sorted_buf, int n, double p) noexcept nogil:
+    """Linear-interpolated percentile of an ascending-sorted buffer.
+    Matches numpy.percentile(..., interpolation='linear') semantics.
+    p in [0, 100]."""
+    cdef double idx, frac
+    cdef int lo, hi
+    if n <= 0:
+        return 0.0
+    if n == 1:
+        return sorted_buf[0]
+    idx = (p / 100.0) * (n - 1)
+    lo = <int> idx
+    if lo < 0:
+        lo = 0
+    hi = lo + 1
+    if hi >= n:
+        return sorted_buf[lo]
+    frac = idx - lo
+    return sorted_buf[lo] * (1.0 - frac) + sorted_buf[hi] * frac
 
 
 def rescue_per_tx_batch(
@@ -835,6 +944,8 @@ def rescue_per_tx_batch(
     int small_entity_guard_n,
     double neg_npmi_threshold,
     double min_admit_threshold = 0.0,                     # hybrid: min-PMI fast-pass cutoff
+    double real_signal_threshold = 0.0,                   # noise floor; >0 enables real-players gate
+    double aggregator_percentile = 50.0,                  # percentile of real-signal pmis (real-players gate)
 ):
     """Per-unassigned-tx Rescue batch.
 
@@ -842,6 +953,16 @@ def rescue_per_tx_batch(
     `spatial.py`) — one C-level pass over all unassigned tx, bin-gated
     candidate gathering, veto check (min OR mean), nearest-candidate-tx
     distance pick.
+
+    The "real players" gate (``real_signal_threshold > 0``) replaces
+    the legacy mean-of-finite veto with a percentile of pairs whose
+    ``|PMI| > real_signal_threshold``. Pairs in the noise band collapse
+    with NaNs and explicit-zeros into a single "not informative"
+    bucket. Active in BOTH ``mean`` and ``hybrid`` modes when
+    ``real_signal_threshold > 0``; falls back to legacy logic when 0.
+    ``aggregator_percentile`` (default 50 = median) tunes
+    strict↔liberal — lower demands more pairs above ``mean_threshold``,
+    higher tolerates a longer left tail.
 
     Returns
     -------
@@ -888,148 +1009,233 @@ def rescue_per_tx_batch(
     cdef cnp.int32_t[:] gen_mv = cache_gen
     cdef int current_gen = 0
 
+    # Real-players gate state. Buffer sized to max entity gene count
+    # (bounded by panel size). Heap-allocated once; reused across all
+    # entity decisions in this batch.
+    cdef int rs_active = 1 if real_signal_threshold > 0.0 else 0
+    cdef double rs_thr = real_signal_threshold
+    cdef double agg_p = aggregator_percentile
+    cdef int max_ent_size = 0
+    cdef int _e
+    cdef int _ent_size
+    if rs_active:
+        for _e in range(n_ent):
+            _ent_size = ent_gene_offsets[_e + 1] - ent_gene_offsets[_e]
+            if _ent_size > max_ent_size:
+                max_ent_size = _ent_size
+        if max_ent_size < 1:
+            max_ent_size = 1
+    cdef float *pmi_buf = <float*> malloc(<size_t>(max_ent_size if rs_active else 1) * sizeof(float))
+    if pmi_buf == NULL:
+        raise MemoryError("rescue_per_tx_batch: failed to allocate pmi_buf")
+
     cdef int i, j, b, off_lo, off_hi, ass_li, ent
     cdef int e_off_lo, e_off_hi, n_ent_genes, ig, eg
     cdef int g_idx, vetoed, any_vetoed, found_neg, n_finite, used_fallback
     cdef int g_in_E
+    cdef int n_signal
+    cdef float v_f, av_f, min_signal_f
     cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p, min_pmi
+    cdef double p_aggregate
 
-    for i in range(n_una):
-        current_gen += 1
-        g_idx = <int> una_g_mv[i]
-        if g_idx < 0:
-            reason_mv[i] = 1
-            continue
-
-        best_d = 1e300
-        best_ent_mv[i] = -1
-        any_vetoed = 0
-        used_fallback = 0
-
-        for j in range(9):
-            b = <int> nb_bins_mv[i, j]
-            if b < 0 or b >= max_bin_key_plus_one:
+    try:
+        for i in range(n_una):
+            current_gen += 1
+            g_idx = <int> una_g_mv[i]
+            if g_idx < 0:
+                reason_mv[i] = 1
                 continue
-            off_lo = <int> bin_off_mv[b]
-            off_hi = <int> bin_off_mv[b + 1]
-            for k in range(off_lo, off_hi):
-                ass_li = <int> bin_data_mv[k]
-                # z-bound filter
-                if has_z:
-                    dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
-                    if dz < 0: dz = -dz
-                    if dz > z_bound:
-                        continue
 
-                ent = ass_ent_mv[ass_li]
-                if ent < 0 or ent >= n_ent:
+            best_d = 1e300
+            best_ent_mv[i] = -1
+            any_vetoed = 0
+            used_fallback = 0
+
+            for j in range(9):
+                b = <int> nb_bins_mv[i, j]
+                if b < 0 or b >= max_bin_key_plus_one:
                     continue
+                off_lo = <int> bin_off_mv[b]
+                off_hi = <int> bin_off_mv[b + 1]
+                for k in range(off_lo, off_hi):
+                    ass_li = <int> bin_data_mv[k]
+                    # z-bound filter
+                    if has_z:
+                        dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
+                        if dz < 0: dz = -dz
+                        if dz > z_bound:
+                            continue
 
-                # Cache check
-                if gen_mv[ent] == current_gen:
-                    if cache_mv[ent] == 1:
+                    ent = ass_ent_mv[ass_li]
+                    if ent < 0 or ent >= n_ent:
                         continue
-                    # else cache_mv[ent] == 2 → OK; fall through
-                else:
-                    # Compute veto for this entity (this tx).
-                    e_off_lo = ent_off_mv[ent]
-                    e_off_hi = ent_off_mv[ent + 1]
-                    n_ent_genes = e_off_hi - e_off_lo
-                    vetoed = 0
 
-                    if n_ent_genes == 0:
-                        vetoed = 0
-                    elif veto_mode == 0:
-                        # min-mode: any entity gene with W[g, eg] < neg_thr → veto
-                        for ig in range(e_off_lo, e_off_hi):
-                            eg = ent_g_mv[ig]
-                            if eg == g_idx:
-                                continue
-                            if W_mv[g_idx, eg] < neg_npmi_threshold:
-                                vetoed = 1
-                                break
-                    elif veto_mode == 1:
-                        # mean-mode
-                        pmi_sum = 0.0
-                        n_finite = 0
-                        found_neg = 0
-                        for ig in range(e_off_lo, e_off_hi):
-                            eg = ent_g_mv[ig]
-                            if eg == g_idx:
-                                continue
-                            pmi_val = W_mv[g_idx, eg]
-                            if pmi_val == pmi_val:  # not NaN
-                                pmi_sum += pmi_val
-                                n_finite += 1
-                                if pmi_val < neg_npmi_threshold:
-                                    found_neg = 1
-                        if n_finite < small_entity_guard_n:
-                            # fall back to min-mode
-                            vetoed = found_neg
-                            if not found_neg and n_finite > 0:
-                                used_fallback += 1
-                        elif n_finite == 0:
-                            vetoed = 1
-                        else:
-                            mean_p = pmi_sum / n_finite
-                            vetoed = 1 if mean_p <= mean_threshold else 0
+                    # Cache check
+                    if gen_mv[ent] == current_gen:
+                        if cache_mv[ent] == 1:
+                            continue
+                        # else cache_mv[ent] == 2 → OK; fall through
                     else:
-                        # hybrid mode (veto_mode == 2):
-                        #   if g ∈ E.genes → admit (no test).
-                        #   else if min PMI(g, E\{g}) > min_admit_threshold → admit.
-                        #   else if mean PMI(g, E\{g}, finite) > mean_threshold → admit.
-                        #   else → veto.
-                        g_in_E = 0
-                        for ig in range(e_off_lo, e_off_hi):
-                            if ent_g_mv[ig] == g_idx:
-                                g_in_E = 1
-                                break
-                        if g_in_E:
+                        # Compute veto for this entity (this tx).
+                        e_off_lo = ent_off_mv[ent]
+                        e_off_hi = ent_off_mv[ent + 1]
+                        n_ent_genes = e_off_hi - e_off_lo
+                        vetoed = 0
+
+                        if n_ent_genes == 0:
                             vetoed = 0
-                        else:
-                            pmi_sum = 0.0
-                            n_finite = 0
-                            min_pmi = 1e300
+                        elif veto_mode == 0:
+                            # min-mode: any entity gene with W[g, eg] < neg_thr → veto
                             for ig in range(e_off_lo, e_off_hi):
                                 eg = ent_g_mv[ig]
-                                pmi_val = W_mv[g_idx, eg]
-                                if pmi_val == pmi_val:  # not NaN
-                                    pmi_sum += pmi_val
-                                    n_finite += 1
-                                    if pmi_val < min_pmi:
-                                        min_pmi = pmi_val
-                            if n_finite == 0:
-                                vetoed = 1
-                            elif min_pmi > min_admit_threshold:
-                                vetoed = 0  # unanimous-positive fast-pass
-                            elif pmi_sum / n_finite > mean_threshold:
-                                vetoed = 0  # aggregate-positive slow-pass
+                                if eg == g_idx:
+                                    continue
+                                if W_mv[g_idx, eg] < neg_npmi_threshold:
+                                    vetoed = 1
+                                    break
+                        elif veto_mode == 1:
+                            # mean-mode
+                            if rs_active:
+                                # Real-players gate: collect pairs with
+                                # |PMI| > rs_thr; veto if percentile-aggregate
+                                # ≤ mean_threshold. Defers to spatial when
+                                # no real-signal pairs (n_signal == 0).
+                                n_signal = 0
+                                for ig in range(e_off_lo, e_off_hi):
+                                    eg = ent_g_mv[ig]
+                                    if eg == g_idx:
+                                        continue
+                                    v_f = W_mv[g_idx, eg]
+                                    if v_f != v_f:  # NaN
+                                        continue
+                                    av_f = v_f if v_f >= 0.0 else -v_f
+                                    if av_f <= rs_thr:
+                                        continue
+                                    pmi_buf[n_signal] = v_f
+                                    n_signal += 1
+                                if n_signal == 0:
+                                    vetoed = 0  # defer to spatial
+                                else:
+                                    _insertion_sort_floats(pmi_buf, n_signal)
+                                    p_aggregate = _percentile_sorted(
+                                        pmi_buf, n_signal, agg_p
+                                    )
+                                    vetoed = 1 if p_aggregate <= mean_threshold else 0
                             else:
-                                vetoed = 1
+                                # Legacy mean-of-finite path (back-compat).
+                                pmi_sum = 0.0
+                                n_finite = 0
+                                found_neg = 0
+                                for ig in range(e_off_lo, e_off_hi):
+                                    eg = ent_g_mv[ig]
+                                    if eg == g_idx:
+                                        continue
+                                    pmi_val = W_mv[g_idx, eg]
+                                    if pmi_val == pmi_val:  # not NaN
+                                        pmi_sum += pmi_val
+                                        n_finite += 1
+                                        if pmi_val < neg_npmi_threshold:
+                                            found_neg = 1
+                                if n_finite < small_entity_guard_n:
+                                    # fall back to min-mode
+                                    vetoed = found_neg
+                                    if not found_neg and n_finite > 0:
+                                        used_fallback += 1
+                                elif n_finite == 0:
+                                    vetoed = 1
+                                else:
+                                    mean_p = pmi_sum / n_finite
+                                    vetoed = 1 if mean_p <= mean_threshold else 0
+                        else:
+                            # hybrid mode (veto_mode == 2):
+                            #   if g ∈ E.genes → admit (no test).
+                            #   else if min PMI(g, E\{g}) > min_admit_threshold → admit.
+                            #   else if percentile-aggregate of real-signal
+                            #         (or mean if rs_active==0) > mean_threshold → admit.
+                            #   else → veto.
+                            g_in_E = 0
+                            for ig in range(e_off_lo, e_off_hi):
+                                if ent_g_mv[ig] == g_idx:
+                                    g_in_E = 1
+                                    break
+                            if g_in_E:
+                                vetoed = 0
+                            else:
+                                if rs_active:
+                                    # Real-players gate (parallel to mean
+                                    # branch above), but with hybrid's
+                                    # unanimous-strong fast-pass on top.
+                                    n_signal = 0
+                                    min_signal_f = 1e30
+                                    for ig in range(e_off_lo, e_off_hi):
+                                        eg = ent_g_mv[ig]
+                                        v_f = W_mv[g_idx, eg]
+                                        if v_f != v_f:  # NaN
+                                            continue
+                                        av_f = v_f if v_f >= 0.0 else -v_f
+                                        if av_f <= rs_thr:
+                                            continue
+                                        pmi_buf[n_signal] = v_f
+                                        if v_f < min_signal_f:
+                                            min_signal_f = v_f
+                                        n_signal += 1
+                                    if n_signal == 0:
+                                        vetoed = 0  # defer to spatial
+                                    elif min_signal_f > min_admit_threshold:
+                                        vetoed = 0  # unanimous-strong fast-pass
+                                    else:
+                                        _insertion_sort_floats(pmi_buf, n_signal)
+                                        p_aggregate = _percentile_sorted(
+                                            pmi_buf, n_signal, agg_p
+                                        )
+                                        vetoed = 1 if p_aggregate <= mean_threshold else 0
+                                else:
+                                    # Legacy mean-of-finite hybrid (back-compat).
+                                    pmi_sum = 0.0
+                                    n_finite = 0
+                                    min_pmi = 1e300
+                                    for ig in range(e_off_lo, e_off_hi):
+                                        eg = ent_g_mv[ig]
+                                        pmi_val = W_mv[g_idx, eg]
+                                        if pmi_val == pmi_val:  # not NaN
+                                            pmi_sum += pmi_val
+                                            n_finite += 1
+                                            if pmi_val < min_pmi:
+                                                min_pmi = pmi_val
+                                    if n_finite == 0:
+                                        vetoed = 1
+                                    elif min_pmi > min_admit_threshold:
+                                        vetoed = 0  # unanimous-positive fast-pass
+                                    elif pmi_sum / n_finite > mean_threshold:
+                                        vetoed = 0  # aggregate-positive slow-pass
+                                    else:
+                                        vetoed = 1
 
-                    cache_mv[ent] = 1 if vetoed else 2
-                    gen_mv[ent] = current_gen
+                        cache_mv[ent] = 1 if vetoed else 2
+                        gen_mv[ent] = current_gen
 
-                if cache_mv[ent] == 1:
-                    any_vetoed = 1
-                    continue
+                    if cache_mv[ent] == 1:
+                        any_vetoed = 1
+                        continue
 
-                # Distance (squared; final sqrt at write-out)
-                dx = ass_c_mv[ass_li, 0] - una_c_mv[i, 0]
-                dy = ass_c_mv[ass_li, 1] - una_c_mv[i, 1]
-                d = dx * dx + dy * dy
-                if has_z:
-                    dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
-                    d += dz * dz
-                if d < best_d:
-                    best_d = d
-                    best_ent_mv[i] = ent
+                    # Distance (squared; final sqrt at write-out)
+                    dx = ass_c_mv[ass_li, 0] - una_c_mv[i, 0]
+                    dy = ass_c_mv[ass_li, 1] - una_c_mv[i, 1]
+                    d = dx * dx + dy * dy
+                    if has_z:
+                        dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
+                        d += dz * dz
+                    if d < best_d:
+                        best_d = d
+                        best_ent_mv[i] = ent
 
-        if best_ent_mv[i] == -1:
-            reason_mv[i] = 2 if any_vetoed else 1
-        else:
-            best_dist_mv[i] = <cnp.float32_t> (best_d ** 0.5)
-        sef_mv[i] = used_fallback
+            if best_ent_mv[i] == -1:
+                reason_mv[i] = 2 if any_vetoed else 1
+            else:
+                best_dist_mv[i] = <cnp.float32_t> (best_d ** 0.5)
+            sef_mv[i] = used_fallback
+    finally:
+        free(pmi_buf)
 
     return best_ent_arr, best_dist_arr, reason_arr, sef_arr
 
