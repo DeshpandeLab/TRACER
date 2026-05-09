@@ -120,6 +120,100 @@ class RescueConfig:
 # kwargs at the call site.
 
 
+@dataclass(frozen=True)
+class BootstrapConfig:
+    """`compute_npmi_bootstrap` config-recommended defaults.
+
+    These are the flavor-C "production" settings (PMI metric, per-gene
+    size-band filter, dual-tau, set_neg_one). The function's own Python
+    signature defaults stay backward-compatible (legacy NPMI, no
+    per-gene filter) for callers that don't go through the config — but
+    callers using `load_config()` get the recommended settings. The
+    `tests/test_config.py::test_defaults_toml_matches_dataclass_defaults`
+    test enforces lockstep with `configs/defaults.toml`.
+
+    Platform presets (e.g. `xenium.toml`) layer on top of these to add
+    platform-specific knobs that depend on column availability (e.g.
+    `nuclear_only=true` requires `overlaps_nucleus`).
+    """
+    # Pre-filter pipeline
+    nuclear_only: bool = False                  # platform-only (needs overlaps_nucleus column)
+    nucleus_col: str = "overlaps_nucleus"
+    percentile_filter: tuple[float, float] | None = None       # global percentile is biased; off
+    per_gene_percentile_filter: tuple[float, float] | None = (5.0, 95.0)  # ← flavor-C default
+    memory_optimize: bool = True
+    # Bootstrap engine
+    metric: Literal["pmi", "npmi"] = "pmi"      # ← flavor-C default (was npmi)
+    tau_low: float = 0.05
+    tau_high: float = 0.20                      # ← flavor-C dual-tau default (was single 0.05)
+    alpha: float = 0.1
+    ci_level: float = 0.95
+    max_bootstraps: int = 10_000
+    coarse_block: int = 200
+    refine_block: int = 500
+    min_samples_for_ci: int = 30
+    subsample_size: int | None = 25_000         # ← flavor-C default (was None / full pop)
+    # Evidence gates
+    min_occurrences_per_context: int = 2
+    min_expected_cooccur_for_evidence: float = 10.0
+    # When None → falls back to min_expected_cooccur_for_evidence (legacy
+    # behavior: same threshold gates evidence and bootstrap eligibility).
+    # Set explicitly to control how rare-cooccurrence pairs are routed:
+    #   higher value → more pairs sent to legacy_only (no bootstrap CI)
+    #   0.0          → bootstrap every high-evidence pair (wide CIs for sparse)
+    min_expected_cooccur_for_bootstrap: float | None = 10.0  # ← flavor-C default (explicit; None → fall back to evidence threshold)
+    # When True, k=0 pairs with E_full ≥ min_expected_cooccur_for_evidence
+    # are classified as `neg_one` (mutual-exclusion sentinel; W = -1 for
+    # NPMI metric, W = -log(E_full) for PMI). When False, those pairs
+    # are classified as `indeterminate` and left absent from W. Matches
+    # the legacy compute_npmi `set_neg_one` semantics, but the gate uses
+    # E_full (not marginal probability).
+    set_neg_one: bool = True
+
+    def __post_init__(self) -> None:
+        # Coerce TOML lists → tuples for frozen-dataclass hashability.
+        for fname in ("percentile_filter", "per_gene_percentile_filter"):
+            v = getattr(self, fname)
+            if isinstance(v, list):
+                object.__setattr__(self, fname, tuple(v))
+        if self.metric not in ("pmi", "npmi"):
+            raise ValueError(
+                f"bootstrap.metric must be 'pmi' or 'npmi'; got {self.metric!r}"
+            )
+        if not (0.0 <= self.tau_low <= self.tau_high):
+            raise ValueError(
+                f"bootstrap requires 0 <= tau_low <= tau_high; got "
+                f"({self.tau_low}, {self.tau_high})"
+            )
+        if not (0.0 <= self.alpha):
+            raise ValueError(f"bootstrap.alpha must be >= 0; got {self.alpha}")
+        if not (0.0 < self.ci_level < 1.0):
+            raise ValueError(
+                f"bootstrap.ci_level must be in (0, 1); got {self.ci_level}"
+            )
+        if self.percentile_filter is not None:
+            lo, hi = self.percentile_filter
+            if not (0.0 <= lo < hi <= 100.0):
+                raise ValueError(
+                    f"bootstrap.percentile_filter must satisfy 0 <= lo < hi <= 100; "
+                    f"got {self.percentile_filter}"
+                )
+        if self.per_gene_percentile_filter is not None:
+            lo, hi = self.per_gene_percentile_filter
+            if not (0.0 <= lo < hi <= 100.0):
+                raise ValueError(
+                    f"bootstrap.per_gene_percentile_filter must satisfy "
+                    f"0 <= lo < hi <= 100; got {self.per_gene_percentile_filter}"
+                )
+
+    @property
+    def tau(self) -> float | tuple[float, float]:
+        """Convenience: returns tau as the function expects it."""
+        if self.tau_low == self.tau_high:
+            return self.tau_low
+        return (self.tau_low, self.tau_high)
+
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -138,6 +232,7 @@ class PipelineConfig:
     final_rescue: RescueConfig = field(
         default_factory=lambda: RescueConfig(small_entity_guard_n=0)
     )
+    bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +249,7 @@ _SECTION_TO_CLS: dict[str, type] = {
     "phase1_qc": Phase1QcConfig,
     "rescue": RescueConfig,
     "final_rescue": RescueConfig,
+    "bootstrap": BootstrapConfig,
 }
 
 
@@ -276,9 +372,24 @@ def load_config(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_for_json(obj: Any) -> Any:
+    """Recursively coerce tuples → lists so JSON roundtrip is symmetric.
+    asdict() preserves tuples, but json.dumps converts them to lists;
+    without this normalization, `loaded == asdict(cfg)` after a roundtrip
+    fails on any tuple-typed field."""
+    if isinstance(obj, dict):
+        return {k: _normalize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_for_json(v) for v in obj]
+    return obj
+
+
 def to_dict(cfg: PipelineConfig) -> dict[str, Any]:
-    """Recursively convert a PipelineConfig to a plain nested dict."""
-    return asdict(cfg)
+    """Recursively convert a PipelineConfig to a plain nested dict.
+    Tuples are normalized to lists so the dict round-trips through JSON
+    cleanly (`json.dumps` converts tuples → lists, and the loaded form
+    must compare equal to this dict)."""
+    return _normalize_for_json(asdict(cfg))
 
 
 def dump_receipt(cfg: PipelineConfig, path: str | Path) -> None:

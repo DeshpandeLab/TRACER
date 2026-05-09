@@ -119,3 +119,41 @@ inherit = "rescue"
 # Stricter than main Rescue: no fallback-to-min for small entities.
 # (Already 0 in [rescue], explicit here for documentation.)
 small_entity_guard_n = 0
+
+
+# ---------------------------------------------------------------------
+# Bootstrap — `compute_npmi_bootstrap` PMI/NPMI panel builder.
+# Defaults are the flavor-C "production" settings: PMI metric, per-gene
+# size-band filter, dual-tau, subsample bootstrap. The function's own
+# Python signature defaults stay backward-compatible (legacy NPMI, no
+# per-gene filter) so existing callers without explicit kwargs don't
+# break — but config-driven callers via `load_config()` get these.
+#
+# Platform presets (e.g. xenium.toml) layer column-dependent knobs on
+# top (e.g. `nuclear_only=true` requires `overlaps_nucleus` to exist).
+# ---------------------------------------------------------------------
+[bootstrap]
+# Pre-filter pipeline
+nuclear_only = false                                # platform-only (needs overlaps_nucleus)
+nucleus_col = "overlaps_nucleus"
+# percentile_filter         = [20.0, 80.0]          # global per-cell tx-count band; None = off
+per_gene_percentile_filter = [5.0, 95.0]            # per-gene size-band admittance — flavor-C
+memory_optimize = true
+
+# Bootstrap engine
+metric = "pmi"                                       # flavor-C: PMI for direct interpretability
+tau_low = 0.05
+tau_high = 0.20                                      # flavor-C dual-tau (pos_strong / pos_weak split)
+alpha = 0.1                                          # Beta(α, α) Jeffreys-style smoothing
+ci_level = 0.95
+max_bootstraps = 10000
+coarse_block = 200
+refine_block = 500
+min_samples_for_ci = 30
+subsample_size = 25000                               # flavor-C: 25k subsample (vs full pop)
+
+# Evidence gates
+min_occurrences_per_context = 2
+min_expected_cooccur_for_evidence = 10.0
+min_expected_cooccur_for_bootstrap = 10.0            # flavor-C: explicit (= evidence threshold)
+set_neg_one = true                                   # k=0 + E_full≥thr → neg_one sentinel

@@ -189,8 +189,10 @@ def test_receipt_roundtrip(tmp_path: Path):
     # unchanged sections still present
     assert loaded["phase1_qc"]["min_tx"] == 3
 
-    # And the dict matches asdict(cfg) by value
-    assert loaded == asdict(cfg)
+    # And the loaded dict matches to_dict(cfg) by value (to_dict
+    # normalizes tuples → lists so JSON round-trip is lossless).
+    from tracer.config import to_dict
+    assert loaded == to_dict(cfg)
 
 
 # --------------------------------------------------------------------------
