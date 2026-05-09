@@ -287,27 +287,27 @@ def _build_presence_matrix(
     function and the legacy single-pass function share the same gene /
     context vocabulary semantics.
     """
+    # Skip redundant astype(str) when input is already categorical or object
+    # — those are the two dtypes the caller will hand us (categorical from
+    # the memory_optimize path; object from raw load). Both work directly
+    # with groupby + pd.Categorical without an intermediate string cast.
+    # int/float-valued group keys would still get auto-stringified by
+    # pd.Categorical's category-building, so functionality is preserved.
     if count_col is None:
         df = df_subset[[group_key, feature_col]]
-        group_series = df[group_key].astype(str)
         counts = (
-            df.assign(_grp=group_series)
-              .groupby(["_grp", feature_col])
+            df.groupby([group_key, feature_col], observed=True, sort=False)
               .size()
               .rename("gene_count")
               .reset_index()
-              .rename(columns={"_grp": group_key})
         )
     else:
         df = df_subset[[group_key, feature_col, count_col]]
-        group_series = df[group_key].astype(str)
         counts = (
-            df.assign(_grp=group_series)
-              .groupby(["_grp", feature_col])[count_col]
+            df.groupby([group_key, feature_col], observed=True, sort=False)[count_col]
               .sum()
               .rename("gene_count")
               .reset_index()
-              .rename(columns={"_grp": group_key})
         )
 
     df_filtered = counts[counts["gene_count"] >= min_occurrences_per_context]
@@ -316,42 +316,88 @@ def _build_presence_matrix(
             f"No genes pass min_occurrences_per_context={min_occurrences_per_context}."
         )
 
-    ctx_cat = pd.Categorical(df_filtered[group_key].astype(str))
-    gene_cat = pd.Categorical(df_filtered[feature_col].astype(str))
-    rows = ctx_cat.codes.astype(np.int32)
-    cols = gene_cat.codes.astype(np.int32)
+    # Use pd.factorize (not pd.Categorical) so the codes/categories are
+    # derived strictly from VALUES PRESENT in `df_filtered`. If the input
+    # column was already categorical (memory_optimize=True path), the
+    # categorical's category dictionary may carry stale labels for cells
+    # whose (cell, gene) rows were just dropped by the
+    # `>= min_occurrences_per_context` filter — `pd.Categorical(cat_series)`
+    # would preserve those, inflating C and breaking population statistics
+    # like `expected_full = k_i*k_j / C` (→ false `indeterminate` vs
+    # `neg_one` classifications). `pd.factorize` always reflects only
+    # observed values, so memON and memOFF agree on M and downstream stats.
+    rows_codes, contexts = pd.factorize(df_filtered[group_key], sort=True)
+    cols_codes, genes = pd.factorize(df_filtered[feature_col], sort=True)
+    rows = rows_codes.astype(np.int32)
+    cols = cols_codes.astype(np.int32)
+    contexts = np.asarray(contexts)
+    genes = np.asarray(genes)
     # int32 for the binary presence values: M.T @ M sums these along the
     # dot product, so a pair cooccurring in >127 cells would overflow int8
     # and end up encoded as 0 (excluded from the sparse cooccurrence
     # matrix). int32 is safe for any realistic cell count.
     vals = np.ones(len(rows), dtype=np.int32)
-    contexts = ctx_cat.categories.to_numpy()
-    genes = gene_cat.categories.to_numpy()
     M = sp.coo_matrix(
         (vals, (rows, cols)), shape=(len(contexts), len(genes))
     ).tocsr()
     M.data = np.ones_like(M.data, dtype=np.int32)  # binarise
-    return M, genes
+    return M, genes, contexts
 
 
 def _bootstrap_npmi_for_pairs(
     M_sample: sp.csr_matrix,
     pairs_i: np.ndarray,
     pairs_j: np.ndarray,
+    alpha: float = 0.0,
+    metric: str = "npmi",
 ):
-    """Vectorized NPMI for the given upper-triangle pair list on a
-    bootstrap-sampled presence matrix.
+    """Vectorized PMI or NPMI for the given upper-triangle pair list on
+    a bootstrap-sampled presence matrix.
 
-    Returns a 1D float64 array of length ``len(pairs_i)``. Entries with
-    zero observed cooccurrence in this bootstrap iteration are NaN; the
-    caller is responsible for skipping those when accumulating CI
-    samples.
+    Returns a 1D float64 array of length ``len(pairs_i)`` in the
+    requested ``metric`` (``"pmi"`` = log p_ij/(p_i p_j); ``"npmi"`` =
+    PMI / -log(p_ij), bounded ±1).
+
+    Parameters
+    ----------
+    alpha : float
+        Beta(alpha, alpha) Jeffreys-style additive smoothing. ``alpha=0``
+        is the unsmoothed estimator: pairs with ``k_ij=0`` in this
+        bootstrap iteration return NaN (the caller filters these). With
+        ``alpha>0`` (e.g. 0.5 for Jeffreys), smoothed probabilities are
+        ``(k + alpha) / (N + 2 * alpha)``; every pair returns a finite
+        value (no filtering needed). Smoothing eliminates the "log of
+        zero" iter dropping, which biases the bootstrap median upward
+        (less negative) for pairs with k_ij_full=1 by removing the most-
+        negative iters from the sample.
+    metric : {"npmi", "pmi"}
+        Which scale to return. Affects per-iteration return value AND
+        therefore the downstream bootstrap median/CI. tau thresholds in
+        the parent ``compute_npmi_bootstrap`` are interpreted in this
+        same metric.
     """
+    if metric not in ("npmi", "pmi"):
+        raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
     N_b = M_sample.shape[0]
     marg = np.asarray(M_sample.sum(axis=0)).ravel().astype(np.int64)
     Mi = M_sample[:, pairs_i]
     Mj = M_sample[:, pairs_j]
     co = np.asarray(Mi.multiply(Mj).sum(axis=0)).ravel().astype(np.int64)
+
+    if alpha > 0:
+        # Jeffreys-style additive smoothing — all probabilities > 0, no
+        # filtering needed.
+        N_b_a = N_b + 2.0 * alpha
+        Pij = (co + alpha) / N_b_a
+        Pi  = (marg[pairs_i] + alpha) / N_b_a
+        Pj  = (marg[pairs_j] + alpha) / N_b_a
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.log(Pij / (Pi * Pj))
+            if metric == "pmi":
+                out = pmi
+            else:
+                out = pmi / (-np.log(Pij))
+        return out
 
     Pij = co / N_b
     Pi = marg[pairs_i] / N_b
@@ -359,10 +405,12 @@ def _bootstrap_npmi_for_pairs(
     out = np.full(co.shape[0], np.nan, dtype=np.float64)
     valid = (co > 0) & (Pi > 0) & (Pj > 0)
     if valid.any():
-        denom = Pi[valid] * Pj[valid]
         with np.errstate(divide="ignore", invalid="ignore"):
-            pmi = np.log(Pij[valid] / denom)
-            out[valid] = pmi / (-np.log(Pij[valid]))
+            pmi = np.log(Pij[valid] / (Pi[valid] * Pj[valid]))
+            if metric == "pmi":
+                out[valid] = pmi
+            else:
+                out[valid] = pmi / (-np.log(Pij[valid]))
     return out
 
 
@@ -373,7 +421,7 @@ def compute_npmi_bootstrap(
     feature_col: str = "feature_name",
     min_occurrences_per_context: int = 2,
     count_col: str | None = None,
-    tau: float = 0.05,
+    tau: float | tuple[float, float] | list = 0.05,
     ci_level: float = 0.95,
     max_bootstraps: int = 10_000,
     coarse_block: int = 200,
@@ -386,6 +434,15 @@ def compute_npmi_bootstrap(
     subsample_size: int | None = None,
     metric: str = "npmi",
     expected_cooccur_for_neg_one: float | None = None,  # deprecated alias
+    alpha: float = 0.1,
+    min_expected_cooccur_for_bootstrap: float | None = None,
+    set_neg_one: bool = True,
+    nuclear_only: bool = False,
+    nucleus_col: str = "overlaps_nucleus",
+    percentile_filter: tuple[float, float] | None = None,
+    per_gene_percentile_filter: tuple[float, float] | None = None,
+    exclude_contexts: set | list | None = None,
+    memory_optimize: bool = True,
 ) -> NpmiBootstrapResult:
     """Bootstrap NPMI over contexts (cells) with active sampling.
 
@@ -395,13 +452,38 @@ def compute_npmi_bootstrap(
     unsettled-at-budget pairs are encoded as absent (= zero) in the
     output CSR.
 
+    Early-stopping policy: only "strong" classifications (CI clearly
+    outside ±tau_high) and "tight_null" (CI clearly inside ±tau_low)
+    trigger early-stop. Weak / dead_zone classifications keep iterating
+    to budget so their CI / median are not locked in by a CI that just
+    barely crosses the lower threshold. Final classification of any
+    still-unsettled pair is done at budget exhaustion using the final CI.
+
+    Downstream ranking note: because settled-pair CI bounds cluster near
+    the threshold by construction (a pair settles the moment CI crosses
+    tau), CI bounds are biased estimates for ranking purposes. Use the
+    per-pair `median` (point estimate from the bootstrap distribution)
+    or `legacy_pmi`/`legacy_npmi` (full-data point estimates) for
+    ranking, weighting, or threshold-based discrimination. CIs are for
+    classification (is this pair above/below the threshold?), not for
+    magnitude estimation.
+
     Parameters
     ----------
     df_subset : DataFrame
         Long-format transcripts with at least ``group_key`` and
         ``feature_col`` columns. Same contract as :func:`compute_npmi`.
-    tau : float
-        Dead-zone threshold matching the downstream coherence threshold.
+    tau : float or 2-element sequence
+        Dead-zone threshold(s). If scalar, single threshold (legacy
+        behavior): pairs classified as ``pos`` (CI_lo > tau), ``neg``
+        (CI_hi < -tau), ``dead_zone`` (CI inside ±tau), or ``unsettled``.
+        If a 2-element sequence (tau_low, tau_high), the function emits
+        7 kinds: ``pos_strong`` (CI_lo > tau_high), ``pos_weak`` (tau_low
+        < CI_lo ≤ tau_high), ``neg_strong``, ``neg_weak``, ``tight_null``
+        (CI inside ±tau_low), ``dead_zone`` (CI inside ±tau_high but
+        straddles ±tau_low), ``unsettled``. The vector form lets the
+        caller separate "is this real" (tau_low) from "is this strong"
+        (tau_high) decisions.
     ci_level : float
         Confidence level for the bootstrap CI (0.95 → percentiles 2.5%
         and 97.5%).
@@ -447,9 +529,196 @@ def compute_npmi_bootstrap(
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
 
+    # ------------------------------------------------------------------
+    # Pre-filter pipeline + memory optimization.
+    # Order matters:
+    #   1. Drop excluded contexts (sentinels: "UNASSIGNED", "-1", ...) —
+    #      always applied (default set), to prevent the unassigned-pool
+    #      mega-context from poisoning the population statistics.
+    #   2. nuclear_only: restrict to nucleus-overlapping tx (Long's QC).
+    #   3. percentile_filter: drop contexts whose tx-count is outside
+    #      [percentile(low), percentile(high)] of the per-context tx
+    #      distribution. Long's defaults are (20, 80) → keep middle 60%.
+    #   4. memory_optimize: trim columns + cast group_key/feature_col to
+    #      categorical to cut peak DataFrame RSS by ~5x.
+    # The math is invariant to memory_optimize because categorical labels
+    # produce identical groupby/cooccurrence semantics as object strings.
+    # ------------------------------------------------------------------
+    _df = df_subset
+    n_in = len(_df)
+    n_dropped = {"excluded": 0, "nuclear": 0, "percentile": 0}
+
+    # Step 1: exclude sentinel contexts. Default applies even if user passes
+    # exclude_contexts=None (defensive). Pass exclude_contexts=set() to
+    # bypass the default (rare; not recommended).
+    if exclude_contexts is None:
+        excl = {"UNASSIGNED", "-1", "DROP", "nan", "None", ""}
+    else:
+        excl = set(map(str, exclude_contexts))
+    if excl:
+        _grp_str = _df[group_key].astype(str)
+        keep = ~_grp_str.isin(excl)
+        n_dropped["excluded"] = int((~keep).sum())
+        if not keep.all():
+            _df = _df.loc[keep]
+
+    # Step 2: nuclear-only filter
+    if nuclear_only:
+        if nucleus_col not in _df.columns:
+            raise ValueError(
+                f"nuclear_only=True requires column {nucleus_col!r} "
+                f"(found columns: {list(_df.columns)})"
+            )
+        _nuc = _df[nucleus_col]
+        if _nuc.dtype == bool:
+            keep = _nuc
+        else:
+            # 1/0 int, "True"/"False" str, "1.0"/"0.0" float — coerce.
+            keep = _nuc.astype(str).isin({"True", "true", "1", "1.0"}) | (
+                pd.to_numeric(_nuc, errors="coerce") == 1
+            )
+        keep = keep.fillna(False).astype(bool)
+        n_dropped["nuclear"] = int((~keep).sum())
+        if not keep.all():
+            _df = _df.loc[keep]
+
+    # Step 3: percentile filter on per-context tx-count
+    if percentile_filter is not None:
+        low_pct, high_pct = float(percentile_filter[0]), float(percentile_filter[1])
+        if not (0.0 <= low_pct < high_pct <= 100.0):
+            raise ValueError(
+                f"percentile_filter must satisfy 0 <= low < high <= 100 "
+                f"(got {percentile_filter!r})"
+            )
+        # Per-context tx-count distribution AFTER prior filters.
+        ctx_counts = _df.groupby(group_key, observed=True).size()
+        low_thr = float(np.percentile(ctx_counts.values, low_pct))
+        high_thr = float(np.percentile(ctx_counts.values, high_pct))
+        good_ctx = set(ctx_counts[(ctx_counts >= low_thr) &
+                                    (ctx_counts <= high_thr)].index.astype(str))
+        keep = _df[group_key].astype(str).isin(good_ctx)
+        n_dropped["percentile"] = int((~keep).sum())
+        if not keep.all():
+            _df = _df.loc[keep]
+
+    # Step 3b: per-gene percentile filter — INFER per-gene size bands ONLY.
+    # For each gene g, compute the per-cell total-tx distribution
+    # restricted to cells where g passes `min_occurrences_per_context`,
+    # then derive (n_min_g, n_max_g) percentile bounds from THAT
+    # distribution. Apply later (after _build_presence_matrix) as a
+    # SIZE-BASED admittance matrix `A` over the post-presence-filter
+    # cell set: A[c, g] = 1 iff cell c.total_tx ∈ [n_min_g, n_max_g],
+    # regardless of whether c expresses g.
+    #
+    # This is the (B″) framework: per-gene admittance is a property of
+    # cell SIZE (where g is biologically expected), independent of the
+    # observed presence of g. PMI for pair (i, j) is then computed under
+    # per-pair scoping: universe = cells admitted for both i AND j,
+    # marginals + cooccurrence all defined over the same pair-specific
+    # universe. This avoids the asymmetric-scoping bias of the simpler
+    # tx-level inner-join approach (which conflated admittance with
+    # presence and biased PMI for cross-cell-type pairs).
+    n_dropped["per_gene_percentile"] = 0
+    pgp_bands: dict | None = None  # gene_name -> (n_min, n_max) when active
+    pgp_cell_total: pd.Series | None = None
+    if per_gene_percentile_filter is not None:
+        pgp_lo, pgp_hi = float(per_gene_percentile_filter[0]), float(per_gene_percentile_filter[1])
+        if not (0.0 <= pgp_lo < pgp_hi <= 100.0):
+            raise ValueError(
+                f"per_gene_percentile_filter must satisfy 0 <= low < high <= 100 "
+                f"(got {per_gene_percentile_filter!r})"
+            )
+        # 1. Per-cell total tx (count of tx per cell, all genes; will be
+        #    indexed by cell-id and re-aligned to M's row order later).
+        pgp_cell_total = (_df.groupby(group_key, observed=True).size()
+                              .rename("_total_tx"))
+        # 2. Per-(cell, gene) count.
+        cg = (_df.groupby([group_key, feature_col], observed=True).size()
+                  .rename("_cg_count").reset_index())
+        # 3. Restrict to g+ cells (count >= min_occurrences_per_context).
+        cg = cg[cg["_cg_count"] >= min_occurrences_per_context]
+        if cg.empty:
+            pgp_bands = {}
+        else:
+            # 4. Join total-tx onto each g+ (cell, gene) row.
+            cg = cg.join(pgp_cell_total, on=group_key)
+            # 5. Per-gene percentile bands from g+ cells' total-tx.
+            grp = cg.groupby(feature_col, observed=True)["_total_tx"]
+            lo_per_gene = grp.quantile(pgp_lo / 100.0)
+            hi_per_gene = grp.quantile(pgp_hi / 100.0)
+            pgp_bands = {
+                str(g): (float(lo_per_gene[g]), float(hi_per_gene[g]))
+                for g in lo_per_gene.index
+            }
+        # NOTE: We do NOT inner-join _df. The size-band admittance A is
+        # constructed AFTER _build_presence_matrix so it can align with
+        # M's cell row order. n_dropped["per_gene_percentile"] stays 0
+        # at the tx level — the filter's effect is at the matmul level.
+
+    # Step 4: memory_optimize — trim to needed columns + categorical cast.
+    if memory_optimize:
+        wanted = [group_key, feature_col]
+        if count_col is not None and count_col in _df.columns:
+            wanted.append(count_col)
+        # Drop unused columns; reset_index drops the legacy positional index.
+        _df = _df[wanted].reset_index(drop=True)
+        # Categorical cast of object/string columns. Categorical-from-categorical
+        # is a no-op; categorical-from-object dedupes labels to int32 codes
+        # plus a small categories dictionary, dropping per-row overhead from
+        # ~70 bytes (object str) to 4 bytes.
+        if not isinstance(_df[group_key].dtype, pd.CategoricalDtype):
+            _df = _df.assign(**{group_key: _df[group_key].astype("category")})
+        if not isinstance(_df[feature_col].dtype, pd.CategoricalDtype):
+            _df = _df.assign(**{feature_col: _df[feature_col].astype("category")})
+
+    df_subset = _df  # downstream code uses this name
+    n_out = len(df_subset)
+    pre_filter_diag = {
+        "n_input_rows": int(n_in),
+        "n_dropped_excluded": n_dropped["excluded"],
+        "n_dropped_nuclear": n_dropped["nuclear"],
+        "n_dropped_percentile": n_dropped["percentile"],
+        "n_dropped_per_gene_percentile": n_dropped.get("per_gene_percentile", 0),
+        "n_kept_rows": int(n_out),
+        "exclude_contexts_applied": sorted(excl) if excl else [],
+        "nuclear_only": bool(nuclear_only),
+        "percentile_filter": list(percentile_filter) if percentile_filter is not None else None,
+        "per_gene_percentile_filter": (list(per_gene_percentile_filter)
+                                         if per_gene_percentile_filter is not None else None),
+        "memory_optimize": bool(memory_optimize),
+    }
+    if show_progress:
+        print(
+            f"[bootstrap_npmi] pre-filter: {n_in:,} → {n_out:,} tx "
+            f"(excluded={n_dropped['excluded']:,}, "
+            f"nuclear={n_dropped['nuclear']:,}, "
+            f"percentile={n_dropped['percentile']:,})",
+            flush=True,
+        )
+        if memory_optimize:
+            print(
+                f"[bootstrap_npmi] memory_optimize: kept {len(df_subset.columns)} cols, "
+                f"casted {group_key!r}/{feature_col!r} to categorical",
+                flush=True,
+            )
+
+    # Parse tau: accept scalar (legacy) or 2-element vector (dual threshold).
+    tau_arr = np.atleast_1d(np.asarray(tau, dtype=float))
+    if tau_arr.size == 1:
+        tau_low = tau_high = float(tau_arr[0])
+        _is_dual_tau = False
+    elif tau_arr.size == 2:
+        tau_low = float(tau_arr.min())
+        tau_high = float(tau_arr.max())
+        _is_dual_tau = (tau_low < tau_high)
+    else:
+        raise ValueError(
+            f"tau must be scalar or 2-element sequence (got shape {tau_arr.shape})"
+        )
+
     rng = np.random.default_rng(seed)
 
-    M, genes = _build_presence_matrix(
+    M, genes, contexts = _build_presence_matrix(
         df_subset,
         group_key=group_key,
         feature_col=feature_col,
@@ -458,7 +727,51 @@ def compute_npmi_bootstrap(
     )
     C, G = M.shape
 
-    # Global marginals
+    # Build size-band admittance matrix A when per_gene_percentile_filter
+    # is active. A has the same shape as M; A[c, g] = 1 iff cell c (i.e.,
+    # contexts[c]) has total_tx in gene g's [n_min_g, n_max_g] band,
+    # REGARDLESS of whether c expresses g. When A is None, downstream code
+    # treats every (cell, gene) as admitted (legacy behavior).
+    #
+    # CRITICAL: M from _build_presence_matrix is "presence only". For
+    # per-pair scoping the cooccurrence and marginal matmuls require
+    # M_admit = M_presence · A (elementwise) — i.e., admitted+present —
+    # because k_i_ij = (M_admit.T @ A)[i,j] needs cells admitted for BOTH
+    # i and j AND with i present. We replace M with M_admit below.
+    A: sp.csr_matrix | None = None
+    if pgp_bands is not None and pgp_cell_total is not None and len(pgp_bands) > 0:
+        ctx_total_tx = pgp_cell_total.reindex(contexts).to_numpy(dtype=np.int64)
+        n_min_arr = np.array([pgp_bands.get(str(g), (np.nan, np.nan))[0]
+                                for g in genes], dtype=np.float64)
+        n_max_arr = np.array([pgp_bands.get(str(g), (np.nan, np.nan))[1]
+                                for g in genes], dtype=np.float64)
+        A_dense = (
+            (ctx_total_tx[:, None] >= n_min_arr[None, :]) &
+            (ctx_total_tx[:, None] <= n_max_arr[None, :])
+        )
+        A_dense &= np.isfinite(n_min_arr[None, :])
+        A = sp.csr_matrix(A_dense.astype(np.int32))
+        # M_admit = M_presence · A (elementwise sparse multiply).
+        # Both M and A are CSR — sp.csr.multiply broadcasts elementwise.
+        M = M.multiply(A).tocsr()
+        # Re-binarize after multiply (multiply may yield non-{0,1} ints
+        # for matrices that already had non-binary entries — defensive).
+        M.data = np.ones_like(M.data, dtype=np.int32)
+        if show_progress:
+            a_density = float(A.nnz) / max(A.shape[0] * A.shape[1], 1)
+            m_density = float(M.nnz) / max(M.shape[0] * M.shape[1], 1)
+            print(
+                f"[bootstrap_npmi] per_gene size-band admittance A: "
+                f"shape={A.shape}, A_density={a_density:.3f}, "
+                f"M_admit_density={m_density:.3f}, "
+                f"bands_for_n_genes={len(pgp_bands)}", flush=True,
+            )
+
+    # Global marginals (computed from M, which IS M_admit when per-gene
+    # filter is active — denoised presence). Standard PMI scoping: single
+    # universe of size C for all pairs. The per-gene admittance affects
+    # WHICH cells count as "g+" (via M_admit's elementwise mask), not
+    # which cells are in the universe.
     marg_global = np.asarray(M.sum(axis=0)).ravel().astype(np.int64)
     p_global = marg_global / C
 
@@ -466,14 +779,14 @@ def compute_npmi_bootstrap(
     if iter_size <= 0:
         raise ValueError(f"subsample_size must be positive (got {subsample_size!r})")
 
-    # Observed cooccurrence (upper triangle).
+    # Observed cooccurrence (upper triangle). M.T @ M counts cells with
+    # both genes admitted+present.
     co_full = (M.T @ M).tocoo()
     upper = co_full.row < co_full.col
     obs_i = co_full.row[upper].astype(np.int32)
     obs_j = co_full.col[upper].astype(np.int32)
-    obs_k = co_full.data[upper].astype(np.int64)  # k_full per pair
+    obs_k = co_full.data[upper].astype(np.int64)
 
-    # Per-pair expected cooccur counts under independence:
     p_i_obs = p_global[obs_i]
     p_j_obs = p_global[obs_j]
     expected_full_obs = p_i_obs * p_j_obs * C
@@ -510,22 +823,29 @@ def compute_npmi_bootstrap(
             if (i, j) in observed_set:
                 continue
             E_full = float(E_full_all[idx])
-            if E_full >= thr:
+            if E_full >= thr and set_neg_one:
                 # k=0 with high expected count → mutual exclusion.
                 # NPMI sentinel = -1 (perfect avoidance limit).
                 # PMI sentinel  = -log(E_full)  (the PMI you'd see at k=1, the
                 # smallest possible non-zero cooccur — a finite proxy for -∞).
+                # When set_neg_one=False, this branch is skipped and the
+                # pair falls through to the "indeterminate" classification
+                # below — matches the legacy compute_npmi default.
                 npmi_sentinel = -1.0
                 pmi_sentinel = float(-np.log(E_full)) if E_full > 0 else np.nan
                 w_value = pmi_sentinel if metric == "pmi" else npmi_sentinel
                 out_rows.append(i); out_cols.append(j); out_vals.append(w_value)
                 n_neg_one += 1
                 if ci_records is not None:
+                    # `median`/`ci_lo`/`ci_hi` are RESERVED for bootstrap output.
+                    # neg_one didn't run bootstrap → NaN. The W-matrix sentinel
+                    # value (npmi_sentinel/pmi_sentinel) is preserved on
+                    # `legacy_npmi`/`legacy_pmi` columns.
                     ci_records.append((
                         i, j, str(genes[i]), str(genes[j]),
                         "neg_one",
                         npmi_sentinel, pmi_sentinel,
-                        w_value, np.nan, np.nan, 0,
+                        np.nan, np.nan, np.nan, 0,
                         E_full, float(p_outer[i, j] * iter_size),
                     ))
             else:
@@ -538,7 +858,7 @@ def compute_npmi_bootstrap(
                         i, j, str(genes[i]), str(genes[j]),
                         "indeterminate",
                         np.nan, np.nan,
-                        0.0, np.nan, np.nan, 0,
+                        np.nan, np.nan, np.nan, 0,
                         E_full, float(p_outer[i, j] * iter_size),
                     ))
         del p_outer, observed_set, ti, tj, E_full_all
@@ -563,13 +883,31 @@ def compute_npmi_bootstrap(
 
     # --------------------------------------------------------------------
     # Stage 3: classify each observed pair by evidence tier.
+    #
+    # Eligibility uses max(k_observed, E[k_ij]) rather than E[k_ij] alone.
+    # Using only E[k] under H0 misses rare-cell-type-marker coexpression where
+    # the marginals are tiny (so E[k]≪thr) but observed cooccur is large
+    # (e.g., macrophage scavenger receptors at k=37 with E[k]=1.0). Those are
+    # real biology, not rare-event PMI artifacts — the data IS sufficient.
     # --------------------------------------------------------------------
-    high_evidence = expected_full_obs >= thr
-    can_bootstrap = high_evidence & (expected_sub_obs >= thr)
+    obs_k_f = obs_k.astype(np.float64)
+    observed_sub_obs = obs_k_f * iter_size / C
+    high_evidence = np.maximum(obs_k_f, expected_full_obs) >= thr
+    # Bootstrap-eligibility threshold. By default the same as evidence
+    # threshold (preserves legacy behavior — pairs whose expected cooccurrence
+    # in a bootstrap subsample is below thr are routed to "legacy_only" and
+    # skipped to save compute). Setting `min_expected_cooccur_for_bootstrap`
+    # lower (e.g., 0.0) lets ALL high-evidence pairs run the bootstrap, at
+    # the cost of wider CIs for sparse pairs (and ~3-5x more wall time).
+    thr_boot = (float(min_expected_cooccur_for_bootstrap)
+                  if min_expected_cooccur_for_bootstrap is not None
+                  else thr)
+    can_bootstrap = high_evidence & (np.maximum(observed_sub_obs, expected_sub_obs) >= thr_boot)
     legacy_only_mask = high_evidence & ~can_bootstrap  # robust legacy, but bootstrap can't refine
     low_evidence_mask = ~high_evidence
 
-    # low_evidence pairs (k_full > 0 but E_full < thr): value = 0 in W
+    # low_evidence pairs (k_full > 0 but E_full < thr): value = 0 in W,
+    # bootstrap not run → median/ci columns NaN (reserved for bootstrap output).
     n_low_evidence_obs = int(low_evidence_mask.sum())
     if ci_records is not None and n_low_evidence_obs:
         for k_idx in np.flatnonzero(low_evidence_mask):
@@ -579,11 +917,13 @@ def compute_npmi_bootstrap(
                 "low_evidence",
                 float(legacy_npmi[k_idx]) if np.isfinite(legacy_npmi[k_idx]) else np.nan,
                 float(legacy_pmi[k_idx]) if np.isfinite(legacy_pmi[k_idx]) else np.nan,
-                0.0, np.nan, np.nan, 0,
+                np.nan, np.nan, np.nan, 0,
                 float(expected_full_obs[k_idx]), float(expected_sub_obs[k_idx]),
             ))
 
     # legacy_only pairs: store legacy value (NPMI or PMI per `metric`) in W.
+    # `median`/`ci_lo`/`ci_hi` are reserved for bootstrap output → NaN here.
+    # The legacy point estimate lives on `legacy_npmi`/`legacy_pmi` columns.
     if legacy_only_mask.any():
         sel = np.flatnonzero(legacy_only_mask)
         for k_idx in sel:
@@ -597,8 +937,7 @@ def compute_npmi_bootstrap(
                     "legacy_only",
                     float(legacy_npmi[k_idx]) if np.isfinite(legacy_npmi[k_idx]) else np.nan,
                     float(legacy_pmi[k_idx]) if np.isfinite(legacy_pmi[k_idx]) else np.nan,
-                    float(v) if np.isfinite(v) else np.nan,
-                    np.nan, np.nan, 0,
+                    np.nan, np.nan, np.nan, 0,
                     float(expected_full_obs[k_idx]), float(expected_sub_obs[k_idx]),
                 ))
 
@@ -622,6 +961,7 @@ def compute_npmi_bootstrap(
             "n_bootstraps_per_pair": np.zeros(0, dtype=np.int32),
             "subsample_size": iter_size,
             "min_expected_cooccur_for_evidence": thr,
+            "pre_filter": pre_filter_diag,
         }
         W_sparse = sp.coo_matrix(
             (out_vals, (out_rows, out_cols)),
@@ -648,7 +988,16 @@ def compute_npmi_bootstrap(
     unsettled = np.ones(n_pairs, dtype=bool)
     n_samples = np.zeros(n_pairs, dtype=np.int32)
     sample_lists: list[list[float]] = [[] for _ in range(n_pairs)]
-    settled_kind = np.zeros(n_pairs, dtype=np.int8)  # 0 unsettled, 1 pos, -1 neg, 2 dead-zone
+    # settled_kind values:
+    #   0  unsettled
+    #   1  pos_strong  (CI_lo > tau_high)
+    #   2  pos_weak    (tau_low < CI_lo ≤ tau_high) — only fires when _is_dual_tau
+    #  -1  neg_strong  (CI_hi < -tau_high)
+    #  -2  neg_weak    (-tau_high ≤ CI_hi < -tau_low) — only fires when _is_dual_tau
+    #   3  tight_null  (CI inside ±tau_low) — only fires when _is_dual_tau
+    #   4  dead_zone   (CI inside ±tau_high but straddles ±tau_low; collapses to "dead_zone"
+    #                   in scalar mode where it's the same as kind=3)
+    settled_kind = np.zeros(n_pairs, dtype=np.int8)
     # Track at which n_done each pair settled. -1 = never settled.
     settled_at_n_done = np.full(n_pairs, -1, dtype=np.int32)
 
@@ -674,7 +1023,9 @@ def compute_npmi_bootstrap(
         for _ in range(block):
             sample_idx = rng.integers(0, C, size=iter_size)
             M_b = M[sample_idx]
-            npmi_block = _bootstrap_npmi_for_pairs(M_b, i_un, j_un)
+            npmi_block = _bootstrap_npmi_for_pairs(
+                M_b, i_un, j_un, alpha=alpha, metric=metric,
+            )
             for kk, gk in enumerate(un_idx):
                 v = npmi_block[kk]
                 if np.isfinite(v):
@@ -688,15 +1039,25 @@ def compute_npmi_bootstrap(
             arr = sample_lists[gk]
             lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
             median = float(np.median(arr))
-            if lo > tau:
+            # IN-LOOP early-stop: only on CONFIDENT classifications.
+            #   - pos_strong / neg_strong  : CI clearly outside ±tau_high
+            #   - tight_null               : CI clearly inside ±tau_low
+            # Weak (CI between ±tau_low and ±tau_high) and dead_zone (CI inside
+            # ±tau_high but straddles ±tau_low) intentionally do NOT early-stop:
+            # those pairs should keep iterating so they can either firm up to
+            # strong or have a precise post-budget median, not get locked in
+            # by a CI that just crossed the lower threshold. With scalar tau
+            # (tau_low == tau_high), the tight_null branch IS the legacy
+            # dead_zone, so behavior matches the original 3-kind early-stop.
+            if lo > tau_high:
                 unsettled[gk] = False
-                settled_kind[gk] = 1
-            elif hi < -tau:
+                settled_kind[gk] = 1   # pos_strong
+            elif hi < -tau_high:
                 unsettled[gk] = False
-                settled_kind[gk] = -1
-            elif lo > -tau and hi < tau:
+                settled_kind[gk] = -1  # neg_strong
+            elif lo > -tau_low and hi < tau_low:
                 unsettled[gk] = False
-                settled_kind[gk] = 2
+                settled_kind[gk] = 3   # tight_null (= legacy "dead_zone" when scalar)
             if not unsettled[gk] and persist_ci:
                 per_pair_ci_lo[gk] = lo
                 per_pair_ci_hi[gk] = hi
@@ -705,11 +1066,49 @@ def compute_npmi_bootstrap(
                 settled_at_n_done[gk] = n_done
                 sample_lists[gk] = []  # release memory
 
-    # Final CI capture for any pair still unsettled at budget exhaustion.
+    # Post-budget classification: pairs that didn't early-stop as
+    # strong/strong-/tight_null get classified now based on their final CI.
+    # In-loop early-stop excluded weak/dead_zone branches, so this pass
+    # assigns those kinds (plus catches any pair that drifted into strong
+    # territory at the very end).
+    for gk in np.flatnonzero(unsettled):
+        arr = sample_lists[gk]
+        if len(arr) < min_samples_for_ci:
+            continue   # leave kind=0 (unsettled), no CI info captured below
+        lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+        median = float(np.median(arr))
+        # Apply full 6-condition cascade to the final CI:
+        if lo > tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = 1   # pos_strong (drifted up at end)
+        elif lo > tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = 2   # pos_weak
+        elif hi < -tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = -1  # neg_strong (drifted down at end)
+        elif hi < -tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = -2  # neg_weak
+        elif lo > -tau_low and hi < tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = 3   # tight_null
+        elif lo > -tau_high and hi < tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = 4   # dead_zone
+        # else: stays kind=0 (genuinely unsettled — CI extends beyond ±tau_high
+        #       and doesn't clear ±tau_low)
+        if persist_ci:
+            per_pair_ci_lo[gk] = lo
+            per_pair_ci_hi[gk] = hi
+            per_pair_median[gk] = median
+
+    # Capture CI for pairs that have <min_samples and didn't go through cascade above.
     if persist_ci:
         for gk in np.flatnonzero(unsettled):
             arr = sample_lists[gk]
             if len(arr) >= 2:
+                # Only happens if min_samples_for_ci wasn't met above.
                 lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
                 per_pair_ci_lo[gk] = lo
                 per_pair_ci_hi[gk] = hi
@@ -717,15 +1116,26 @@ def compute_npmi_bootstrap(
             elif len(arr) == 1:
                 per_pair_median[gk] = float(arr[0])
 
-    n_pos = int((settled_kind == 1).sum())
-    n_neg = int((settled_kind == -1).sum())
-    n_dead = int((settled_kind == 2).sum())
-    n_unsettled = int(unsettled.sum())
+    n_pos_strong = int((settled_kind == 1).sum())
+    n_pos_weak   = int((settled_kind == 2).sum())
+    n_neg_strong = int((settled_kind == -1).sum())
+    n_neg_weak   = int((settled_kind == -2).sum())
+    n_tight_null = int((settled_kind == 3).sum())
+    n_dead_zone  = int((settled_kind == 4).sum())
+    n_unsettled  = int(unsettled.sum())
+    # Legacy aggregate counts (scalar-tau back-compat: weak bins are empty,
+    # tight_null collapses into "dead_zone" reporting).
+    n_pos  = n_pos_strong + n_pos_weak
+    n_neg  = n_neg_strong + n_neg_weak
+    n_dead = n_tight_null + n_dead_zone
 
-    # For settled pos / neg pairs, store the canonical legacy value in W
-    # (the bootstrap CI confirms direction; the value is legacy NPMI or PMI
-    # depending on `metric`).
-    settled_mask = (settled_kind == 1) | (settled_kind == -1)
+    # For settled pos / neg pairs (strong AND weak), store the canonical legacy
+    # value in W (the bootstrap CI confirms direction; the value is legacy NPMI
+    # or PMI depending on `metric`). tight_null and dead_zone do NOT enter W.
+    settled_mask = (
+        (settled_kind == 1) | (settled_kind == -1) |
+        (settled_kind == 2) | (settled_kind == -2)
+    )
     if settled_mask.any():
         for k_idx in np.flatnonzero(settled_mask):
             i = int(pairs_i[k_idx]); j = int(pairs_j[k_idx])
@@ -742,7 +1152,18 @@ def compute_npmi_bootstrap(
     # Append per-pair CI rows for everything that went through the
     # active sampler (settled pos/neg/dead-zone, plus unsettled).
     if ci_records is not None:
-        kind_for = {1: "pos", -1: "neg", 2: "dead_zone", 0: "unsettled"}
+        if _is_dual_tau:
+            kind_for = {1: "pos_strong", 2: "pos_weak",
+                          -1: "neg_strong", -2: "neg_weak",
+                          3: "tight_null", 4: "dead_zone",
+                          0: "unsettled"}
+        else:
+            # Scalar tau: kind=2/-2/4 are unreachable; kind=3 (CI inside ±tau)
+            # is the legacy "dead_zone" so map it to that name for back-compat.
+            kind_for = {1: "pos", 2: "pos",
+                          -1: "neg", -2: "neg",
+                          3: "dead_zone", 4: "dead_zone",
+                          0: "unsettled"}
         for k_idx in range(n_pairs):
             kind = kind_for[int(settled_kind[k_idx])]
             i = int(pairs_i[k_idx])
@@ -778,9 +1199,15 @@ def compute_npmi_bootstrap(
         "n_indeterminate": n_indeterminate,
         "n_low_evidence": n_low_evidence,
         "n_legacy_only": n_legacy_only,
-        "n_dead_zone": n_dead,
-        "n_pos": n_pos,
-        "n_neg": n_neg,
+        "n_dead_zone": n_dead,            # aggregate (tight_null + dead_zone)
+        "n_pos": n_pos,                    # aggregate (pos_strong + pos_weak)
+        "n_neg": n_neg,                    # aggregate (neg_strong + neg_weak)
+        "n_pos_strong": n_pos_strong,
+        "n_pos_weak":   n_pos_weak,
+        "n_neg_strong": n_neg_strong,
+        "n_neg_weak":   n_neg_weak,
+        "n_tight_null": n_tight_null,
+        "n_dead_zone_only": n_dead_zone,   # CI inside ±tau_high but straddles ±tau_low
         "n_unsettled": n_unsettled,
         "n_bootstraps_per_pair": n_samples,
         "settled_at_n_done": settled_at_n_done,
@@ -789,6 +1216,10 @@ def compute_npmi_bootstrap(
         "subsample_size": iter_size,
         "min_expected_cooccur_for_evidence": thr,
         "metric": metric,
+        "tau_low": tau_low,
+        "tau_high": tau_high,
+        "is_dual_tau": _is_dual_tau,
+        "pre_filter": pre_filter_diag,
     }
     pair_ci_df = _ci_records_to_df(ci_records) if ci_records is not None else None
     return NpmiBootstrapResult(
