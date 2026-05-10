@@ -112,11 +112,111 @@ class RescueConfig:
             )
 
 
-# Group, Stitch, and Demote are deliberately NOT represented as
-# dataclasses here yet. Adding them while their parameters are still
-# being tuned would create a drift trap (every parameter tweak in
-# those modules would need to be mirrored in the config). They will
-# be added when those stages freeze. Until then, their knobs live as
+@dataclass(frozen=True)
+class GroupConfig:
+    """Phase 2 — entity grouping.
+
+    Two backends, selected per-pipeline by ``seg_residual_cascade`` /
+    ``noseg_cascade``:
+
+    * **Cascade** (default since 2026-05-07 for SEG-residual,
+      2026-05-09 for NOSEG): density-anchor + Phase-1a/b purity prune.
+      Emits ``cascade_<n>-1`` partial labels. Auto-floor selects the
+      density-threshold floor at runtime by walking down candidate
+      thresholds until ``target_cov`` of residual tx is captured (with
+      a ``hard_min`` lower bound).
+
+    * **Legacy spatial-CC** (when ``*_cascade=False``): the original
+      ``annotate_unassigned_components_fast`` with G=8 µm self-bin
+      connectivity + post-hoc gene-set prune. Emits ``UNASSIGNED_<n>``
+      component labels. Retained as a fallback for parity with
+      pre-cascade pipeline state.
+
+    The cascade backend's internal params (bin size, territory radius,
+    per-pair PMI threshold, min anchor tx) are shared between the SEG
+    and NOSEG paths; the auto-floor params (target_cov, hard_min) are
+    per-pipeline because SEG-residual is sparser than the full NOSEG
+    pool — auto-floor selects different floors in those regimes.
+    """
+    # Backend selection (per pipeline)
+    seg_residual_cascade: bool = True
+    noseg_cascade: bool = True
+
+    # Cascade auto-floor — per pipeline (different residual density regimes)
+    seg_cascade_target_cov: float = 0.65
+    seg_cascade_hard_min: int = 2
+    noseg_cascade_target_cov: float = 0.65
+    noseg_cascade_hard_min: int = 2
+
+    # Cascade internal params — shared between SEG and NOSEG paths
+    cascade_bin_size_um: float = 2.0           # G in cascade_as_residual_handler
+    cascade_territory_radius_bins: int = 1      # Moore radius (3×3 = 9 bins)
+    cascade_pmi_threshold: float = 0.05         # mirrors phase1.pmi_threshold
+    cascade_min_anchor_tx: int = 3
+
+    # Legacy spatial-CC fallback — used when *_cascade=False
+    legacy_bin_size_um: float = 8.0             # G in build_grid_graph_xy
+    legacy_neighborhood: Literal["self", "moore"] = "self"
+    legacy_k: int = 8
+    legacy_dist_threshold: float = 1.5
+    legacy_min_comp_size: int = 5
+    legacy_npmi_threshold: float = -0.1         # post-prune negative cutoff
+
+    def __post_init__(self) -> None:
+        # Cascade params
+        if not (0.0 < self.seg_cascade_target_cov <= 1.0):
+            raise ValueError(
+                f"group.seg_cascade_target_cov must be in (0, 1]; got {self.seg_cascade_target_cov}"
+            )
+        if not (0.0 < self.noseg_cascade_target_cov <= 1.0):
+            raise ValueError(
+                f"group.noseg_cascade_target_cov must be in (0, 1]; got {self.noseg_cascade_target_cov}"
+            )
+        if self.seg_cascade_hard_min < 2:
+            raise ValueError(
+                f"group.seg_cascade_hard_min must be >= 2; got {self.seg_cascade_hard_min}"
+            )
+        if self.noseg_cascade_hard_min < 2:
+            raise ValueError(
+                f"group.noseg_cascade_hard_min must be >= 2; got {self.noseg_cascade_hard_min}"
+            )
+        if self.cascade_bin_size_um <= 0:
+            raise ValueError(
+                f"group.cascade_bin_size_um must be > 0; got {self.cascade_bin_size_um}"
+            )
+        if self.cascade_territory_radius_bins < 1:
+            raise ValueError(
+                f"group.cascade_territory_radius_bins must be >= 1; got {self.cascade_territory_radius_bins}"
+            )
+        if not (-1.0 <= self.cascade_pmi_threshold <= 1.0):
+            raise ValueError(
+                f"group.cascade_pmi_threshold out of range: {self.cascade_pmi_threshold}"
+            )
+        if self.cascade_min_anchor_tx < 1:
+            raise ValueError(
+                f"group.cascade_min_anchor_tx must be >= 1; got {self.cascade_min_anchor_tx}"
+            )
+        # Legacy params
+        if self.legacy_bin_size_um <= 0:
+            raise ValueError(
+                f"group.legacy_bin_size_um must be > 0; got {self.legacy_bin_size_um}"
+            )
+        if self.legacy_neighborhood not in ("self", "moore"):
+            raise ValueError(
+                f"group.legacy_neighborhood must be 'self' or 'moore'; got {self.legacy_neighborhood!r}"
+            )
+        if self.legacy_min_comp_size < 1:
+            raise ValueError(
+                f"group.legacy_min_comp_size must be >= 1; got {self.legacy_min_comp_size}"
+            )
+
+
+# Stitch and Demote are deliberately NOT represented as dataclasses
+# here yet. Their parameters are still being tuned (e.g.
+# `deltaC_min` was just raised from 0.0 to 0.03 on 2026-05-09; the
+# Stitch decomposable-coherence + DSU + heap path is planned). Adding
+# typed configs prematurely would create a drift trap. They will be
+# added when those stages freeze. Until then, their knobs live as
 # kwargs at the call site.
 
 
@@ -229,6 +329,7 @@ class PipelineConfig:
     split_phase1: SplitPhase1Config = field(default_factory=SplitPhase1Config)
     phase1_qc: Phase1QcConfig = field(default_factory=Phase1QcConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
+    group: GroupConfig = field(default_factory=GroupConfig)
     final_rescue: RescueConfig = field(
         default_factory=lambda: RescueConfig(small_entity_guard_n=0)
     )
@@ -248,6 +349,7 @@ _SECTION_TO_CLS: dict[str, type] = {
     "split_phase1": SplitPhase1Config,
     "phase1_qc": Phase1QcConfig,
     "rescue": RescueConfig,
+    "group": GroupConfig,
     "final_rescue": RescueConfig,
     "bootstrap": BootstrapConfig,
 }
@@ -406,6 +508,8 @@ __all__ = [
     "SplitPhase1Config",
     "Phase1QcConfig",
     "RescueConfig",
+    "GroupConfig",
+    "BootstrapConfig",
     "PipelineConfig",
     "load_config",
     "to_dict",

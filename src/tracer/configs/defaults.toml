@@ -102,12 +102,60 @@ small_entity_guard_n = 0
 
 
 # ---------------------------------------------------------------------
-# Group, Stitch, Demote — NOT yet config-driven.
+# Group — entity grouping. Two backends, selected per-pipeline by
+# `seg_residual_cascade` / `noseg_cascade`:
 #
-# These stages are still being tuned. Their parameters live as kwargs
-# at the call site in tests/_pipeline_runner.py until the stages
-# freeze, at which point dedicated [group], [stitch], [demote]
-# sections will be added here.
+#   Cascade (default since 2026-05-07/2026-05-09): density-anchor +
+#   Phase-1a/b purity prune. Auto-floor selects density-threshold floor
+#   from runtime tx-coverage. Emits `cascade_<n>-1` partials.
+#
+#   Legacy spatial-CC (when *_cascade=false): annotate_unassigned_
+#   components_fast with G=8 µm self-bin connectivity. Emits
+#   UNASSIGNED_<n> components. Retained as fallback for parity with
+#   pre-cascade pipeline state.
+#
+# Cascade internals (bin size, territory radius, PMI threshold,
+# min anchor tx) are shared between SEG and NOSEG paths. Auto-floor
+# params (target_cov, hard_min) are per-pipeline because SEG-residual
+# is sparser than the full NOSEG pool — auto-floor selects different
+# floors in those regimes.
+# ---------------------------------------------------------------------
+[group]
+# Backend selection (per pipeline)
+seg_residual_cascade = true
+noseg_cascade = true
+
+# Cascade auto-floor — per pipeline (different residual density regimes)
+seg_cascade_target_cov = 0.65
+seg_cascade_hard_min = 2
+noseg_cascade_target_cov = 0.65
+noseg_cascade_hard_min = 2
+
+# Cascade internal params — shared between SEG and NOSEG paths
+cascade_bin_size_um = 2.0           # G in cascade_as_residual_handler
+cascade_territory_radius_bins = 1    # Moore radius (3×3 = 9 bins)
+cascade_pmi_threshold = 0.05         # mirrors phase1.pmi_threshold
+cascade_min_anchor_tx = 3
+
+# Legacy spatial-CC fallback — used when *_cascade=false
+legacy_bin_size_um = 8.0             # G in build_grid_graph_xy
+legacy_neighborhood = "self"
+legacy_k = 8
+legacy_dist_threshold = 1.5
+legacy_min_comp_size = 5
+legacy_npmi_threshold = -0.1         # post-prune negative cutoff
+
+
+# ---------------------------------------------------------------------
+# Stitch, Demote — NOT yet config-driven.
+#
+# Stitch's knob set is still being tuned (e.g. `deltaC_min` was
+# raised from 0.0 to 0.03 on 2026-05-09 to prevent NOSEG supercell
+# formation; the decomposable-coherence + DSU + heap path is planned
+# as opt-in). Demote is essentially the size-floor `min_size=5` —
+# small surface area, low priority for typed config until Stitch
+# settles. Their parameters remain as kwargs at the call site in
+# tests/_pipeline_runner.py until they freeze.
 #
 # ---------------------------------------------------------------------
 # Final Rescue — single-pass rescue of post-Demote unassigned tx.
