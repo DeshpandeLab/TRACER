@@ -667,7 +667,7 @@ PHASE1_SEG_RESIDUAL_CASCADE_TARGET_COV: float = 0.65
 PHASE1_SEG_RESIDUAL_CASCADE_HARD_MIN: int = 2
 
 
-# Opt-in: replace the NOSEG path's Group call (de-facto cell-finder, not
+# Replace the NOSEG path's Group call (de-facto cell-finder, not
 # residual handler) with the density-cascade. NOSEG runs at higher density
 # than SEG-residual since the entire pool is the input — auto-floor will
 # typically pick floor=4 (~66 % tx coverage) on Xenium full pool.
@@ -675,9 +675,15 @@ PHASE1_SEG_RESIDUAL_CASCADE_HARD_MIN: int = 2
 # See density-cascade-handoff.md for ROI ARI improvements (+0.085 over
 # baseline NOSEG) and full-tissue homogeneity bench results.
 #
-#   False = off (current default — preserves existing test references).
-#   True  = enable cascade in place of Group in the NOSEG path.
-PHASE1_NOSEG_CASCADE: bool = False
+#   False = off (legacy: G=8 self spatial-only annotate_unassigned_
+#           components_fast; bin restriction acts as a crude
+#           anchoring substitute).
+#   True  = on (default 2026-05-09 onward): cascade as Phase-1
+#           replacement in the NOSEG path. Promotes cascade to default
+#           symmetrically with PHASE1_SEG_RESIDUAL_CASCADE (flipped
+#           2026-05-07). Test references that pinned legacy NOSEG
+#           entity counts will need refresh.
+PHASE1_NOSEG_CASCADE: bool = True
 PHASE1_NOSEG_CASCADE_TARGET_COV: float = 0.65
 PHASE1_NOSEG_CASCADE_HARD_MIN: int = 2
 
@@ -945,11 +951,17 @@ def run_segmented_pipeline(df: pd.DataFrame,
                 break
         _record_stage(progression, "Post-Group Rescue", df_grouped, "tracer_id")
 
-    # Stitch — uses the same dz_stats computed before Split.
-    df_grouped["post_stage4"] = df_grouped["tracer_id"]
+    # Stitch — symmetric kwargs with NOSEG path (close-edges guard removed
+    # 2026-05-09: empirical bench on 500 µm Xenium ROI showed the guard is
+    # dormant under current production constants — flipping it on/off in
+    # SEG / NOSEG produced byte-identical Stitch output. Removing for
+    # symmetry; auto_dz is still computed but no longer fed in here.
+    # entity_col reads `tracer_id` directly (the active partition column
+    # after Post-Group Rescue); previous code aliased this as
+    # "post_stage4", a stale name from the numbered-stages era.
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
         df_final=df_grouped, aux=aux,
-        entity_col="post_stage4", gene_col="feature_name",
+        entity_col="tracer_id", gene_col="feature_name",
         coord_cols=("x", "y", "z"),
         mode="count", threshold=PMI_THR, metric="pmi",
         penalize_simplicity=True, deltaC_min=0.0,
@@ -957,8 +969,6 @@ def run_segmented_pipeline(df: pd.DataFrame,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
         G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else auto_Gz),
         z_neighbor_depth=1,
-        min_close_edges_dz=auto_dz,
-        min_close_edges_n=5 if auto_dz is not None else 0,
         min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
@@ -1101,11 +1111,11 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
                 break
         _record_stage(progression, "Post-Group Rescue", df_grouped, "tracer_id")
 
-    # Stitch
-    df_grouped["post_stage4"] = df_grouped["tracer_id"]
+    # Stitch — entity_col reads `tracer_id` directly (was aliased as
+    # "post_stage4" — a stale name from the numbered-stages era).
     df_stitched, _ = apply_stitching_to_transcripts_memory_efficient(
         df_final=df_grouped, aux=aux,
-        entity_col="post_stage4", gene_col="feature_name",
+        entity_col="tracer_id", gene_col="feature_name",
         coord_cols=("x", "y", "z"),
         mode="count", threshold=PMI_THR, metric="pmi",
         penalize_simplicity=True, deltaC_min=0.0,
