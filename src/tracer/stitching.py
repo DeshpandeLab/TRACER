@@ -2491,4 +2491,45 @@ def apply_stitching_to_transcripts_memory_efficient(
 
     if debug_stages and debug_legacy_col != out_col:
         df_out[debug_legacy_col] = df_out[out_col].copy()
+
+    # Propagate `_etype` to match the post-stitch labels. `summary`
+    # carries one etype per original entity; the merge target's etype
+    # is what survives. Build a label→etype map from summary and
+    # remap. Without this, tx of merged-in entities keep their
+    # original (now-stale) etype, which can bias downstream
+    # entity-level classification (the `.first()` aggregation in
+    # build_entity_table picks non-deterministic etype within the
+    # merged entity).
+    if "_etype" in df_out.columns and "etype" in summary.columns:
+        # summary has entity_id (original) and etype. Map original →
+        # stitched label, then dedupe by stitched label (winning etype
+        # is one of the merged-set etypes; pick the first per stitched-
+        # label group, which corresponds to the stitch target's etype
+        # since stitch targets retain their own ID).
+        s_label = pd.Series(summary["etype"].to_numpy(),
+                             index=summary["entity_id"].astype(str))
+        # Map each original entity to its stitched label
+        stitched_label = pd.Series(
+            {k: entity_to_stitched.get(k, k) for k in s_label.index},
+            index=s_label.index,
+        )
+        # For each stitched label, prefer the etype of the entity whose
+        # ID equals the stitched label itself (the merge target).
+        target_etype: dict[str, str] = {}
+        for orig, stitched in stitched_label.items():
+            if orig == stitched:
+                target_etype[stitched] = str(s_label.loc[orig])
+        # For entities that didn't survive but whose target wasn't in
+        # the summary (shouldn't happen but defensive), fall back to
+        # the original etype.
+        for orig, stitched in stitched_label.items():
+            target_etype.setdefault(stitched, str(s_label.loc[orig]))
+        new_labels = df_out[out_col].astype(str)
+        new_etype = new_labels.map(target_etype)
+        # Where the new label has no entry in the map (e.g.,
+        # unassigned), keep the existing _etype value.
+        keep_existing = new_etype.isna()
+        if (~keep_existing).any():
+            df_out.loc[~keep_existing, "_etype"] = new_etype[~keep_existing].astype(str).to_numpy()
+
     return df_out, entity_to_stitched
