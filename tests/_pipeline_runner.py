@@ -91,7 +91,6 @@ def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
 
 def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
                                    entity_col: str,
-                                   cell_id_col: str = "cell_id",
                                    nuclear_col: str = "overlaps_nucleus",
                                    margin_tx: int = 1,
                                    ) -> tuple[pd.DataFrame, dict]:
@@ -102,6 +101,9 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
     collisions (deposed main vs renumbered sub-partials of new main)
     are resolved by reserving sub-suffix slots for rank-0's sub-partials
     first and bumping deposed depth-1 entities past the reserved range.
+
+    Parent identity is derived from the label regex; no cell_id column
+    is read.
 
     Spec: docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
     """
@@ -138,10 +140,9 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
             n_nuc = int(sum(1 for r in rows if is_nuclear[r]))
             sizes.append((d1, n_nuc))
 
-        def _sort_key(d1_size: tuple[str, int]) -> tuple:
+        def _sort_key(d1_size: tuple[str, int], _cm=current_main) -> tuple:
             d1, n = d1_size
-            is_curr_main = 1 if d1 == current_main else 0
-            return (-n, -is_curr_main, d1)
+            return (-n, -(d1 == _cm), d1)
         sizes.sort(key=_sort_key)
 
         n_largest = sizes[0][1]
@@ -167,6 +168,12 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
             else:
                 new_depth1[d1] = f"{parent}-{k + n_rank0_subs}"
 
+        # Renumber sub-suffixes for EVERY old depth-1 (not just rank-0) so the
+        # output suffix set is always contiguous starting at 1. Spec says
+        # "preserved verbatim"; in practice Split-Phase1 emits contiguous
+        # suffixes so renumbering is a no-op for non-rank-0 entities. Keeping
+        # the uniform rule simplifies the code without observable behavior
+        # change on the production data.
         sub_rename: dict[tuple[str, str], str] = {}
         for d1, _ in sizes:
             old_d2js: list[str] = []

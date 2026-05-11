@@ -28,7 +28,7 @@ def test_no_partials_is_noop():
         ("42", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     assert (out["tracer_id"] == df["tracer_id"]).all()
@@ -49,7 +49,7 @@ def test_single_swap_promotes_larger_partial():
         ("42-1", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -68,7 +68,7 @@ def test_tie_keeps_original_main():
         ("42-1", "42", True),  ("42-1", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -89,7 +89,7 @@ def test_three_way_reorder():
         ("42-2", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -120,7 +120,7 @@ def test_subpartial_follows_parent_with_bump_on_collision():
         ("42-1-1", "42", True), ("42-1-1", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -141,7 +141,7 @@ def test_unassigned_labels_untouched():
         ("UNASSIGNED",   "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -162,7 +162,7 @@ def test_cyto_tx_dont_count_toward_size():
         ("42-1", "42", False), ("42-1", "42", False), ("42-1", "42", False),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     counts = out["tracer_id"].value_counts().to_dict()
@@ -179,12 +179,12 @@ def test_idempotent():
         ("42-1", "42", True),  ("42-1", "42", True),
     ])
     out1, stats1 = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     assert stats1["n_parents_reranked"] == 1
     out2, stats2 = _phase1_rerank_within_parent(
-        out1, entity_col="tracer_id", cell_id_col="cell_id",
+        out1, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     assert (out2["tracer_id"] == out1["tracer_id"]).all()
@@ -199,7 +199,7 @@ def test_margin_tx_blocks_close_swaps():
         ("42-1", "42", True), ("42-1", "42", True),
     ])
     out, stats = _phase1_rerank_within_parent(
-        df, entity_col="tracer_id", cell_id_col="cell_id",
+        df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=3,
     )
     counts = out["tracer_id"].value_counts().to_dict()
