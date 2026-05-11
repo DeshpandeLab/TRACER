@@ -74,3 +74,25 @@ def test_tie_keeps_original_main():
     counts = out["tracer_id"].value_counts().to_dict()
     assert counts == {"42": 4, "42-1": 4}
     assert stats["n_parents_reranked"] == 0
+
+
+def test_three_way_reorder():
+    """Main 42 has 2, partial 42-1 has 4, partial 42-2 has 7 →
+    new order: 42-2 (7) → main; 42-1 (4) → -1; 42 (2) → -2."""
+    df = _df([
+        ("42",   "42", True), ("42",   "42", True),
+        ("42-1", "42", True), ("42-1", "42", True),
+        ("42-1", "42", True), ("42-1", "42", True),
+        ("42-2", "42", True), ("42-2", "42", True),
+        ("42-2", "42", True), ("42-2", "42", True),
+        ("42-2", "42", True), ("42-2", "42", True),
+        ("42-2", "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 7, "42-1": 4, "42-2": 2}
+    assert stats["n_parents_reranked"] == 1
+    assert stats["n_tx_relabeled"] == 13
