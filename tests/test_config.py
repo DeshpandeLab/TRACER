@@ -22,6 +22,7 @@ from tracer.config import (
     GroupConfig,
     Phase1Config,
     Phase1QcConfig,
+    Phase1RerankConfig,
     PipelineConfig,
     RescueConfig,
     SplitPhase1Config,
@@ -167,6 +168,21 @@ def test_phase1_invariants():
         Phase1Config(pmi_threshold=2.0)
     with pytest.raises(ValueError, match="seed_coherence_floor"):
         Phase1Config(seed_coherence_floor=-0.1)
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"margin_tx": 0}, "margin_tx"),
+    ({"margin_tx": -1}, "margin_tx"),
+])
+def test_phase1_rerank_invariants(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        Phase1RerankConfig(**kwargs)
+
+
+def test_phase1_rerank_defaults():
+    cfg = Phase1RerankConfig()
+    assert cfg.enabled is False
+    assert cfg.margin_tx == 1
 
 
 @pytest.mark.parametrize("kwargs, match", [

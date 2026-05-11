@@ -93,6 +93,26 @@ class Phase1QcConfig:
 
 
 @dataclass(frozen=True)
+class Phase1RerankConfig:
+    """Re-rank depth-1 entities under each parent cell by nuclear-tx
+    count; promote the largest to the main `{cell_id}` slot.
+
+    Opt-in (default off). Defuses Phase 1's greedy 1a→1b→1c privilege
+    when a partial ends up with more nuclear tx than the main. See
+    `docs/superpowers/specs/2026-05-11-phase1-rerank-design.md`.
+    """
+    enabled: bool = False
+    margin_tx: int = 1   # minimum (n_largest - n_runner_up) required
+                         # to swap. margin_tx=1 ⇒ strict >.
+
+    def __post_init__(self) -> None:
+        if self.margin_tx < 1:
+            raise ValueError(
+                f"phase1_rerank.margin_tx must be >= 1; got {self.margin_tx}"
+            )
+
+
+@dataclass(frozen=True)
 class RescueConfig:
     """Spatial-prior rescue veto (used by main Rescue and Final Rescue)."""
     veto_mode: Literal["min", "mean", "hybrid"] = "hybrid"
@@ -336,6 +356,7 @@ class PipelineConfig:
     phase1: Phase1Config = field(default_factory=Phase1Config)
     split_phase1: SplitPhase1Config = field(default_factory=SplitPhase1Config)
     phase1_qc: Phase1QcConfig = field(default_factory=Phase1QcConfig)
+    phase1_rerank: Phase1RerankConfig = field(default_factory=Phase1RerankConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     group: GroupConfig = field(default_factory=GroupConfig)
     final_rescue: RescueConfig = field(
@@ -356,6 +377,7 @@ _SECTION_TO_CLS: dict[str, type] = {
     "phase1": Phase1Config,
     "split_phase1": SplitPhase1Config,
     "phase1_qc": Phase1QcConfig,
+    "phase1_rerank": Phase1RerankConfig,
     "rescue": RescueConfig,
     "group": GroupConfig,
     "final_rescue": RescueConfig,
@@ -515,6 +537,7 @@ __all__ = [
     "Phase1Config",
     "SplitPhase1Config",
     "Phase1QcConfig",
+    "Phase1RerankConfig",
     "RescueConfig",
     "GroupConfig",
     "BootstrapConfig",
