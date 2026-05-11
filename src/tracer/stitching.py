@@ -293,7 +293,13 @@ def compute_within_entity_dz_stats(
     s = df[entity_col].astype(str)
     keep = s != "-1"
     if etype_filter is not None:
-        types = s.map(infer_entity_type)
+        # Prefer the upstream-emitted _etype column when present
+        # (correct on FFPE cell_ids). Fall back to label-string parsing
+        # for back-compat.
+        if "_etype" in df.columns:
+            types = df["_etype"].astype(str)
+        else:
+            types = s.map(infer_entity_type)
         keep = keep & types.isin(etype_filter)
     sub = df[keep]
     pooled: list[np.ndarray] = []
@@ -349,8 +355,13 @@ def build_entity_table(
     df = df_final.loc[keep, [entity_col, gene_col, *coord_cols]].copy()
     df[entity_col] = df[entity_col].astype(str)
 
-    # entity type
-    df["_etype"] = df[entity_col].map(infer_entity_type)
+    # entity type — prefer the upstream-emitted `_etype` column when
+    # present (correct on Xenium FFPE / IO cell_ids). Fall back to the
+    # label-string parser for back-compat on input frames without _etype.
+    if "_etype" in df_final.columns:
+        df["_etype"] = df_final.loc[keep, "_etype"].astype(str).to_numpy()
+    else:
+        df["_etype"] = df[entity_col].map(infer_entity_type)
     df = df[df["_etype"].isin(["cell", "partial", "component"])]
 
     # centroid (`observed=True` avoids processing empty categorical groups

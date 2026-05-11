@@ -1029,11 +1029,19 @@ def reassign_unassigned_to_nearby_entities(
     assigned_mask = (~unassigned_mask).to_numpy()
     if only_partial_component:
         # Keep only assigned tx whose entity_id is partial / component.
-        all_labels = df[entity_col].astype(str).to_numpy()
-        partial_or_component = np.array([
-            infer_entity_type(lab) in ("partial", "component")
-            for lab in all_labels
-        ], dtype=bool)
+        # Prefer the upstream-emitted _etype column when present
+        # (correct on FFPE cell_ids); fall back to label-string parsing.
+        if "_etype" in df.columns:
+            etype_arr = df["_etype"].astype(str).to_numpy()
+            partial_or_component = np.isin(
+                etype_arr, ("partial", "component")
+            )
+        else:
+            all_labels = df[entity_col].astype(str).to_numpy()
+            partial_or_component = np.array([
+                infer_entity_type(lab) in ("partial", "component")
+                for lab in all_labels
+            ], dtype=bool)
         assigned_mask = assigned_mask & partial_or_component
 
     if assigned_mask.sum() == 0:
@@ -1232,13 +1240,27 @@ def demote_small_entities(
     counts = labels.value_counts()
     small_labels = set(counts.index[counts < min_size]) - set(keep_labels)
     if exempt_types:
-        # Lazy import to avoid circular dep at module load.
-        from .stitching import infer_entity_type
         exempt_set = set(exempt_types)
-        small_labels = {
-            lab for lab in small_labels
-            if infer_entity_type(lab) not in exempt_set
-        }
+        # Prefer _etype column when present (correct on FFPE cell_ids).
+        if "_etype" in df_out.columns:
+            # Build a label → etype map from the dataframe (drop dups)
+            lab_etype = (
+                df_out[[out_col, "_etype"]]
+                .drop_duplicates(out_col)
+                .set_index(out_col)["_etype"]
+                .astype(str)
+            )
+            small_labels = {
+                lab for lab in small_labels
+                if lab_etype.get(lab, "unknown") not in exempt_set
+            }
+        else:
+            # Lazy import to avoid circular dep at module load.
+            from .stitching import infer_entity_type
+            small_labels = {
+                lab for lab in small_labels
+                if infer_entity_type(lab) not in exempt_set
+            }
     if not small_labels:
         return df_out, 0
 
@@ -1574,12 +1596,15 @@ def reassign_unassigned_grid_pool(
     entity_genes_lookup: dict[str, frozenset] = {}
     skip_entity_set: set[str] = set()
     z_col_idx = list(coord_cols).index("z") if "z" in coord_cols else None
+    # entity_summary carries `etype` per row (computed in build_entity_table,
+    # which prefers the upstream _etype column when available). Use that
+    # rather than label-parsing — correct on FFPE cell_ids.
     for ent_row in entity_summary.itertuples():
         eid = str(ent_row.entity_id)
         gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
         gi = gi[~pd.isna(gi)].astype(int).unique()
         entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        if only_partial_component and infer_entity_type(eid) == "cell":
+        if only_partial_component and str(ent_row.etype) == "cell":
             skip_entity_set.add(eid)
 
     # Assigned-tx pool for the bin index (excluding cells if requested).
@@ -2182,7 +2207,9 @@ def reassign_unassigned_to_nearest_tx_no_neg(
         gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
         gi = gi[~pd.isna(gi)].astype(int).unique()
         entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        if only_partial_component and infer_entity_type(eid) == "cell":
+        # entity_summary.etype is computed in build_entity_table from
+        # the upstream _etype column when present (FFPE-safe).
+        if only_partial_component and str(ent_row.etype) == "cell":
             skip_entity_set.add(eid)
 
     # Assigned transcripts -- the searchable index.
