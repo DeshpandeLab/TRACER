@@ -1305,6 +1305,9 @@ def demote_small_entities(
                 df_out[out_col] = col_data.cat.add_categories([unassigned_label])
         col_pos = df_out.columns.get_loc(out_col)
         df_out.iloc[np.where(demote_mask)[0], col_pos] = unassigned_label
+        # Mirror the demotion in _etype.
+        if "_etype" in df_out.columns:
+            df_out.loc[df_out.index[np.where(demote_mask)[0]], "_etype"] = "unknown"
 
     return df_out, n_demoted
 
@@ -1987,6 +1990,35 @@ def reassign_unassigned_grid_pool(
             if new_cats:
                 df_out[out_col] = col_data.cat.add_categories(sorted(new_cats))
         df_out.iloc[sel_rows, col_pos] = new_labels[matched]
+
+        # Propagate _etype for the rescued tx — copy the target
+        # entity's etype from an already-assigned tx with that label.
+        # Without this, rescued tx keep stale 'unknown' etype values
+        # which would bias entity-level aggregation in downstream
+        # build_entity_table calls.
+        if "_etype" in df_out.columns:
+            target_labels = pd.Series(new_labels[matched]).astype(str)
+            etype_series = df_out["_etype"].astype(str)
+            label_series = df_out[out_col].astype(str)
+            known_mask = (etype_series != "unknown") & (~label_series.isin(
+                {"-1", "DROP", "UNASSIGNED", "nan"}
+            ))
+            if known_mask.any():
+                label_to_etype = (
+                    pd.DataFrame({
+                        "lab": label_series[known_mask].to_numpy(),
+                        "etype": etype_series[known_mask].to_numpy(),
+                    })
+                    .drop_duplicates("lab")
+                    .set_index("lab")["etype"]
+                )
+                new_etype = target_labels.map(label_to_etype)
+                ok = new_etype.notna().to_numpy()
+                if ok.any():
+                    sel_with_etype = sel_rows[ok]
+                    df_out.loc[df_out.index[sel_with_etype], "_etype"] = (
+                        new_etype[ok].astype(str).to_numpy()
+                    )
 
     n_reassigned = int(matched.sum())
     if n_reassigned > 0:

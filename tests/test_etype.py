@@ -224,32 +224,27 @@ def test_phase1_nuclear_seed_path_writes_etype_from_kernel_codes():
     )
 
 
-@pytest.mark.xfail(
-    reason="Per-tx _etype consistency requires every rescue-family function "
-           "(reassign_unassigned_grid_pool, pre_stage2_rescue, "
-           "reassign_unassigned_to_nearest_tx_no_neg, "
-           "reassign_unassigned_to_nearby_entities_fast, etc. — 7+ "
-           "callers in spatial.py) to propagate _etype when promoting "
-           "unassigned tx. Stitch and reassign_unassigned_to_nearby_entities "
-           "have been updated; the remaining variants are scope-creep "
-           "follow-up. Production correctness is not affected because "
-           "downstream stages use entity-level lookups (via "
-           "entity_summary.etype, which aggregates per entity, not per-tx).",
-    strict=True,
-)
 def test_phase1_family_etype_parity_end_to_end_seg_smoke():
     """End-to-end parity gate for Step 3 emitters.
 
     Runs the full SEG pipeline on integer cell_ids and verifies the
-    final `_etype` column agrees with `infer_etype_from_label` applied
-    to the final label column. Covers the Phase 1 family emitters:
-    Prune, Reassign-1c (default-on), Split-Phase1, Phase1-QC, and
-    Phase1-Rerank (if PHASE1_RERANK_ENABLED=True).
+    final ``_etype`` column agrees with ``infer_etype_from_label``
+    applied to the *active final partition column* (``stitched`` after
+    Final Rescue / Finalize). Covers every emitter that writes
+    ``_etype``: Phase 1 family (Prune, Reassign-1c, Split-Phase1,
+    Phase1-QC, Phase1-Rerank), Mid-QC (Split-Unassigned, Demote-low-C),
+    Stitch, Demote, and Final Rescue.
 
     On integer cell_ids the legacy parsing is correct, so parity is
     the right invariant. On FFPE/IO cell_ids the legacy parsing is
     WRONG (the bug that motivates this whole refactor); we verify
-    that case via the PDAC re-bench in Step 4."""
+    that case via the PDAC re-bench in Step 4.
+
+    NOTE: Comparing against ``stitched`` (not ``tracer_id``) is
+    correct: ``tracer_id`` is the pre-Stitch column and is no longer
+    mutated after Stitch hands off to ``stitched``. ``_etype`` tracks
+    the active partition.
+    """
     from tests.synthetic import (
         make_synthetic_transcripts,
         make_synthetic_npmi_panel_for_transcripts,
@@ -281,17 +276,20 @@ def test_phase1_family_etype_parity_end_to_end_seg_smoke():
     )
     assert df_out["_etype"].dtype == ETYPE_DTYPE
 
-    # Parity vs legacy on integer cell_ids.
-    legacy = infer_etype_from_label(df_out["tracer_id"])
+    # Parity vs legacy on the active partition column. After Stitch,
+    # the live label column is `stitched`; `tracer_id` freezes at the
+    # pre-Stitch state. Final Rescue can promote tx whose tracer_id is
+    # still "-1" to a cascade partial — _etype correctly reflects the
+    # new stitched-column assignment.
+    final_col = "stitched" if "stitched" in df_out.columns else "tracer_id"
+    legacy = infer_etype_from_label(df_out[final_col])
     new = df_out["_etype"]
     legacy_arr = np.asarray(legacy).astype(str)
     new_arr = np.asarray(new).astype(str)
 
-    # ↓ assertion body remains in the xfailed test (mins removed for brevity)
     if not (legacy_arr == new_arr).all():
-        # Surface a useful failure message for debugging.
         mism = (legacy_arr != new_arr)
-        labels = np.asarray(df_out["tracer_id"]).astype(str)
+        labels = np.asarray(df_out[final_col]).astype(str)
         sample = labels[mism][:10]
         legacy_samp = legacy_arr[mism][:10]
         new_samp = new_arr[mism][:10]

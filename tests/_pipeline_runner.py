@@ -1160,11 +1160,13 @@ def _split_unassigned_components(df_in: pd.DataFrame, *,
         groups_rows.sort(key=lambda a: -len(a))
         stats["components_split"] += 1
 
+        demoted_rows_local: list[np.ndarray] = []
         for k, gr in enumerate(groups_rows):
             sz = len(gr)
             if sz < min_size:
                 out_labels[gr] = unassigned_id
                 stats["tx_demoted_singletons"] += sz
+                demoted_rows_local.append(gr)
                 continue
             if k == 0:
                 continue  # largest keeps original label
@@ -1173,6 +1175,13 @@ def _split_unassigned_components(df_in: pd.DataFrame, *,
             out_labels[gr] = new_label
             stats["subcomps_minted"] += 1
             stats["tx_total_relabelled"] += sz
+            # New sub-component label is still a Group component; _etype
+            # stays "component" — no update needed.
+        if demoted_rows_local and "_etype" in df_out.columns:
+            rows_concat = np.concatenate(demoted_rows_local)
+            mask = np.zeros(len(df_out), dtype=bool)
+            mask[rows_concat] = True
+            df_out.loc[mask, "_etype"] = "unknown"
 
     df_out[entity_col] = out_labels
     return df_out, stats
@@ -1285,6 +1294,8 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
         mask = df_out[entity_col].isin(bad_set)
         df_out.loc[mask, entity_col] = unassigned_id
         n_demoted = int(mask.sum())
+        if "_etype" in df_out.columns:
+            df_out.loc[mask, "_etype"] = "unknown"
 
     return df_out, {
         "entities_examined": int(entity_ids.size),
