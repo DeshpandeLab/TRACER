@@ -89,6 +89,123 @@ def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
     }
 
 
+def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
+                                   entity_col: str,
+                                   nuclear_col: str = "overlaps_nucleus",
+                                   margin_tx: int = 1,
+                                   ) -> tuple[pd.DataFrame, dict]:
+    """Within each parent cell, re-rank depth-1 entities by nuclear-tx
+    count and promote the largest to the main `{cell_id}` label.
+
+    Sub-partials follow their depth-1 ancestor's renaming. Naming
+    collisions (deposed main vs renumbered sub-partials of new main)
+    are resolved by reserving sub-suffix slots for rank-0's sub-partials
+    first and bumping deposed depth-1 entities past the reserved range.
+
+    Parent identity is derived from the label regex; no cell_id column
+    is read.
+
+    Spec: docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
+    """
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    labels = df_out[entity_col].to_numpy(dtype=object).copy()
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+
+    _re_label = _re.compile(r"^(\d+)(?:-(\d+)(?:-(\d+))?)?$")
+
+    parent_to_depth1_rows: dict[str, dict[str, list[int]]] = {}
+    for i, lab in enumerate(labels):
+        m = _re_label.match(str(lab))
+        if not m:
+            continue
+        parent = m.group(1)
+        d1 = m.group(2)
+        depth1 = parent if d1 is None else f"{parent}-{d1}"
+        parent_to_depth1_rows.setdefault(parent, {}).setdefault(
+            depth1, []
+        ).append(i)
+
+    stats = {"n_parents_reranked": 0, "n_tx_relabeled": 0}
+
+    for parent, depth1_map in parent_to_depth1_rows.items():
+        if len(depth1_map) < 2:
+            continue
+
+        sizes: list[tuple[str, int]] = []
+        current_main = parent if parent in depth1_map else None
+        for d1, rows in depth1_map.items():
+            n_nuc = int(sum(1 for r in rows if is_nuclear[r]))
+            sizes.append((d1, n_nuc))
+
+        def _sort_key(d1_size: tuple[str, int], _cm=current_main) -> tuple:
+            d1, n = d1_size
+            return (-n, -(d1 == _cm), d1)
+        sizes.sort(key=_sort_key)
+
+        n_largest = sizes[0][1]
+        n_runner_up = sizes[1][1]
+        if (n_largest - n_runner_up) < margin_tx:
+            continue
+        if sizes[0][0] == current_main:
+            continue
+
+        rank0_old_d1 = sizes[0][0]
+        rank0_subs: set[str] = set()
+        for r in depth1_map[rank0_old_d1]:
+            m = _re_label.match(str(labels[r]))
+            assert m is not None
+            if m.group(3) is not None:
+                rank0_subs.add(m.group(3))
+        n_rank0_subs = len(rank0_subs)
+
+        new_depth1: dict[str, str] = {}
+        for k, (d1, _) in enumerate(sizes):
+            if k == 0:
+                new_depth1[d1] = parent
+            else:
+                new_depth1[d1] = f"{parent}-{k + n_rank0_subs}"
+
+        # Renumber sub-suffixes for EVERY old depth-1 (not just rank-0) so the
+        # output suffix set is always contiguous starting at 1. Spec says
+        # "preserved verbatim"; in practice Split-Phase1 emits contiguous
+        # suffixes so renumbering is a no-op for non-rank-0 entities. Keeping
+        # the uniform rule simplifies the code without observable behavior
+        # change on the production data.
+        sub_rename: dict[tuple[str, str], str] = {}
+        for d1, _ in sizes:
+            old_d2js: list[str] = []
+            for r in depth1_map[d1]:
+                m = _re_label.match(str(labels[r]))
+                assert m is not None
+                if m.group(3) is not None and m.group(3) not in old_d2js:
+                    old_d2js.append(m.group(3))
+            old_d2js.sort(key=int)
+            for new_idx, old_d2j in enumerate(old_d2js, start=1):
+                sub_rename[(d1, old_d2j)] = str(new_idx)
+
+        all_rows = [r for rows in depth1_map.values() for r in rows]
+        for r in all_rows:
+            m = _re_label.match(str(labels[r]))
+            assert m is not None
+            d1k = m.group(2)
+            d2j = m.group(3)
+            old_d1 = parent if d1k is None else f"{parent}-{d1k}"
+            new_d1 = new_depth1[old_d1]
+            if d2j is None:
+                labels[r] = new_d1
+            else:
+                labels[r] = f"{new_d1}-{sub_rename[(old_d1, d2j)]}"
+
+        stats["n_parents_reranked"] += 1
+        stats["n_tx_relabeled"] += len(all_rows)
+
+    df_out[entity_col] = labels
+    return df_out, stats
+
+
 def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
                                      entity_col: str,
                                      coord_cols=("x", "y", "z"),
@@ -640,6 +757,12 @@ RESCUE_POST_GROUP_PASSES: int = 3
 #   True  = enable post-1c reassignment.
 PHASE1_REASSIGN_AFTER_1C: bool = False
 
+PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
+                                        # under each parent by nuclear-tx
+                                        # count. See
+                                        # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
+PHASE1_RERANK_MARGIN_TX: int = 1
+
 
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
 # spatial-only connected components) with the density-cascade Phase 1 on
@@ -833,6 +956,18 @@ def run_segmented_pipeline(df: pd.DataFrame,
         unassigned_id="-1",
     )
     _record_stage(progression, "Split-Phase1", df_pruned, "tracer_id")
+
+    # Phase1-Rerank (opt-in): within each parent cell_id, promote the
+    # depth-1 entity with the most nuclear tx to the main `{cell_id}`
+    # label. Defuses Phase 1's greedy 1a->1b->1c privilege.
+    # Only runs when overlaps_nucleus is present (nuclear-seed prune path).
+    if PHASE1_RERANK_ENABLED and "overlaps_nucleus" in df_pruned.columns:
+        df_pruned, _rerank_stats = _phase1_rerank_within_parent(
+            df_pruned, entity_col="tracer_id",
+            nuclear_col="overlaps_nucleus",
+            margin_tx=PHASE1_RERANK_MARGIN_TX,
+        )
+        _record_stage(progression, "Phase1-Rerank", df_pruned, "tracer_id")
 
     # Post-split QC: demote tiny Phase 1 entities (1-2 tx) so they
     # don't act as degenerate routing anchors in Rescue.
