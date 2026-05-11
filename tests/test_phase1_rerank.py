@@ -96,3 +96,34 @@ def test_three_way_reorder():
     assert counts == {"42": 7, "42-1": 4, "42-2": 2}
     assert stats["n_parents_reranked"] == 1
     assert stats["n_tx_relabeled"] == 13
+
+
+def test_subpartial_follows_parent_with_bump_on_collision():
+    """Promoted partial brings its sub-partials along; deposed main
+    bumps past the reserved sub-suffix slots.
+
+    Before:
+      42       × 2   (main)
+      42-1     × 4   (partial; direct tx)
+      42-1-1   × 2   (sub-partial of 42-1)
+      subtree-size: 42=2, 42-1=6 → 42-1 wins.
+
+    After:
+      42       × 4   (was 42-1 direct)
+      42-1     × 2   (was 42-1-1; sub-partial of new main)
+      42-2     × 2   (was 42; bumped past the reserved -1 slot)
+    """
+    df = _df([
+        ("42",     "42", True), ("42",     "42", True),
+        ("42-1",   "42", True), ("42-1",   "42", True),
+        ("42-1",   "42", True), ("42-1",   "42", True),
+        ("42-1-1", "42", True), ("42-1-1", "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 4, "42-1": 2, "42-2": 2}
+    assert stats["n_parents_reranked"] == 1
+    assert stats["n_tx_relabeled"] == 8

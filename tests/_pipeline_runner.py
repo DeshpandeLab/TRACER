@@ -98,6 +98,11 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
     """Within each parent cell, re-rank depth-1 entities by nuclear-tx
     count and promote the largest to the main `{cell_id}` label.
 
+    Sub-partials follow their depth-1 ancestor's renaming. Naming
+    collisions (deposed main vs renumbered sub-partials of new main)
+    are resolved by reserving sub-suffix slots for rank-0's sub-partials
+    first and bumping deposed depth-1 entities past the reserved range.
+
     Spec: docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
     """
     import re as _re
@@ -146,14 +151,37 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
         if sizes[0][0] == current_main:
             continue
 
+        rank0_old_d1 = sizes[0][0]
+        rank0_subs: set[str] = set()
+        for r in depth1_map[rank0_old_d1]:
+            m = _re_label.match(str(labels[r]))
+            assert m is not None
+            if m.group(3) is not None:
+                rank0_subs.add(m.group(3))
+        n_rank0_subs = len(rank0_subs)
+
         new_depth1: dict[str, str] = {}
         for k, (d1, _) in enumerate(sizes):
-            new_depth1[d1] = parent if k == 0 else f"{parent}-{k}"
+            if k == 0:
+                new_depth1[d1] = parent
+            else:
+                new_depth1[d1] = f"{parent}-{k + n_rank0_subs}"
+
+        sub_rename: dict[tuple[str, str], str] = {}
+        for d1, _ in sizes:
+            old_d2js: list[str] = []
+            for r in depth1_map[d1]:
+                m = _re_label.match(str(labels[r]))
+                assert m is not None
+                if m.group(3) is not None and m.group(3) not in old_d2js:
+                    old_d2js.append(m.group(3))
+            old_d2js.sort(key=int)
+            for new_idx, old_d2j in enumerate(old_d2js, start=1):
+                sub_rename[(d1, old_d2j)] = str(new_idx)
 
         all_rows = [r for rows in depth1_map.values() for r in rows]
         for r in all_rows:
-            old_lab = str(labels[r])
-            m = _re_label.match(old_lab)
+            m = _re_label.match(str(labels[r]))
             assert m is not None
             d1k = m.group(2)
             d2j = m.group(3)
@@ -162,7 +190,7 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
             if d2j is None:
                 labels[r] = new_d1
             else:
-                labels[r] = f"{new_d1}-{d2j}"
+                labels[r] = f"{new_d1}-{sub_rename[(old_d1, d2j)]}"
 
         stats["n_parents_reranked"] += 1
         stats["n_tx_relabeled"] += len(all_rows)
