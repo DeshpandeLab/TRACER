@@ -378,3 +378,37 @@ class TestSegVsNoSegConsistency:
         assert ami > 0.10, (
             f"AMI(seg, noseg) = {ami:.3f} below chance threshold (0.10)"
         )
+
+
+# ============================================================================
+# Phase1-Rerank opt-in smoke tests
+# ============================================================================
+
+def test_rerank_off_omits_stage_seg_smoke(synthetic_inputs):
+    """With PHASE1_RERANK_ENABLED=False (default), Phase1-Rerank is
+    not recorded in the SEG progression."""
+    df, panel, _gt = synthetic_inputs
+    _df_out, progression = run_segmented_pipeline(df, panel)
+    stage_names = [p["stage"] for p in progression]
+    assert "Phase1-Rerank" not in stage_names
+
+
+def test_rerank_on_records_stage_seg_smoke(monkeypatch, synthetic_inputs):
+    """Flipping PHASE1_RERANK_ENABLED=True records the new stage between
+    Split-Phase1 and Phase1-QC in the SEG progression.
+
+    The synthetic fixture uses ``is_nuclear``; rename it to
+    ``overlaps_nucleus`` so the nuclear-seed prune path (and rerank) fires.
+    """
+    import tests._pipeline_runner as runner
+    monkeypatch.setattr(runner, "PHASE1_RERANK_ENABLED", True)
+    df, panel, _gt = synthetic_inputs
+    # Expose the nuclear flag under the name the pipeline expects so that
+    # the nuclear-seed prune path (and therefore Phase1-Rerank) is taken.
+    df_nuc = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+    _df_out, progression = runner.run_segmented_pipeline(df_nuc, panel)
+    stage_names = [p["stage"] for p in progression]
+    idx_split = stage_names.index("Split-Phase1")
+    idx_qc = stage_names.index("Phase1-QC")
+    idx_rerank = stage_names.index("Phase1-Rerank")
+    assert idx_split < idx_rerank < idx_qc

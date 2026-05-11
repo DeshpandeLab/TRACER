@@ -757,6 +757,12 @@ RESCUE_POST_GROUP_PASSES: int = 3
 #   True  = enable post-1c reassignment.
 PHASE1_REASSIGN_AFTER_1C: bool = False
 
+PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
+                                        # under each parent by nuclear-tx
+                                        # count. See
+                                        # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
+PHASE1_RERANK_MARGIN_TX: int = 1
+
 
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
 # spatial-only connected components) with the density-cascade Phase 1 on
@@ -950,6 +956,18 @@ def run_segmented_pipeline(df: pd.DataFrame,
         unassigned_id="-1",
     )
     _record_stage(progression, "Split-Phase1", df_pruned, "tracer_id")
+
+    # Phase1-Rerank (opt-in): within each parent cell_id, promote the
+    # depth-1 entity with the most nuclear tx to the main `{cell_id}`
+    # label. Defuses Phase 1's greedy 1a->1b->1c privilege.
+    # Only runs when overlaps_nucleus is present (nuclear-seed prune path).
+    if PHASE1_RERANK_ENABLED and "overlaps_nucleus" in df_pruned.columns:
+        df_pruned, _rerank_stats = _phase1_rerank_within_parent(
+            df_pruned, entity_col="tracer_id",
+            nuclear_col="overlaps_nucleus",
+            margin_tx=PHASE1_RERANK_MARGIN_TX,
+        )
+        _record_stage(progression, "Phase1-Rerank", df_pruned, "tracer_id")
 
     # Post-split QC: demote tiny Phase 1 entities (1-2 tx) so they
     # don't act as degenerate routing anchors in Rescue.
