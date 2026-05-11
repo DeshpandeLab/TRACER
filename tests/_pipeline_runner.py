@@ -1396,14 +1396,11 @@ PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
                                         # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
 PHASE1_RERANK_MARGIN_TX: int = 1
 
-# Use the etype-aware rerank/classifier helpers that derive parent
-# identity from the cell_id column instead of regex-parsing the label
-# string. Required for correctness on Xenium FFPE / IO data where
-# cell_ids natively contain dashes (e.g. `adohnpem-1`). Default-on
-# 2026-05-11 after migration: byte-identical on integer-cell_id data
-# (verified by tests/test_etype.py parity gates), correct on FFPE.
-# See docs/superpowers/specs/2026-05-11-etype-column-design.md.
-USE_ETYPE_COLUMN: bool = True
+# The etype-aware path is now the only path (hardwired in commit
+# 3fbcc67). Legacy regex-based _phase1_rerank_within_parent and
+# _reassign_nuclear_post_1c functions remain in this module for
+# back-compat with tests that import them directly; they're not
+# called by run_segmented_pipeline anymore.
 
 
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,

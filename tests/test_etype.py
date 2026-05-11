@@ -469,6 +469,11 @@ def test_rerank_etype_unassigned_label_skipped():
     assert counts["-1"] == 1
 
 
+@pytest.mark.skip(
+    reason="USE_ETYPE_COLUMN flag removed in step 6 — call site no longer "
+           "branches, so this test compares the same code path against "
+           "itself. Kept as a stub for git-blame archaeology."
+)
 def test_flag_on_integer_cell_ids_parity_with_legacy_seg_smoke(monkeypatch):
     """Full SEG pipeline with USE_ETYPE_COLUMN=True must produce
     byte-identical output to USE_ETYPE_COLUMN=False on integer cell_ids.
@@ -519,6 +524,10 @@ def test_flag_on_integer_cell_ids_parity_with_legacy_seg_smoke(monkeypatch):
     )
 
 
+@pytest.mark.skip(
+    reason="USE_ETYPE_COLUMN flag removed in step 6 — see sibling test "
+           "for explanation."
+)
 def test_flag_on_integer_cell_ids_with_reassign_parity_seg_smoke():
     """With reassign-1c enabled AND rerank enabled, flag-on must
     still produce byte-identical output to flag-off on integer
