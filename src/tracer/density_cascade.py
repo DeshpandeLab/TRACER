@@ -466,8 +466,21 @@ def cascade_as_residual_handler(
     )
 
     new_labels = df_out[entity_col].to_numpy(dtype=object).copy()
+    relabeled_orig_indices: list[int] = []
     for res_idx, anchor_idx in casc["tx_to_anchor"].items():
         orig_idx = df_res["_orig_idx"].iloc[res_idx]
         new_labels[orig_idx] = f"{label_prefix}{anchor_idx}-1"
+        relabeled_orig_indices.append(int(orig_idx))
     df_out[entity_col] = new_labels
+
+    # Mirror the cascade label-emission in `_etype` if the column
+    # exists. Cascade entities are emitted as `cascade_<n>-1` — they
+    # are treated as 'partial' in the legacy `infer_entity_type`
+    # classifier (any label containing '-' is partial), and the
+    # downstream rerank/reassign machinery treats them symmetrically
+    # with Phase-1c partials.
+    if "_etype" in df_out.columns and relabeled_orig_indices:
+        mask = np.zeros(len(df_out), dtype=bool)
+        mask[relabeled_orig_indices] = True
+        df_out.loc[mask, "_etype"] = "partial"
     return df_out
