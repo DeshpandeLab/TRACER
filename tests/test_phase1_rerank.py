@@ -127,3 +127,44 @@ def test_subpartial_follows_parent_with_bump_on_collision():
     assert counts == {"42": 4, "42-1": 2, "42-2": 2}
     assert stats["n_parents_reranked"] == 1
     assert stats["n_tx_relabeled"] == 8
+
+
+def test_unassigned_labels_untouched():
+    """Labels matching UNASSIGNED_*, -1, etc. are not candidates for
+    rerank under any parent."""
+    df = _df([
+        ("42",            "42", True), ("42",            "42", True),
+        ("42-1",          "42", True), ("42-1",          "42", True),
+        ("42-1",          "42", True), ("42-1",          "42", True),
+        ("UNASSIGNED_7", "42", True),
+        ("-1",            "42", False),
+        ("UNASSIGNED",   "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts["42"] == 4
+    assert counts["42-1"] == 2
+    assert counts["UNASSIGNED_7"] == 1
+    assert counts["-1"] == 1
+    assert counts["UNASSIGNED"] == 1
+
+
+def test_cyto_tx_dont_count_toward_size():
+    """Only nuclear tx count toward the size used for ranking.
+    Partial has more total tx but fewer nuclear → main wins."""
+    df = _df([
+        ("42",   "42", True),  ("42",   "42", True),  ("42",   "42", True),
+        ("42-1", "42", True),  ("42-1", "42", True),
+        ("42-1", "42", False), ("42-1", "42", False),
+        ("42-1", "42", False), ("42-1", "42", False), ("42-1", "42", False),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 3, "42-1": 7}
+    assert stats["n_parents_reranked"] == 0
