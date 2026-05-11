@@ -119,3 +119,105 @@ def test_infer_entity_type_etype_reads_column():
     })
     kinds = infer_entity_type_etype(df)
     assert list(kinds) == ["cell", "partial", "component"]
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Phase 1 emitter parity
+# ---------------------------------------------------------------------------
+
+
+def test_phase1_emitter_writes_etype_consistent_with_labels():
+    """On integer cell_ids, the Phase 1 emitter's `_etype` column must
+    agree with `infer_etype_from_label` applied to the produced label
+    column. This is the parity gate: if it diverges on integer
+    cell_ids, the emitter is buggy. (On FFPE/IO dash-containing
+    cell_ids, the emitter would be CORRECT and the parity helper would
+    be WRONG — the inversion that motivates the refactor — but we
+    don't exercise that case here; that's the job of the PDAC
+    re-bench in Step 4.)
+    """
+    from tests.synthetic import (
+        make_synthetic_transcripts,
+        make_synthetic_npmi_panel_for_transcripts,
+    )
+    from tracer.pruning import prune_transcripts_fast
+
+    df, gt = make_synthetic_transcripts(
+        n_cells=10, n_types=2, seed=42,
+    )
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    df_out, _aux = prune_transcripts_fast(
+        df.copy(), panel,
+        cell_id_col="cell_id", gene_col="feature_name",
+        threshold=0.05, unassigned_id="-1",
+        nan_fill=0.0, n_jobs=-1, show_progress=False,
+    )
+    # `_etype` column is present and a Categorical
+    assert "_etype" in df_out.columns
+    assert df_out["_etype"].dtype == ETYPE_DTYPE
+
+    # Parity against legacy label parsing on integer cell_ids.
+    # The label column produced by prune_transcripts_fast is `tracer_id`
+    # by default (or whatever `out_col` is set to). Check the columns
+    # to find it.
+    label_cols = [c for c in df_out.columns if c in ("tracer_id", "out", "_out")]
+    # Default out_col in the package is `tracer_id`; if that's missing,
+    # fall back to whatever the function actually wrote. Worst case
+    # we'll find no match and the test surfaces a real bug.
+    assert label_cols, f"expected a label column; got {list(df_out.columns)}"
+    label_col = label_cols[0]
+
+    legacy_kinds = infer_etype_from_label(df_out[label_col])
+    new_kinds = df_out["_etype"]
+    # Compare as strings (Categorical equality requires same dtype)
+    assert (
+        np.asarray(legacy_kinds).astype(str) == np.asarray(new_kinds).astype(str)
+    ).all(), (
+        "Phase 1 _etype emitter diverges from legacy label classification "
+        "on integer cell_ids — this is the parity gate failure."
+    )
+
+
+def test_phase1_nuclear_seed_path_writes_etype_from_kernel_codes():
+    """The Cython-batched nuclear-seed prune path (production for
+    Xenium FFPE / IO) writes `_etype` directly from kernel codes,
+    bypassing label-string parsing. On integer cell_ids the result
+    must agree with `infer_etype_from_label` applied to the label
+    column (parity gate); the bug-free behavior on FFPE cell_ids is
+    exercised separately in the PDAC re-bench (Step 4)."""
+    from tests.synthetic import (
+        make_synthetic_transcripts,
+        make_synthetic_npmi_panel_for_transcripts,
+    )
+    from tracer.pruning import prune_transcripts_nuclear_seed
+
+    df, gt = make_synthetic_transcripts(
+        n_cells=10, n_types=2, seed=42,
+    )
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    # The nuclear-seed path requires the column the runner expects.
+    df = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+
+    df_out, _aux = prune_transcripts_nuclear_seed(
+        df.copy(), panel,
+        cell_id_col="cell_id", gene_col="feature_name",
+        nuclear_col="overlaps_nucleus",
+        threshold=0.05, unassigned_id="-1",
+        metric_col="NPMI",  # synthetic panel uses NPMI column name
+        nan_fill=0.0, n_jobs=-1, show_progress=False,
+    )
+    assert "_etype" in df_out.columns
+    assert df_out["_etype"].dtype == ETYPE_DTYPE
+
+    label_cols = [c for c in df_out.columns if c == "tracer_id"]
+    assert label_cols, f"expected tracer_id; got {list(df_out.columns)}"
+    label_col = label_cols[0]
+
+    legacy_kinds = infer_etype_from_label(df_out[label_col])
+    new_kinds = df_out["_etype"]
+    assert (
+        np.asarray(legacy_kinds).astype(str) == np.asarray(new_kinds).astype(str)
+    ).all(), (
+        "Nuclear-seed _etype emitter diverges from legacy classification "
+        "on integer cell_ids — kernel-code mapping is buggy."
+    )

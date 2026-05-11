@@ -12,6 +12,7 @@ import scipy.sparse as sp
 from tqdm.auto import tqdm  # noqa: F401 — used by prune_transcripts_fast
 
 from . import _cy_prune
+from ._etype import etype_from_codes
 from ._repro import _ensure_reproducibility_seed
 from ._utils import prepare_transcript_df
 
@@ -464,6 +465,18 @@ def prune_transcripts_fast(
 
     df.drop(columns=["_cell_str", "_gene_idx"], inplace=True)
 
+    # Populate the _etype categorical column. The legacy whole-cell
+    # prune path doesn't produce per-tx kernel codes (the Cython kernel
+    # path does), so we classify from the final label string via
+    # `infer_etype_from_label`. This is acceptable because this path
+    # is taken ONLY when `overlaps_nucleus` is missing — i.e. legacy /
+    # synthetic data with integer cell_ids, where label-string parsing
+    # is correct. Production Xenium FFPE / IO data takes the
+    # `prune_transcripts_nuclear_seed` path which writes `_etype`
+    # directly from kernel codes (bug-free regardless of cell_id format).
+    from ._etype import infer_etype_from_label
+    df["_etype"] = infer_etype_from_label(df[out_col])
+
     from .stitching import compute_housekeeping_mask
 
     aux = {
@@ -616,6 +629,15 @@ def prune_transcripts_nuclear_seed(
     # codes 1 and 2.
     code_arr = np.asarray(codes)
     cell_str_arr = df["_cell_str"].to_numpy()
+
+    # Populate the _etype categorical column from the Cython codes.
+    # This is the canonical source of entity-kind classification for
+    # the etype-column refactor (see src/tracer/_etype.py); it sidesteps
+    # the legacy label-string parsing rule, which misclassifies Xenium
+    # FFPE / IO cell_ids that natively contain dashes (e.g. 'adohnpem-1').
+    # Stage-1 emission only — readers still default to label parsing
+    # until step 4 of the refactor flips the flag.
+    df["_etype"] = etype_from_codes(code_arr)
 
     # Build partial labels (code == 1): "{cid}-1"
     partial_mask = (code_arr == 1)
