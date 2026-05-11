@@ -599,6 +599,187 @@ def _vectorized_mean_pmi_excl_self(W: np.ndarray,
     return out
 
 
+def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
+                                       entity_col: str,
+                                       aux: dict,
+                                       cell_id_col: str = "cell_id",
+                                       gene_col: str = "feature_name",
+                                       nuclear_col: str = "overlaps_nucleus",
+                                       margin: float = 0.05,
+                                       threshold: float = 0.05,
+                                       ) -> tuple[pd.DataFrame, dict]:
+    """Sibling of `_reassign_nuclear_post_1c` that uses the input
+    `cell_id_col` for parent identity instead of regex-parsing the
+    label string. Works on any cell_id format — integer (lung cancer)
+    or alphanumeric / dash-containing (Xenium FFPE / IO).
+
+    All other semantics identical to the legacy / regex version:
+    sequential margin walk, `mp > best_mean + margin` admission rule,
+    nuclear-only tx considered.
+    """
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    label_arr = df_out[entity_col].to_numpy(dtype=object).copy()
+
+    gene_to_idx = aux["gene_to_idx"]
+    W = aux["W"]
+    if not isinstance(W, np.ndarray):
+        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
+                       dtype=np.float32)
+    if W.dtype != np.float32:
+        W = W.astype(np.float32)
+
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+    nuc_genes = df_out[gene_col].astype(str).to_numpy()
+    cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
+    nuc_idx = np.where(is_nuclear)[0]
+
+    has_etype = "_etype" in df_out.columns
+    etype_arr = (
+        df_out["_etype"].astype(str).to_numpy() if has_etype else None
+    )
+
+    # Build per-entity nuclear-gene set via pandas groupby.
+    _UN = {"-1", "DROP", "UNASSIGNED", "nan"}
+    label_s = pd.Series(label_arr)
+    is_un_label = (
+        label_s.isin(_UN) | label_s.str.startswith("UNASSIGNED_", na=False)
+    )
+    nuc_with_entity_mask = is_nuclear & (~is_un_label.to_numpy())
+    if nuc_with_entity_mask.any():
+        gi_arr_all = (
+            pd.Series(nuc_genes).map(gene_to_idx)
+            .fillna(-1).astype(np.int64).to_numpy()
+        )
+        valid_for_build = nuc_with_entity_mask & (gi_arr_all >= 0)
+        if valid_for_build.any():
+            build_df = pd.DataFrame({
+                "entity": label_arr[valid_for_build].astype(str),
+                "gi":     gi_arr_all[valid_for_build],
+            }).drop_duplicates()
+            entity_to_genes_lists = (
+                build_df.groupby("entity", sort=False)["gi"]
+                .apply(np.array).to_dict()
+            )
+            entity_to_genes: dict[str, set[int]] = {
+                e: set(int(x) for x in arr)
+                for e, arr in entity_to_genes_lists.items()
+            }
+        else:
+            entity_to_genes = {}
+    else:
+        entity_to_genes = {}
+
+    # Build parent_to_entities using the cell_id column — works on
+    # any cell_id format, no regex.
+    # For each entity, find its parent by looking up the cell_id of
+    # any tx labeled with that entity. Filter to entities that ARE
+    # the main label of some cell (label == cell_id) or a partial /
+    # sub-partial (label.startswith(cell_id + "-")).
+    SENT = _UN
+    parent_to_entities: dict[str, list[str]] = {}
+    for ent in entity_to_genes:
+        idx = np.where(label_arr == ent)[0]
+        if idx.size == 0:
+            continue
+        parent = str(cell_id_arr[idx[0]])
+        if parent in SENT:
+            continue
+        if ent != parent and not ent.startswith(parent + "-"):
+            continue  # not a Phase 1-family entity (e.g., cascade)
+        parent_to_entities.setdefault(parent, []).append(ent)
+
+    n_moves = 0
+    n_parents_with_partials = 0
+    moved_tx_indices: list[int] = []
+
+    # Candidate tx per parent: nuclear, in main entity (label == cell_id),
+    # AND etype == "cell" if column present. Works on any cell_id format.
+    cand_by_parent: dict[str, np.ndarray] = {}
+    if nuc_idx.size > 0:
+        nuc_label = label_arr[nuc_idx].astype(str)
+        nuc_cid = cell_id_arr[nuc_idx]
+        is_cand = nuc_label == nuc_cid
+        if has_etype:
+            is_cand &= (etype_arr[nuc_idx] == "cell")
+        if is_cand.any():
+            cand_tx_idx = nuc_idx[is_cand]
+            cand_parent = nuc_cid[is_cand]
+            order = np.argsort(cand_parent, kind="stable")
+            cand_tx_idx_sorted = cand_tx_idx[order]
+            cand_parent_sorted = cand_parent[order]
+            change = np.r_[True, cand_parent_sorted[1:] != cand_parent_sorted[:-1]]
+            starts = np.where(change)[0]
+            ends = np.r_[starts[1:], cand_parent_sorted.size]
+            for s, e in zip(starts, ends):
+                cand_by_parent[str(cand_parent_sorted[s])] = cand_tx_idx_sorted[s:e]
+
+    for parent, ent_list in parent_to_entities.items():
+        if len(ent_list) < 2:
+            continue
+        main = parent
+        if main not in entity_to_genes:
+            continue
+        partials = [e for e in ent_list if e != main]
+        if not partials:
+            continue
+        n_parents_with_partials += 1
+
+        cand_idx = cand_by_parent.get(parent)
+        if cand_idx is None or cand_idx.size == 0:
+            continue
+
+        S_main = np.fromiter(entity_to_genes[main], dtype=np.int64)
+        S_partials_arrays = [
+            np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials
+        ]
+
+        # Lazy gene-index lookup for this parent's candidates.
+        cand_gene_idx = np.fromiter(
+            (gene_to_idx.get(nuc_genes[i], -1) for i in cand_idx),
+            dtype=np.int64, count=cand_idx.size,
+        )
+        valid_gene = cand_gene_idx >= 0
+        if not valid_gene.any():
+            continue
+        cand_idx_v = cand_idx[valid_gene]
+        cand_g_v = cand_gene_idx[valid_gene]
+
+        mean_main_v = _vectorized_mean_pmi_excl_self(W, cand_g_v, S_main)
+        finite_main_v = np.isfinite(mean_main_v)
+        if not finite_main_v.any():
+            continue
+        cand_idx_f = cand_idx_v[finite_main_v]
+        cand_g_f = cand_g_v[finite_main_v]
+        best_mean = mean_main_v[finite_main_v].copy()
+        best_p_idx = np.full(best_mean.shape, -1, dtype=np.int32)
+
+        for k, S_p in enumerate(S_partials_arrays):
+            mp = _vectorized_mean_pmi_excl_self(W, cand_g_f, S_p)
+            accept = np.isfinite(mp) & (mp > best_mean + margin)
+            if accept.any():
+                best_mean[accept] = mp[accept]
+                best_p_idx[accept] = k
+
+        moves = best_p_idx >= 0
+        if moves.any():
+            for n_local in np.where(moves)[0]:
+                kk = int(best_p_idx[n_local])
+                label_arr[cand_idx_f[n_local]] = partials[kk]
+                moved_tx_indices.append(int(cand_idx_f[n_local]))
+            n_moves += int(moves.sum())
+
+    df_out[entity_col] = label_arr
+    if has_etype and moved_tx_indices:
+        mask = np.zeros(len(df_out), dtype=bool)
+        mask[moved_tx_indices] = True
+        df_out.loc[mask, "_etype"] = "partial"
+    return df_out, {
+        "n_tx_moved": n_moves,
+        "n_parents_with_partials": n_parents_with_partials,
+    }
+
+
 def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
                                 entity_col: str,
                                 aux: dict,
@@ -1393,12 +1574,20 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # nuclear tx weakly admitted to the main seed, whose gene fits a
     # 1c partial's sub-seed strictly better, get moved to the partial.
     if PHASE1_REASSIGN_AFTER_1C and "overlaps_nucleus" in df_pruned.columns:
-        df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
-            df_pruned, entity_col="tracer_id", aux=aux,
-            cell_id_col="cell_id", gene_col="feature_name",
-            nuclear_col="overlaps_nucleus",
-            margin=0.05, threshold=PMI_THR,
-        )
+        if USE_ETYPE_COLUMN:
+            df_pruned, _reassign_stats = _reassign_nuclear_post_1c_etype(
+                df_pruned, entity_col="tracer_id", aux=aux,
+                cell_id_col="cell_id", gene_col="feature_name",
+                nuclear_col="overlaps_nucleus",
+                margin=0.05, threshold=PMI_THR,
+            )
+        else:
+            df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
+                df_pruned, entity_col="tracer_id", aux=aux,
+                cell_id_col="cell_id", gene_col="feature_name",
+                nuclear_col="overlaps_nucleus",
+                margin=0.05, threshold=PMI_THR,
+            )
         _record_stage(progression, "Phase1-Reassign-1c", df_pruned, "tracer_id")
 
     # Spatial-split Phase 1 entities. Phase 1c is purely gene-based —

@@ -517,3 +517,45 @@ def test_flag_on_integer_cell_ids_parity_with_legacy_seg_smoke(monkeypatch):
         f"USE_ETYPE_COLUMN flag changes output on integer cell_ids "
         f"(n_diff={int(diff.sum())}/{len(diff)}). Should be byte-identical."
     )
+
+
+def test_flag_on_integer_cell_ids_with_reassign_parity_seg_smoke():
+    """With reassign-1c enabled AND rerank enabled, flag-on must
+    still produce byte-identical output to flag-off on integer
+    cell_ids. Covers both new etype readers (reassign + rerank)."""
+    from tests.synthetic import (
+        make_synthetic_transcripts,
+        make_synthetic_npmi_panel_for_transcripts,
+    )
+    import tests._pipeline_runner as runner
+    from tests._pipeline_runner import run_segmented_pipeline
+
+    df, gt = make_synthetic_transcripts(n_cells=15, n_types=3, seed=42)
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    df_nuc = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+
+    orig_reassign = runner.PHASE1_REASSIGN_AFTER_1C
+    orig_rerank = runner.PHASE1_RERANK_ENABLED
+    orig_flag = runner.USE_ETYPE_COLUMN
+    try:
+        runner.PHASE1_REASSIGN_AFTER_1C = True
+        runner.PHASE1_RERANK_ENABLED = True
+        runner.USE_ETYPE_COLUMN = False
+        out_legacy, _ = run_segmented_pipeline(df_nuc.copy(), panel)
+
+        runner.USE_ETYPE_COLUMN = True
+        out_etype, _ = run_segmented_pipeline(df_nuc.copy(), panel)
+    finally:
+        runner.PHASE1_REASSIGN_AFTER_1C = orig_reassign
+        runner.PHASE1_RERANK_ENABLED = orig_rerank
+        runner.USE_ETYPE_COLUMN = orig_flag
+
+    diff = (
+        out_legacy["tracer_id"].astype(str).to_numpy()
+        != out_etype["tracer_id"].astype(str).to_numpy()
+    )
+    assert not diff.any(), (
+        f"USE_ETYPE_COLUMN flag changes output with reassign+rerank "
+        f"on integer cell_ids (n_diff={int(diff.sum())}/{len(diff)}). "
+        f"Should be byte-identical."
+    )

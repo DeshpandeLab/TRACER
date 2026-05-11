@@ -36,6 +36,7 @@ PANEL = Path("/Users/adeshpa6/1_Projects/01.10_Lab/GENESIS/.claude/worktrees/sto
 REPO = Path(__file__).resolve().parents[1]
 OUT_JSON = REPO / "benchmarks" / "pdac_roi_etype.json"
 OUT_LOG = REPO / "benchmarks" / "pdac_roi_etype.log"
+OUT_PARQUET = REPO / "benchmarks" / "pdac_roi_etype_partitions.parquet"
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +188,10 @@ def main() -> int:
     }
 
     try:
-        runner.PHASE1_REASSIGN_AFTER_1C = False
+        # Composition mode: both Reassign-1c and Phase1-Rerank ON.
+        # On legacy regex readers, BOTH silently no-op on FFPE cell_ids
+        # (same bug); on etype readers, both fire correctly.
+        runner.PHASE1_REASSIGN_AFTER_1C = True
         runner.PHASE1_RERANK_ENABLED = True
 
         # ---- Legacy rerank reader (flag off) ----
@@ -269,6 +273,25 @@ def main() -> int:
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     OUT_JSON.write_text(json.dumps(results, indent=2, default=str))
     log(f"\nWrote: {OUT_JSON}")
+
+    # Persist paired partition for offline analysis
+    parts = pd.DataFrame({
+        "transcript_id": df["transcript_id"].to_numpy(),
+        "cell_id":       df["cell_id"].astype(str).to_numpy(),
+        "x":             df["x"].to_numpy(),
+        "y":             df["y"].to_numpy(),
+        "z":             df["z"].to_numpy(),
+        "overlaps_nucleus": df["overlaps_nucleus"].to_numpy(),
+        "feature_name":  df["feature_name"].astype(str).to_numpy(),
+        "label_legacy":  df_legacy["tracer_id"].astype(str).to_numpy(),
+        "label_etype":   df_etype["tracer_id"].astype(str).to_numpy(),
+        "etype_legacy":  (df_legacy["_etype"].astype(str).to_numpy()
+                          if "_etype" in df_legacy.columns else None),
+        "etype_etype":   (df_etype["_etype"].astype(str).to_numpy()
+                          if "_etype" in df_etype.columns else None),
+    })
+    parts.to_parquet(OUT_PARQUET, index=False)
+    log(f"Wrote: {OUT_PARQUET}")
     return 0
 
 
