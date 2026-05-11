@@ -54,6 +54,18 @@ min_tx = 3
 
 
 # ---------------------------------------------------------------------
+# Phase1-Rerank — opt-in; within each parent cell, re-rank depth-1
+# entities by nuclear-tx count and promote the largest to the main
+# `{cell_id}` label. Defuses Phase 1's greedy 1a→1b→1c privilege.
+# Default off; flip after a bench shows demonstrable cell-count
+# recovery without coherence regression.
+# ---------------------------------------------------------------------
+[phase1_rerank]
+enabled = false
+margin_tx = 1
+
+
+# ---------------------------------------------------------------------
 # Rescue — spatial-prior reassignment of Phase-1 unassigned tx.
 # Used by both the main 3-pass Rescue and the post-Demote Final Rescue.
 # ---------------------------------------------------------------------
