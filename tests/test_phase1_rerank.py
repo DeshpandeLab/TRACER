@@ -168,3 +168,40 @@ def test_cyto_tx_dont_count_toward_size():
     counts = out["tracer_id"].value_counts().to_dict()
     assert counts == {"42": 3, "42-1": 7}
     assert stats["n_parents_reranked"] == 0
+
+
+def test_idempotent():
+    """Running rerank twice in a row is a no-op the second time."""
+    df = _df([
+        ("42",   "42", True),
+        ("42",   "42", True),
+        ("42-1", "42", True),  ("42-1", "42", True),
+        ("42-1", "42", True),  ("42-1", "42", True),
+    ])
+    out1, stats1 = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    assert stats1["n_parents_reranked"] == 1
+    out2, stats2 = _phase1_rerank_within_parent(
+        out1, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    assert (out2["tracer_id"] == out1["tracer_id"]).all()
+    assert stats2["n_parents_reranked"] == 0
+
+
+def test_margin_tx_blocks_close_swaps():
+    """margin_tx=3 blocks a +1 difference."""
+    df = _df([
+        ("42",   "42", True), ("42",   "42", True), ("42",   "42", True),
+        ("42-1", "42", True), ("42-1", "42", True),
+        ("42-1", "42", True), ("42-1", "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=3,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 3, "42-1": 4}
+    assert stats["n_parents_reranked"] == 0
