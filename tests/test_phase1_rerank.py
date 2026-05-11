@@ -205,3 +205,33 @@ def test_margin_tx_blocks_close_swaps():
     counts = out["tracer_id"].value_counts().to_dict()
     assert counts == {"42": 3, "42-1": 4}
     assert stats["n_parents_reranked"] == 0
+
+
+def test_qc_after_rerank_demotes_old_main_below_min_tx():
+    """If old main had 2 tx (below min_tx=3) and partial had 5, after
+    Rerank the partial wears `42` (survives QC); the old main wears
+    `42-1` with 2 tx and gets demoted by the next Phase 1-QC pass."""
+    from tests._pipeline_runner import (
+        _phase1_rerank_within_parent,
+        _qc_demote_small_phase1_entities,
+        PHASE1_QC_MIN_TX,
+    )
+    df = _df([
+        ("42",   "42", True), ("42",   "42", True),
+        ("42-1", "42", True), ("42-1", "42", True),
+        ("42-1", "42", True), ("42-1", "42", True), ("42-1", "42", True),
+    ])
+    rerk, _ = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    qcd, _qc_stats = _qc_demote_small_phase1_entities(
+        rerk, entity_col="tracer_id", min_size=PHASE1_QC_MIN_TX,
+        unassigned_id="-1",
+    )
+    counts = qcd["tracer_id"].value_counts().to_dict()
+    # Rerank: old 42-1 (5) → "42"; old 42 (2) → "42-1"
+    # QC: "42-1" has 2 tx < 3 → demote to "-1"
+    assert counts["42"] == 5
+    assert counts.get("-1", 0) == 2
+    assert "42-1" not in counts
