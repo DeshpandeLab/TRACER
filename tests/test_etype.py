@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from tracer._etype import (
     ETYPE_CATEGORIES,
@@ -221,3 +222,78 @@ def test_phase1_nuclear_seed_path_writes_etype_from_kernel_codes():
         "Nuclear-seed _etype emitter diverges from legacy classification "
         "on integer cell_ids — kernel-code mapping is buggy."
     )
+
+
+@pytest.mark.xfail(
+    reason="End-to-end parity requires the Group/cascade emitter (Step 3e) "
+           "and downstream stage emitters (Step 3f). Until those land, "
+           "cascade entities (`cascade_<n>-1`) and Rescue-promoted tx "
+           "carry the pre-Phase-1 `_etype` value (often 'unknown'), "
+           "diverging from the label-string classification. The test is "
+           "kept here as the gate that flips to PASS once 3e/3f land.",
+    strict=True,
+)
+def test_phase1_family_etype_parity_end_to_end_seg_smoke():
+    """End-to-end parity gate for Step 3 emitters.
+
+    Runs the full SEG pipeline on integer cell_ids and verifies the
+    final `_etype` column agrees with `infer_etype_from_label` applied
+    to the final label column. Covers the Phase 1 family emitters:
+    Prune, Reassign-1c (default-on), Split-Phase1, Phase1-QC, and
+    Phase1-Rerank (if PHASE1_RERANK_ENABLED=True).
+
+    On integer cell_ids the legacy parsing is correct, so parity is
+    the right invariant. On FFPE/IO cell_ids the legacy parsing is
+    WRONG (the bug that motivates this whole refactor); we verify
+    that case via the PDAC re-bench in Step 4."""
+    from tests.synthetic import (
+        make_synthetic_transcripts,
+        make_synthetic_npmi_panel_for_transcripts,
+    )
+    import tests._pipeline_runner as runner
+    from tests._pipeline_runner import run_segmented_pipeline
+
+    df, gt = make_synthetic_transcripts(n_cells=15, n_types=3, seed=42)
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    # Force the nuclear-seed prune path so we exercise the Cython
+    # kernel-code emitter (production-relevant), not just the legacy
+    # whole-cell prune.
+    df_nuc = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+
+    # Snapshot defaults; restore at end.
+    orig_rerank = runner.PHASE1_RERANK_ENABLED
+    orig_reassign = runner.PHASE1_REASSIGN_AFTER_1C
+    try:
+        runner.PHASE1_RERANK_ENABLED = True  # exercise the rerank emitter
+        runner.PHASE1_REASSIGN_AFTER_1C = True
+        df_out, _prog = run_segmented_pipeline(df_nuc, panel)
+    finally:
+        runner.PHASE1_RERANK_ENABLED = orig_rerank
+        runner.PHASE1_REASSIGN_AFTER_1C = orig_reassign
+
+    assert "_etype" in df_out.columns, (
+        "End-to-end pipeline must carry _etype through to the final "
+        "output (Phase 1 family emitters should populate it)."
+    )
+    assert df_out["_etype"].dtype == ETYPE_DTYPE
+
+    # Parity vs legacy on integer cell_ids.
+    legacy = infer_etype_from_label(df_out["tracer_id"])
+    new = df_out["_etype"]
+    legacy_arr = np.asarray(legacy).astype(str)
+    new_arr = np.asarray(new).astype(str)
+
+    if not (legacy_arr == new_arr).all():
+        # Surface a useful failure message for debugging.
+        mism = (legacy_arr != new_arr)
+        labels = np.asarray(df_out["tracer_id"]).astype(str)
+        sample = labels[mism][:10]
+        legacy_samp = legacy_arr[mism][:10]
+        new_samp = new_arr[mism][:10]
+        msg = (
+            f"_etype diverges from label-parse on {mism.sum()}/{len(mism)} tx. "
+            f"Sample (label / legacy / new): "
+            + ", ".join(f"{l!r}/{lk}/{nk}"
+                        for l, lk, nk in zip(sample, legacy_samp, new_samp))
+        )
+        raise AssertionError(msg)

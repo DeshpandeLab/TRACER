@@ -83,6 +83,9 @@ def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
         mask = df_out[entity_col].isin(bad)
         df_out.loc[mask, entity_col] = unassigned_id
         n_demoted = int(mask.sum())
+        # Mirror the demotion in _etype if the column exists.
+        if "_etype" in df_out.columns:
+            df_out.loc[mask, "_etype"] = "unknown"
     return df_out, {
         "entities_demoted": len(bad),
         "tx_demoted": n_demoted,
@@ -187,6 +190,12 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
                 sub_rename[(d1, old_d2j)] = str(new_idx)
 
         all_rows = [r for rows in depth1_map.values() for r in rows]
+        # Track which rows transition between roles for the _etype update
+        # below. Sub-partials (d2j is not None) stay "partial" regardless;
+        # only the depth-1 entities flip cell↔partial based on the new
+        # rank.
+        rows_to_cell: list[int] = []
+        rows_to_partial: list[int] = []
         for r in all_rows:
             m = _re_label.match(str(labels[r]))
             assert m is not None
@@ -196,8 +205,24 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
             new_d1 = new_depth1[old_d1]
             if d2j is None:
                 labels[r] = new_d1
+                if new_d1 == parent:
+                    rows_to_cell.append(r)
+                else:
+                    rows_to_partial.append(r)
             else:
                 labels[r] = f"{new_d1}-{sub_rename[(old_d1, d2j)]}"
+                # sub-partial keeps its existing "partial" etype
+
+        # Apply _etype updates for this parent if the column exists.
+        if "_etype" in df_out.columns:
+            if rows_to_cell:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_cell] = True
+                df_out.loc[mask, "_etype"] = "cell"
+            if rows_to_partial:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_partial] = True
+                df_out.loc[mask, "_etype"] = "partial"
 
         stats["n_parents_reranked"] += 1
         stats["n_tx_relabeled"] += len(all_rows)
@@ -300,14 +325,19 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
         m_part = _re.match(r"^(\d+)-(\d+)$", ent)
         m_sub = _re.match(r"^(\d+)-(\d+)-(\d+)$", ent)
 
+        # Collect (rows, new_etype) updates per parent for batched _etype write.
+        rows_to_unknown_local: list[np.ndarray] = []
+        rows_to_partial_local: list[np.ndarray] = []
+
         for k, gr in enumerate(groups_rows):
             sz = len(gr)
             if sz < min_size:
                 out_labels[gr] = unassigned_id
                 stats["tx_demoted_singletons"] += sz
+                rows_to_unknown_local.append(gr)
                 continue
             if k == 0:
-                continue  # largest keeps original label
+                continue  # largest keeps original label (and its existing _etype)
 
             # Mint fresh label without colliding with existing partials
             if m_main is not None:
@@ -330,6 +360,24 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
             out_labels[gr] = new_label
             stats["subgroups_minted"] += 1
             stats["tx_total_relabelled"] += sz
+            # New sub-group inherits "partial" etype regardless of whether
+            # the parent was a main (depth-1 partial emitted) or a partial
+            # (sub-partial emitted) — per the design, sub-partials are
+            # "partial" flat.
+            rows_to_partial_local.append(gr)
+
+        # Apply _etype updates for this parent
+        if "_etype" in df_out.columns:
+            if rows_to_unknown_local:
+                rows_concat = np.concatenate(rows_to_unknown_local)
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_concat] = True
+                df_out.loc[mask, "_etype"] = "unknown"
+            if rows_to_partial_local:
+                rows_concat = np.concatenate(rows_to_partial_local)
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_concat] = True
+                df_out.loc[mask, "_etype"] = "partial"
 
     df_out[entity_col] = out_labels
     return df_out, stats
@@ -455,6 +503,10 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
 
     n_moves = 0
     n_parents_with_partials = 0
+    # Accumulate tx indices that get moved from main → partial across all
+    # parents. Their _etype flips cell → partial in a single batched
+    # write below.
+    moved_tx_indices: list[int] = []
 
     # Precompute candidate tx indices per parent in ONE pass: for each
     # nuclear tx whose entity label is purely numeric (a main label),
@@ -542,9 +594,14 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
             for n_local in np.where(moves)[0]:
                 k = int(best_p_idx[n_local])
                 label_arr[cand_idx_f[n_local]] = partials[k]
+                moved_tx_indices.append(int(cand_idx_f[n_local]))
             n_moves += int(moves.sum())
 
     df_out[entity_col] = label_arr
+    if "_etype" in df_out.columns and moved_tx_indices:
+        mask = np.zeros(len(df_out), dtype=bool)
+        mask[moved_tx_indices] = True
+        df_out.loc[mask, "_etype"] = "partial"
     return df_out, {
         "n_tx_moved": n_moves,
         "n_parents_with_partials": n_parents_with_partials,
@@ -619,6 +676,7 @@ def _reassign_nuclear_post_1c_legacy(df_in: pd.DataFrame, *,
         return float(vals[finite].mean())
 
     n_moves = 0
+    moved_tx_indices: list[int] = []
     cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
 
     for parent, ent_list in parent_to_entities.items():
@@ -653,9 +711,14 @@ def _reassign_nuclear_post_1c_legacy(df_in: pd.DataFrame, *,
                     best_p = p
             if best_p is not None:
                 label_arr[tx_idx] = best_p
+                moved_tx_indices.append(int(tx_idx))
                 n_moves += 1
 
     df_out[entity_col] = label_arr
+    if "_etype" in df_out.columns and moved_tx_indices:
+        mask = np.zeros(len(df_out), dtype=bool)
+        mask[moved_tx_indices] = True
+        df_out.loc[mask, "_etype"] = "partial"
     return df_out, {
         "n_tx_moved": n_moves,
         "n_parents_with_partials": int(sum(
