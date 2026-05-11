@@ -337,85 +337,54 @@ def _build_rerank_test_frame(cell_id: str, *, n_main: int, n_partial: int,
 
 
 def test_rerank_etype_integer_cell_id_parity_swap():
-    """Integer cell_ids — etype-aware rerank produces same output as
-    legacy regex rerank on a single-swap case."""
-    from tests._pipeline_runner import (
-        _phase1_rerank_within_parent,
-        _phase1_rerank_within_parent_etype,
-    )
+    """Integer cell_ids — etype-aware rerank performs the expected
+    single-swap when the depth-1 partial outscores the main."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
     df = _build_rerank_test_frame("42", n_main=3, n_partial=5)
-    out_legacy, stats_legacy = _phase1_rerank_within_parent(
-        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
-    )
     out_etype, stats_etype = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
     )
-    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
-    assert stats_legacy["n_parents_reranked"] == stats_etype["n_parents_reranked"]
-    assert stats_legacy["n_tx_relabeled"] == stats_etype["n_tx_relabeled"]
-    # Swap should have happened (5 > 3)
+    assert stats_etype["n_parents_reranked"] == 1
+    assert stats_etype["n_tx_relabeled"] == 8
+    # Swap should have happened (5 > 3).
     counts = out_etype["tracer_id"].value_counts().to_dict()
     assert counts == {"42": 5, "42-1": 3}
 
 
 def test_rerank_etype_integer_cell_id_parity_tie():
-    """Tie keeps original main, in both versions."""
-    from tests._pipeline_runner import (
-        _phase1_rerank_within_parent,
-        _phase1_rerank_within_parent_etype,
-    )
+    """Tie keeps the original main label."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
     df = _build_rerank_test_frame("42", n_main=4, n_partial=4)
-    out_legacy, _ = _phase1_rerank_within_parent(
-        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
-    )
-    out_etype, _ = _phase1_rerank_within_parent_etype(
+    out_etype, stats_etype = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
     )
-    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
+    assert stats_etype["n_parents_reranked"] == 0
+    counts = out_etype["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 4, "42-1": 4}
 
 
 def test_rerank_etype_subpartial_follows_with_bump_on_collision():
-    """Sub-partial + bump-on-collision works on integer cell_ids."""
-    from tests._pipeline_runner import (
-        _phase1_rerank_within_parent,
-        _phase1_rerank_within_parent_etype,
-    )
+    """Sub-partial follows depth-1 ancestor; deposed main bumps to next
+    free suffix slot."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
     df = _build_rerank_test_frame(
         "42", n_main=2, n_partial=4, n_subpartial=2,
-    )
-    out_legacy, _ = _phase1_rerank_within_parent(
-        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
     )
     out_etype, _ = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
     )
-    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
     counts = out_etype["tracer_id"].value_counts().to_dict()
     assert counts == {"42": 4, "42-1": 2, "42-2": 2}
 
 
 def test_rerank_etype_works_on_ffpe_dash_in_cell_id():
-    """The killer test: PDAC-style cell_id `adohnpem-1` works correctly.
-
-    Legacy rerank would silently no-op (regex doesn't match alphanumeric
-    cell_ids). Etype rerank uses cell_id_col for parent identity and
-    correctly handles the swap.
-    """
-    from tests._pipeline_runner import (
-        _phase1_rerank_within_parent,
-        _phase1_rerank_within_parent_etype,
-    )
+    """The killer test: PDAC-style cell_id ``adohnpem-1`` reranks
+    correctly. Pre-refactor legacy regex rerank silently no-oped on
+    FFPE cell_ids because the dash in the cell_id confused the parent-
+    identification regex. The etype-aware sibling reads ``cell_id_col``
+    directly, so it works regardless of cell_id format."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
     df = _build_rerank_test_frame("adohnpem-1", n_main=3, n_partial=5)
-    # Sanity: legacy rerank silently does nothing on FFPE
-    out_legacy, stats_legacy = _phase1_rerank_within_parent(
-        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
-    )
-    assert stats_legacy["n_parents_reranked"] == 0, (
-        "Legacy rerank should silently no-op on FFPE cell_ids "
-        "(the bug that motivates this refactor)."
-    )
-
-    # Etype rerank correctly does the swap.
     out_etype, stats_etype = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
     )
