@@ -1396,13 +1396,14 @@ PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
                                         # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
 PHASE1_RERANK_MARGIN_TX: int = 1
 
-# Opt-in: use the etype-aware rerank/classifier helpers that derive
-# parent identity from the cell_id column instead of regex-parsing the
-# label string. Required for correctness on Xenium FFPE / IO data
-# where cell_ids natively contain dashes (e.g. `adohnpem-1`); leaving
-# this off preserves byte-identical behavior on integer-cell_id data
-# (lung cancer). See docs/superpowers/specs/2026-05-11-etype-column-design.md.
-USE_ETYPE_COLUMN: bool = False
+# Use the etype-aware rerank/classifier helpers that derive parent
+# identity from the cell_id column instead of regex-parsing the label
+# string. Required for correctness on Xenium FFPE / IO data where
+# cell_ids natively contain dashes (e.g. `adohnpem-1`). Default-on
+# 2026-05-11 after migration: byte-identical on integer-cell_id data
+# (verified by tests/test_etype.py parity gates), correct on FFPE.
+# See docs/superpowers/specs/2026-05-11-etype-column-design.md.
+USE_ETYPE_COLUMN: bool = True
 
 
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
@@ -1574,20 +1575,12 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # nuclear tx weakly admitted to the main seed, whose gene fits a
     # 1c partial's sub-seed strictly better, get moved to the partial.
     if PHASE1_REASSIGN_AFTER_1C and "overlaps_nucleus" in df_pruned.columns:
-        if USE_ETYPE_COLUMN:
-            df_pruned, _reassign_stats = _reassign_nuclear_post_1c_etype(
-                df_pruned, entity_col="tracer_id", aux=aux,
-                cell_id_col="cell_id", gene_col="feature_name",
-                nuclear_col="overlaps_nucleus",
-                margin=0.05, threshold=PMI_THR,
-            )
-        else:
-            df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
-                df_pruned, entity_col="tracer_id", aux=aux,
-                cell_id_col="cell_id", gene_col="feature_name",
-                nuclear_col="overlaps_nucleus",
-                margin=0.05, threshold=PMI_THR,
-            )
+        df_pruned, _reassign_stats = _reassign_nuclear_post_1c_etype(
+            df_pruned, entity_col="tracer_id", aux=aux,
+            cell_id_col="cell_id", gene_col="feature_name",
+            nuclear_col="overlaps_nucleus",
+            margin=0.05, threshold=PMI_THR,
+        )
         _record_stage(progression, "Phase1-Reassign-1c", df_pruned, "tracer_id")
 
     # Spatial-split Phase 1 entities. Phase 1c is purely gene-based —
@@ -1611,19 +1604,12 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # label. Defuses Phase 1's greedy 1a->1b->1c privilege.
     # Only runs when overlaps_nucleus is present (nuclear-seed prune path).
     if PHASE1_RERANK_ENABLED and "overlaps_nucleus" in df_pruned.columns:
-        if USE_ETYPE_COLUMN:
-            df_pruned, _rerank_stats = _phase1_rerank_within_parent_etype(
-                df_pruned, entity_col="tracer_id",
-                cell_id_col="cell_id",
-                nuclear_col="overlaps_nucleus",
-                margin_tx=PHASE1_RERANK_MARGIN_TX,
-            )
-        else:
-            df_pruned, _rerank_stats = _phase1_rerank_within_parent(
-                df_pruned, entity_col="tracer_id",
-                nuclear_col="overlaps_nucleus",
-                margin_tx=PHASE1_RERANK_MARGIN_TX,
-            )
+        df_pruned, _rerank_stats = _phase1_rerank_within_parent_etype(
+            df_pruned, entity_col="tracer_id",
+            cell_id_col="cell_id",
+            nuclear_col="overlaps_nucleus",
+            margin_tx=PHASE1_RERANK_MARGIN_TX,
+        )
         _record_stage(progression, "Phase1-Rerank", df_pruned, "tracer_id")
 
     # Post-split QC: demote tiny Phase 1 entities (1-2 tx) so they
