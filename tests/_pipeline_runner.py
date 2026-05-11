@@ -509,7 +509,13 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
     offsets = np.empty(counts.size + 1, dtype=np.int32)
     offsets[0] = 0
     np.cumsum(counts, out=offsets[1:])
-    flat_genes = tmp["gene"].to_numpy(dtype=np.int32)
+    # `to_numpy(dtype=...)` returns a read-only view in some
+    # pandas/numpy combinations (notably pandas + numpy<2). The
+    # Cython kernel requests a writable typed memoryview, so we
+    # need an explicit writable copy here.
+    flat_genes = np.ascontiguousarray(
+        tmp["gene"].to_numpy(dtype=np.int32, copy=True)
+    )
 
     # Cython batch call. When real_signal_threshold > 0, the kernel
     # uses the "real players" denominator (only pairs with |W| above

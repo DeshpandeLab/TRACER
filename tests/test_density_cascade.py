@@ -125,6 +125,14 @@ class TestMooreDilate:
 class TestCascadeIntegration:
     @pytest.fixture(scope="class")
     def roi(self):
+        # `data_loader` lives in benchmarks/ (untracked in some
+        # checkouts including CI). Skip these integration tests when
+        # the helper isn't importable; the unit-level cascade behavior
+        # is exercised by TestAutoFloor / TestMooreDilate above.
+        pytest.importorskip(
+            "data_loader",
+            reason="benchmarks/data_loader.py unavailable (not on sys.path)",
+        )
         from data_loader import load_roi_df, DEFAULT_PROJECT_DIR
         df = load_roi_df(half_side_um=250.0,
                           roi_center_xy=(1818.7, 2186.8)).reset_index(drop=True)
