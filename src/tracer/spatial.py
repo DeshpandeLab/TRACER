@@ -44,8 +44,9 @@ from .graph import build_graph, to_networkx  # noqa: F401 — used internally/ca
 #                              dataframes; never emitted by current code)
 #
 # Note: bare "UNASSIGNED" (the published label) is distinct from the
-# "UNASSIGNED_<n>" component IDs (with underscore suffix) — `infer_entity_type`
-# checks the bare label first before the prefix rule.
+# "UNASSIGNED_<n>" component IDs (with underscore suffix) —
+# `tracer._etype.infer_etype_from_label` checks the bare label first
+# before the ``UNASSIGNED_`` prefix rule.
 #
 # Use `is_unassigned_label(s)` (single label) or `unassigned_mask(series)`
 # (vectorized) instead of literal-set comparisons. Adding a new stage-
@@ -976,7 +977,6 @@ def reassign_unassigned_to_nearby_entities(
                     mean_distance, max_distance.
     """
     _ensure_reproducibility_seed()
-    from .stitching import infer_entity_type
 
     if unassigned_labels is None:
         unassigned_labels = set(UNASSIGNED_LABELS)
@@ -1033,15 +1033,12 @@ def reassign_unassigned_to_nearby_entities(
         # (correct on FFPE cell_ids); fall back to label-string parsing.
         if "_etype" in df.columns:
             etype_arr = df["_etype"].astype(str).to_numpy()
-            partial_or_component = np.isin(
-                etype_arr, ("partial", "component")
-            )
         else:
-            all_labels = df[entity_col].astype(str).to_numpy()
-            partial_or_component = np.array([
-                infer_entity_type(lab) in ("partial", "component")
-                for lab in all_labels
-            ], dtype=bool)
+            from ._etype import infer_etype_from_label
+            etype_arr = np.asarray(
+                infer_etype_from_label(df[entity_col])
+            ).astype(str)
+        partial_or_component = np.isin(etype_arr, ("partial", "component"))
         assigned_mask = assigned_mask & partial_or_component
 
     if assigned_mask.sum() == 0:
@@ -1239,8 +1236,10 @@ def demote_small_entities(
         Default: the full `UNASSIGNED_LABELS` set (all sentinels +
         stage-rejected labels).
     exempt_types : tuple of str
-        Entity types (per `infer_entity_type`) that are protected from
-        demotion regardless of size. Default `("cell",)` — whole cells
+        Entity types (read from the ``_etype`` column when present,
+        otherwise via :func:`tracer._etype.infer_etype_from_label`)
+        that are protected from demotion regardless of size. Default
+        ``("cell",)`` — whole cells
         are locked segmentation outputs and must never be removed even
         if they fall below `min_size` after upstream pruning. Pass `()`
         to disable the type protection.
@@ -1285,11 +1284,14 @@ def demote_small_entities(
                 if lab_etype.get(lab, "unknown") not in exempt_set
             }
         else:
-            # Lazy import to avoid circular dep at module load.
-            from .stitching import infer_entity_type
+            from ._etype import infer_etype_from_label
+            small_arr = np.array(sorted(small_labels), dtype=object)
+            etype_arr = np.asarray(
+                infer_etype_from_label(pd.Series(small_arr))
+            ).astype(str)
             small_labels = {
-                lab for lab in small_labels
-                if infer_entity_type(lab) not in exempt_set
+                lab for lab, etype in zip(small_arr, etype_arr)
+                if etype not in exempt_set
             }
     if not small_labels:
         return df_out, 0
@@ -1597,7 +1599,7 @@ def reassign_unassigned_grid_pool(
             f"veto_mode must be 'min', 'mean', or 'hybrid'; got {veto_mode!r}"
         )
     _ensure_reproducibility_seed()
-    from .stitching import build_entity_table, infer_entity_type
+    from .stitching import build_entity_table
     from .graph import bin_xy, neighbor_bins
 
     if unassigned_labels is None:
@@ -2237,7 +2239,7 @@ def reassign_unassigned_to_nearest_tx_no_neg(
     df_out, n_reassigned, stats
     """
     _ensure_reproducibility_seed()
-    from .stitching import build_entity_table, infer_entity_type
+    from .stitching import build_entity_table
 
     if unassigned_labels is None:
         unassigned_labels = set(UNASSIGNED_LABELS)

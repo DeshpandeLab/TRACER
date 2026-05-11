@@ -66,21 +66,22 @@ def synthetic_inputs():
     return df, panel, gt
 
 
-def _classify(label: str) -> str:
-    s = str(label)
-    if s in ("DROP", "-1", "nan", "UNASSIGNED"):
-        return "unassigned"
-    if s.startswith("UNASSIGNED_"):
-        return "component"
-    if "-" in s:
-        return "partial"
-    return "cell"
-
-
 def _fingerprint(df_out, progression, gt) -> dict:
     """Compute the fingerprint dict to compare against the reference."""
+    from tracer._etype import infer_etype_from_label
+
     s = df_out["stitched"].astype(str)
-    types = s.map(_classify)
+    if "_etype" in df_out.columns:
+        etypes = df_out["_etype"].astype(str)
+    else:
+        etypes = pd.Series(
+            np.asarray(infer_etype_from_label(s)).astype(str),
+            index=df_out.index,
+        )
+    types = etypes.where(
+        etypes.isin(["cell", "partial", "component"]),
+        other="unassigned",
+    )
     n_ent = s.groupby(types).nunique().to_dict()
     n_tx = types.value_counts().to_dict()
 

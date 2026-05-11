@@ -4,7 +4,7 @@ Catches regressions in:
   - `auto_floor_from_coverage` rule (target_cov, hard_min, R-Moore dilation)
   - `density_cascade_phase1` end-to-end on a small ROI
   - `cascade_as_residual_handler` label format (partial-form `cascade_<n>-1`)
-  - `_classify` consistency: cascade labels must classify as 'partial'
+  - label-parse consistency: cascade labels must classify as 'partial'
 
 Run via: pytest tests/test_density_cascade.py
 """
@@ -212,8 +212,16 @@ class TestCascadeIntegration:
 # ============================================================================
 class TestClassifyConsistency:
     def test_cascade_partial_label_classified_as_partial(self):
-        from tests._pipeline_runner import _classify
-        assert _classify("cascade_5-1") == "partial"
-        assert _classify("cascade_42-1") == "partial"
-        # Stitch-merged cascade label (post-merger) — also partial
-        assert _classify("cascade_5-1-1") == "partial"
+        """Cascade labels (``cascade_<N>-1`` and ``cascade_<N>-1-1``)
+        must be classified as ``partial`` by the canonical label parser
+        so Stitch / per-stage accounting count them in the partial pool.
+        """
+        from tracer._etype import infer_etype_from_label
+        kinds = list(
+            np.asarray(
+                infer_etype_from_label(
+                    pd.Series(["cascade_5-1", "cascade_42-1", "cascade_5-1-1"])
+                )
+            ).astype(str)
+        )
+        assert kinds == ["partial", "partial", "partial"]
