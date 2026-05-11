@@ -34,6 +34,63 @@ ETYPE_DTYPE: pd.CategoricalDtype = pd.CategoricalDtype(
 )
 
 
+# ---------------------------------------------------------------------------
+# Entity-hierarchy delimiter
+#
+# All TRACER-produced partial / sub-partial labels use the unique
+# `-tr-` delimiter between the input cell_id and the partial-index
+# tree. Mains keep their bare cell_id label.
+#
+#   main          : `{cell_id}`                       e.g. "42" or "adohnpem-1"
+#   partial       : `{cell_id}{ENTITY_DELIMITER}{k}`  e.g. "42-tr-1"
+#   sub-partial   : `{cell_id}{ENTITY_DELIMITER}{k}{ENTITY_DELIMITER}{j}`
+#                                                       e.g. "42-tr-1-tr-1"
+#
+# This sidesteps the ambiguity on Xenium FFPE / IO data where the
+# input cell_id natively contains dashes (`adohnpem-1`). Splitting on
+# `-tr-` yields `[cell_id, k, j]` uniquely regardless of cell_id
+# content.
+#
+# When changing this constant, **regenerate all reference partitions**
+# (`tests/references/*.json`) and audit any external tooling that
+# pattern-matches on the legacy bare `-` delimiter.
+# ---------------------------------------------------------------------------
+ENTITY_DELIMITER: str = "-tr-"
+
+
+def make_partial_label(cell_id: str, idx: int) -> str:
+    """Construct a depth-1 partial label: `{cell_id}-tr-{idx}`."""
+    return f"{cell_id}{ENTITY_DELIMITER}{idx}"
+
+
+def make_subpartial_label(parent_partial: str, idx: int) -> str:
+    """Construct a sub-partial label under an existing partial:
+    `{parent_partial}-tr-{idx}`. `parent_partial` is expected to be a
+    depth-1 partial label."""
+    return f"{parent_partial}{ENTITY_DELIMITER}{idx}"
+
+
+def split_entity_label(label: str) -> tuple[str, list[int]]:
+    """Decompose a TRACER entity label into (cell_id, depth_indices).
+
+    - main:        ("42",          [])
+    - partial:     ("42",          [1])
+    - sub-partial: ("42",          [1, 1])
+    - PDAC main:   ("adohnpem-1",  [])
+    - PDAC partial:("adohnpem-1",  [1])
+
+    Raises ValueError if a suffix piece isn't a non-negative integer.
+    Returns (label, []) for any label that doesn't contain
+    `ENTITY_DELIMITER` (treated as a main).
+    """
+    if ENTITY_DELIMITER not in label:
+        return label, []
+    parts = label.split(ENTITY_DELIMITER)
+    cell_id = parts[0]
+    indices = [int(p) for p in parts[1:]]
+    return cell_id, indices
+
+
 def empty_etype(n: int) -> pd.Categorical:
     """Build an all-`unknown` etype column of length ``n``."""
     return pd.Categorical(["unknown"] * n, dtype=ETYPE_DTYPE)
@@ -75,6 +132,12 @@ def infer_etype_from_label(labels) -> pd.Categorical:
       - starts with ``UNASSIGNED_``                       → ``component``
       - contains ``-``                                    → ``partial``
       - else                                              → ``cell``
+
+    NOTE: this still uses the legacy bare-dash rule for parity with
+    existing code. The `-tr-` delimiter defined in this module is the
+    target convention; full migration happens in a follow-up commit
+    that updates every emitter + parser + regenerates reference
+    partitions in lockstep.
     """
     s = pd.Series(labels).astype(str).reset_index(drop=True)
     out = np.full(len(s), "unknown", dtype=object)
