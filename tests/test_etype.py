@@ -283,6 +283,7 @@ def test_phase1_family_etype_parity_end_to_end_seg_smoke():
     legacy_arr = np.asarray(legacy).astype(str)
     new_arr = np.asarray(new).astype(str)
 
+    # ↓ assertion body remains in the xfailed test (mins removed for brevity)
     if not (legacy_arr == new_arr).all():
         # Surface a useful failure message for debugging.
         mism = (legacy_arr != new_arr)
@@ -297,3 +298,172 @@ def test_phase1_family_etype_parity_end_to_end_seg_smoke():
                         for l, lk, nk in zip(sample, legacy_samp, new_samp))
         )
         raise AssertionError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — etype-aware rerank reader (cell_id-based parent identification)
+# ---------------------------------------------------------------------------
+
+
+def _build_rerank_test_frame(cell_id: str, *, n_main: int, n_partial: int,
+                              n_subpartial: int = 0,
+                              partial_idx: int = 1,
+                              subpartial_idx: int = 1) -> pd.DataFrame:
+    """Build a minimal DataFrame for rerank testing.
+
+    Returns a DataFrame with columns: tracer_id, cell_id, overlaps_nucleus,
+    _etype. All rows under one parent ``cell_id``. ``tracer_id`` follows
+    the legacy dash convention: main = cell_id, partial = ``f'{cell_id}-{partial_idx}'``,
+    sub-partial = ``f'{cell_id}-{partial_idx}-{subpartial_idx}'``.
+    """
+    from tracer._etype import ETYPE_DTYPE
+    rows = []
+    # main
+    for _ in range(n_main):
+        rows.append((cell_id, cell_id, True, "cell"))
+    # partial
+    partial_lab = f"{cell_id}-{partial_idx}"
+    for _ in range(n_partial):
+        rows.append((partial_lab, cell_id, True, "partial"))
+    # sub-partial
+    sub_lab = f"{cell_id}-{partial_idx}-{subpartial_idx}"
+    for _ in range(n_subpartial):
+        rows.append((sub_lab, cell_id, True, "partial"))
+    df = pd.DataFrame(rows, columns=["tracer_id", "cell_id", "overlaps_nucleus", "_etype"])
+    df["_etype"] = df["_etype"].astype(ETYPE_DTYPE)
+    return df
+
+
+def test_rerank_etype_integer_cell_id_parity_swap():
+    """Integer cell_ids — etype-aware rerank produces same output as
+    legacy regex rerank on a single-swap case."""
+    from tests._pipeline_runner import (
+        _phase1_rerank_within_parent,
+        _phase1_rerank_within_parent_etype,
+    )
+    df = _build_rerank_test_frame("42", n_main=3, n_partial=5)
+    out_legacy, stats_legacy = _phase1_rerank_within_parent(
+        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
+    )
+    out_etype, stats_etype = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
+    assert stats_legacy["n_parents_reranked"] == stats_etype["n_parents_reranked"]
+    assert stats_legacy["n_tx_relabeled"] == stats_etype["n_tx_relabeled"]
+    # Swap should have happened (5 > 3)
+    counts = out_etype["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 5, "42-1": 3}
+
+
+def test_rerank_etype_integer_cell_id_parity_tie():
+    """Tie keeps original main, in both versions."""
+    from tests._pipeline_runner import (
+        _phase1_rerank_within_parent,
+        _phase1_rerank_within_parent_etype,
+    )
+    df = _build_rerank_test_frame("42", n_main=4, n_partial=4)
+    out_legacy, _ = _phase1_rerank_within_parent(
+        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
+    )
+    out_etype, _ = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
+
+
+def test_rerank_etype_subpartial_follows_with_bump_on_collision():
+    """Sub-partial + bump-on-collision works on integer cell_ids."""
+    from tests._pipeline_runner import (
+        _phase1_rerank_within_parent,
+        _phase1_rerank_within_parent_etype,
+    )
+    df = _build_rerank_test_frame(
+        "42", n_main=2, n_partial=4, n_subpartial=2,
+    )
+    out_legacy, _ = _phase1_rerank_within_parent(
+        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
+    )
+    out_etype, _ = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    assert (out_legacy["tracer_id"].to_numpy() == out_etype["tracer_id"].to_numpy()).all()
+    counts = out_etype["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 4, "42-1": 2, "42-2": 2}
+
+
+def test_rerank_etype_works_on_ffpe_dash_in_cell_id():
+    """The killer test: PDAC-style cell_id `adohnpem-1` works correctly.
+
+    Legacy rerank would silently no-op (regex doesn't match alphanumeric
+    cell_ids). Etype rerank uses cell_id_col for parent identity and
+    correctly handles the swap.
+    """
+    from tests._pipeline_runner import (
+        _phase1_rerank_within_parent,
+        _phase1_rerank_within_parent_etype,
+    )
+    df = _build_rerank_test_frame("adohnpem-1", n_main=3, n_partial=5)
+    # Sanity: legacy rerank silently does nothing on FFPE
+    out_legacy, stats_legacy = _phase1_rerank_within_parent(
+        df.drop(columns=["_etype"]), entity_col="tracer_id", margin_tx=1,
+    )
+    assert stats_legacy["n_parents_reranked"] == 0, (
+        "Legacy rerank should silently no-op on FFPE cell_ids "
+        "(the bug that motivates this refactor)."
+    )
+
+    # Etype rerank correctly does the swap.
+    out_etype, stats_etype = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    assert stats_etype["n_parents_reranked"] == 1
+    assert stats_etype["n_tx_relabeled"] == 8
+    counts = out_etype["tracer_id"].value_counts().to_dict()
+    assert counts == {"adohnpem-1": 5, "adohnpem-1-1": 3}
+
+
+def test_rerank_etype_handles_pdac_subpartial():
+    """Sub-partial follow + bump-on-collision works on PDAC cell_ids."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
+    df = _build_rerank_test_frame(
+        "adohnpem-1", n_main=2, n_partial=4, n_subpartial=2,
+    )
+    out, stats = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    # After swap: was 42-1 (4 + 2 sub) → "adohnpem-1"; sub follows;
+    # deposed main (2 tx) bumps past the reserved sub-suffix slot.
+    assert counts == {"adohnpem-1": 4, "adohnpem-1-1": 2, "adohnpem-1-2": 2}
+    assert stats["n_parents_reranked"] == 1
+
+
+def test_rerank_etype_unassigned_label_skipped():
+    """Rows with cell_id == sentinel are skipped; UNASSIGNED entities ignored."""
+    from tests._pipeline_runner import _phase1_rerank_within_parent_etype
+    from tracer._etype import ETYPE_DTYPE
+    df = pd.DataFrame(
+        [
+            ("42",            "42",  True,  "cell"),
+            ("42-1",          "42",  True,  "partial"),
+            ("42-1",          "42",  True,  "partial"),
+            ("42-1",          "42",  True,  "partial"),
+            ("42-1",          "42",  True,  "partial"),
+            ("42-1",          "42",  True,  "partial"),
+            ("UNASSIGNED_7", "42",  True,  "component"),
+            ("-1",            "-1",  False, "unknown"),
+        ],
+        columns=["tracer_id", "cell_id", "overlaps_nucleus", "_etype"],
+    )
+    df["_etype"] = df["_etype"].astype(ETYPE_DTYPE)
+    out, stats = _phase1_rerank_within_parent_etype(
+        df, entity_col="tracer_id", cell_id_col="cell_id", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    # main 42 (1 tx) vs partial 42-1 (5 tx) → swap.
+    # UNASSIGNED_7 and -1 untouched.
+    assert counts["42"] == 5
+    assert counts["42-1"] == 1
+    assert counts["UNASSIGNED_7"] == 1
+    assert counts["-1"] == 1

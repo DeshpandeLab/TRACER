@@ -231,6 +231,183 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
     return df_out, stats
 
 
+def _phase1_rerank_within_parent_etype(df_in: pd.DataFrame, *,
+                                         entity_col: str,
+                                         cell_id_col: str = "cell_id",
+                                         nuclear_col: str = "overlaps_nucleus",
+                                         margin_tx: int = 1,
+                                         ) -> tuple[pd.DataFrame, dict]:
+    """Sibling of `_phase1_rerank_within_parent` that uses the input
+    `cell_id_col` for parent identity (works regardless of cell_id
+    format — integer or FFPE-style dash-containing) instead of regex-
+    parsing the label string.
+
+    Depth is determined by parsing the suffix that follows the cell_id
+    prefix. A tx with label ``L`` and cell_id ``C`` is:
+
+      - main (depth 0):       ``L == C``
+      - depth-1 partial:      ``L == C + "-{k}"`` with k an integer
+      - sub-partial (depth 2):``L == C + "-{k}-{j}"``
+
+    Cell_ids that natively contain dashes (e.g. PDAC's ``adohnpem-1``)
+    are handled correctly: the suffix-after-cell_id (``""`` /
+    ``"-1"`` / ``"-1-1"``) is parsed, not the cell_id itself.
+
+    Output semantics identical to the legacy version: sub-partials
+    follow their depth-1 ancestor's renaming, bump-on-collision for
+    deposed mains, strict `>` margin gate.
+
+    Reads from the `_etype` column when present to filter rerank
+    candidates (only ``cell`` / ``partial`` types are considered;
+    cascade ``component`` entities and ``unknown`` sentinels are
+    skipped). On dataframes without `_etype`, falls back to a label-
+    structure check that treats any pattern ``{cell_id}(-\\d+){0,2}``
+    as a rerank candidate.
+    """
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    labels = df_out[entity_col].to_numpy(dtype=object).copy()
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+    cell_ids = df_out[cell_id_col].astype(str).to_numpy()
+    has_etype = "_etype" in df_out.columns
+    etype_arr = (
+        df_out["_etype"].astype(str).to_numpy() if has_etype else None
+    )
+
+    # Set of labels classified as TRACER-managed entities (cell or
+    # partial). On dataframes with `_etype` we read directly; otherwise
+    # fall back to checking that the suffix-after-cell_id matches the
+    # `{cell_id}(-\\d+){0,2}` shape.
+    UNASSIGNED_SENTINELS = {"-1", "DROP", "UNASSIGNED", "nan"}
+
+    def _suffix_indices(lab: str, cid: str) -> list[int] | None:
+        """Return the integer suffix-after-cell_id components, or None
+        if the label doesn't follow the expected form for parent ``cid``.
+
+        Examples:
+          ('42',         '42')        → []
+          ('42-1',       '42')        → [1]
+          ('42-1-1',     '42')        → [1, 1]
+          ('adohnpem-1', 'adohnpem-1')→ []
+          ('adohnpem-1-1','adohnpem-1')→ [1]
+          ('cascade_3-1','42')        → None (different parent)
+        """
+        if lab == cid:
+            return []
+        if not lab.startswith(cid + "-"):
+            return None
+        suffix = lab[len(cid) + 1:]
+        parts = suffix.split("-")
+        try:
+            return [int(p) for p in parts]
+        except ValueError:
+            return None
+
+    # Bucket tx by (parent_cell_id, depth_1_label). Depth-1 label is
+    # `cid` for mains, `cid-{k}` for depth-1 partials, and for sub-
+    # partials we use their depth-1 ancestor (`cid-{k}`).
+    parent_to_depth1_rows: dict[str, dict[str, list[int]]] = {}
+    for i, (lab, cid) in enumerate(zip(labels, cell_ids)):
+        if cid in UNASSIGNED_SENTINELS:
+            continue
+        if has_etype and etype_arr[i] not in ("cell", "partial"):
+            continue
+        suffix_idx = _suffix_indices(str(lab), str(cid))
+        if suffix_idx is None or len(suffix_idx) > 2:
+            continue  # not a Phase 1-style entity (e.g., cascade)
+        depth1 = str(cid) if not suffix_idx else f"{cid}-{suffix_idx[0]}"
+        parent_to_depth1_rows.setdefault(str(cid), {}).setdefault(
+            depth1, []
+        ).append(i)
+
+    stats = {"n_parents_reranked": 0, "n_tx_relabeled": 0}
+
+    for parent, depth1_map in parent_to_depth1_rows.items():
+        if len(depth1_map) < 2:
+            continue
+
+        sizes: list[tuple[str, int]] = []
+        current_main = parent if parent in depth1_map else None
+        for d1, rows in depth1_map.items():
+            n_nuc = int(sum(1 for r in rows if is_nuclear[r]))
+            sizes.append((d1, n_nuc))
+
+        def _sort_key(d1_size: tuple[str, int], _cm=current_main) -> tuple:
+            d1, n = d1_size
+            return (-n, -(d1 == _cm), d1)
+        sizes.sort(key=_sort_key)
+
+        n_largest = sizes[0][1]
+        n_runner_up = sizes[1][1]
+        if (n_largest - n_runner_up) < margin_tx:
+            continue
+        if sizes[0][0] == current_main:
+            continue
+
+        # Count rank-0's sub-partials to reserve their suffix slots.
+        rank0_old_d1 = sizes[0][0]
+        rank0_subs: set[int] = set()
+        for r in depth1_map[rank0_old_d1]:
+            suffix_idx = _suffix_indices(str(labels[r]), parent)
+            assert suffix_idx is not None
+            if len(suffix_idx) == 2:
+                rank0_subs.add(suffix_idx[1])
+        n_rank0_subs = len(rank0_subs)
+
+        # Build the depth-1 rename map.
+        new_depth1: dict[str, str] = {}
+        for k, (d1, _) in enumerate(sizes):
+            new_depth1[d1] = parent if k == 0 else f"{parent}-{k + n_rank0_subs}"
+
+        # Sub-suffix renumber: uniform per old depth-1, starting at 1.
+        sub_rename: dict[tuple[str, int], int] = {}
+        for d1, _ in sizes:
+            old_d2js: list[int] = []
+            for r in depth1_map[d1]:
+                suffix_idx = _suffix_indices(str(labels[r]), parent)
+                assert suffix_idx is not None
+                if len(suffix_idx) == 2 and suffix_idx[1] not in old_d2js:
+                    old_d2js.append(suffix_idx[1])
+            old_d2js.sort()
+            for new_idx, old_d2j in enumerate(old_d2js, start=1):
+                sub_rename[(d1, old_d2j)] = new_idx
+
+        all_rows = [r for rows in depth1_map.values() for r in rows]
+        rows_to_cell: list[int] = []
+        rows_to_partial: list[int] = []
+        for r in all_rows:
+            suffix_idx = _suffix_indices(str(labels[r]), parent)
+            assert suffix_idx is not None
+            old_d1 = parent if not suffix_idx else f"{parent}-{suffix_idx[0]}"
+            new_d1 = new_depth1[old_d1]
+            if len(suffix_idx) < 2:
+                labels[r] = new_d1
+                if new_d1 == parent:
+                    rows_to_cell.append(r)
+                else:
+                    rows_to_partial.append(r)
+            else:
+                new_d2 = sub_rename[(old_d1, suffix_idx[1])]
+                labels[r] = f"{new_d1}-{new_d2}"
+                # sub-partial keeps its existing "partial" etype
+
+        if has_etype:
+            if rows_to_cell:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_cell] = True
+                df_out.loc[mask, "_etype"] = "cell"
+            if rows_to_partial:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_partial] = True
+                df_out.loc[mask, "_etype"] = "partial"
+
+        stats["n_parents_reranked"] += 1
+        stats["n_tx_relabeled"] += len(all_rows)
+
+    df_out[entity_col] = labels
+    return df_out, stats
+
+
 def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
                                      entity_col: str,
                                      coord_cols=("x", "y", "z"),
