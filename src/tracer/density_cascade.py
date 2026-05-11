@@ -435,8 +435,8 @@ def cascade_as_residual_handler(
     `{label_prefix}{n}-1` (depth-1 partial) back to `entity_col` for
     committed tx. Tx not anchored remain "-1".
 
-    The `-1` suffix puts cascade output in the partial namespace — `_classify`
-    sees them as `partial`, and downstream Stitch's two-dash partial-merger
+    The `-1` suffix puts cascade output in the partial namespace
+    (``_etype = "partial"``), and downstream Stitch's two-dash partial-merger
     can glue fragments of the same biological cell into one entity (output
     e.g. `cascade_5-1-1`). On full Xenium tissue this merges ~10 % of
     cascade fragments and gains +0.003 completeness with stable homogeneity.
@@ -473,10 +473,8 @@ def cascade_as_residual_handler(
         relabeled_orig_indices.append(int(orig_idx))
     df_out[entity_col] = new_labels
 
-    # Mirror the cascade label-emission in `_etype` if the column
-    # exists. Cascade entities are emitted as `cascade_<n>-1` — they
-    # are treated as 'partial' in the legacy `infer_entity_type`
-    # classifier (any label containing '-' is partial), and the
+    # Mirror the cascade label-emission in `_etype`. Cascade entities
+    # are emitted as `cascade_<n>-1` and classified as ``partial`` —
     # downstream rerank/reassign machinery treats them symmetrically
     # with Phase-1c partials.
     if "_etype" in df_out.columns and relabeled_orig_indices:

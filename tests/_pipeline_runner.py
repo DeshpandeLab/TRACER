@@ -973,7 +973,7 @@ PHASE1_RERANK_MARGIN_TX: int = 1
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
 # spatial-only connected components) with the density-cascade Phase 1 on
 # the same post-Rescue residual. Cascade emits `cascade_<n>` synthetic
-# anchors, classified as 'cell' by `_classify`. Floor is selected at runtime
+# anchors, classified as 'cell' (``_etype == "cell"``). Floor is selected at runtime
 # from runtime tx-coverage in the residual pool — no hand-tuned thresholds.
 #
 # On 500 µm Xenium ROI, head-to-head:
@@ -1023,25 +1023,29 @@ PHASE1_NOSEG_CASCADE_TARGET_COV: float = 0.65
 PHASE1_NOSEG_CASCADE_HARD_MIN: int = 2
 
 
-def _classify(label: str) -> str:
-    s = str(label)
-    # All unassigned-class labels (fixed sentinels + stage-rejected
-    # diagnostics like "prune_rejected"/"group_rejected"/"demote_rejected")
-    # collapse to "unassigned" for stage-snapshot accounting.
-    if s in ("DROP", "-1", "nan", "UNASSIGNED") or s.endswith("_rejected"):
-        return "unassigned"
-    if s.startswith("UNASSIGNED_"):
-        return "component"
-    if "-" in s:
-        return "partial"
-    return "cell"
-
-
 def _state_dict(df: pd.DataFrame, col: str) -> dict[str, int]:
+    """Stage-snapshot accounting. Reads the upstream-emitted ``_etype``
+    column when present (correct on FFPE cell_ids); otherwise falls
+    back to the canonical label parser :func:`tracer._etype.infer_etype_from_label`.
+    """
+    from tracer._etype import infer_etype_from_label
+
     s = df[col].astype(str)
-    types = s.map(_classify)
-    n_ent = s.groupby(types).nunique().to_dict()
-    n_tx = types.value_counts().to_dict()
+    if "_etype" in df.columns:
+        etypes = df["_etype"].astype(str)
+    else:
+        etypes = pd.Series(
+            np.asarray(infer_etype_from_label(s)).astype(str),
+            index=df.index,
+        )
+    # Map etype categories → snapshot keys. "unknown" and "drop" both
+    # collapse to "unassigned" (matches the legacy `_classify` schema).
+    bucket = etypes.where(
+        etypes.isin(["cell", "partial", "component"]),
+        other="unassigned",
+    )
+    n_ent = s.groupby(bucket).nunique().to_dict()
+    n_tx = bucket.value_counts().to_dict()
     return {
         "n_cells": int(n_ent.get("cell", 0)),
         "n_partials": int(n_ent.get("partial", 0)),

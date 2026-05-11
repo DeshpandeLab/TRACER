@@ -15,37 +15,6 @@ from .graph import _BIN_BIAS, bin_xy, delaunay_edges, neighbor_bins, unpack_bin
 
 
 # ---------- Phase 4: Hierarchical Stitching ----------
-# ----------------------------
-# Helpers: entity type / parse
-# ----------------------------
-def infer_entity_type(entity_id: str) -> str:
-    """
-    Returns one of: 'cell', 'partial', 'component', 'drop', 'unknown'
-    """
-    if entity_id is None or (isinstance(entity_id, float) and np.isnan(entity_id)):
-        return "unknown"
-    s = str(entity_id)
-    # Unassigned sentinels — must be checked BEFORE the partial-by-hyphen
-    # rule, otherwise "-1" gets misclassified as a partial (because it
-    # contains a hyphen) and Stitch tries to merge a phantom "-1
-    # partial" entity with real cells.
-    #
-    # The unassigned class includes:
-    #   - fixed sentinels: -1, DROP, UNASSIGNED, nan
-    #   - stage-rejected diagnostics: *_rejected (prune_rejected,
-    #     group_rejected, demote_rejected — see spatial.UNASSIGNED_LABELS)
-    # All map to "unknown" so the cell/partial/component whitelist at the
-    # call sites uniformly excludes them — no label-specific filter
-    # downstream needs updating when a new stage-rejection sentinel is
-    # added.
-    if s in ("-1", "DROP", "UNASSIGNED", "nan") or s.endswith("_rejected"):
-        return "unknown"
-    if s.startswith("UNASSIGNED_"):
-        return "component"
-    if "-" in s:
-        return "partial"
-    # otherwise treat as cell (original)
-    return "cell"
 
 
 def estimate_within_cell_dz_threshold(
@@ -272,10 +241,11 @@ def compute_within_entity_dz_stats(
     z_col : str, default ``"z"``
         Column holding the z coordinate (µm).
     etype_filter : tuple of {"cell", "partial", "component"} or None
-        Restrict the pool to entities of these types (per
-        :func:`infer_entity_type`). Pass ``None`` to include all
-        non-``"-1"`` entities. Default ``("cell",)`` — cells are the
-        most representative reference scale.
+        Restrict the pool to entities of these types (read from the
+        ``_etype`` column when present, otherwise computed via
+        :func:`tracer._etype.infer_etype_from_label`). Pass ``None`` to
+        include all non-``"-1"`` entities. Default ``("cell",)`` — cells
+        are the most representative reference scale.
     min_entity_size : int
         Skip entities with fewer than this many transcripts (no
         pairwise statistic).
@@ -290,16 +260,21 @@ def compute_within_entity_dz_stats(
         percentile, e.g. ``"p75"``. All distances in same units as
         ``z_col`` (typically µm). Returns NaN-filled dict if no data.
     """
+    from ._etype import infer_etype_from_label
+
     s = df[entity_col].astype(str)
     keep = s != "-1"
     if etype_filter is not None:
         # Prefer the upstream-emitted _etype column when present
-        # (correct on FFPE cell_ids). Fall back to label-string parsing
-        # for back-compat.
+        # (correct on FFPE cell_ids). Fall back to the vectorized
+        # label parser for back-compat on input frames without _etype.
         if "_etype" in df.columns:
             types = df["_etype"].astype(str)
         else:
-            types = s.map(infer_entity_type)
+            types = pd.Series(
+                np.asarray(infer_etype_from_label(s)).astype(str),
+                index=s.index,
+            )
         keep = keep & types.isin(etype_filter)
     sub = df[keep]
     pooled: list[np.ndarray] = []
@@ -357,11 +332,15 @@ def build_entity_table(
 
     # entity type — prefer the upstream-emitted `_etype` column when
     # present (correct on Xenium FFPE / IO cell_ids). Fall back to the
-    # label-string parser for back-compat on input frames without _etype.
+    # canonical vectorized label parser for back-compat on input frames
+    # without _etype.
     if "_etype" in df_final.columns:
         df["_etype"] = df_final.loc[keep, "_etype"].astype(str).to_numpy()
     else:
-        df["_etype"] = df[entity_col].map(infer_entity_type)
+        from ._etype import infer_etype_from_label
+        df["_etype"] = np.asarray(
+            infer_etype_from_label(df[entity_col])
+        ).astype(str)
     df = df[df["_etype"].isin(["cell", "partial", "component"])]
 
     # centroid (`observed=True` avoids processing empty categorical groups

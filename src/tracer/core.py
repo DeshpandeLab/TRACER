@@ -38,7 +38,6 @@ from .spatial import (
     demote_small_entities,
 )
 from .stitching import (
-    infer_entity_type,
     build_entity_table,
     coherence,
     signal_strength,
