@@ -83,48 +83,101 @@ def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
         mask = df_out[entity_col].isin(bad)
         df_out.loc[mask, entity_col] = unassigned_id
         n_demoted = int(mask.sum())
+        # Mirror the demotion in _etype if the column exists.
+        if "_etype" in df_out.columns:
+            df_out.loc[mask, "_etype"] = "unknown"
     return df_out, {
         "entities_demoted": len(bad),
         "tx_demoted": n_demoted,
     }
 
 
-def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
-                                   entity_col: str,
-                                   nuclear_col: str = "overlaps_nucleus",
-                                   margin_tx: int = 1,
-                                   ) -> tuple[pd.DataFrame, dict]:
-    """Within each parent cell, re-rank depth-1 entities by nuclear-tx
-    count and promote the largest to the main `{cell_id}` label.
+def _phase1_rerank_within_parent_etype(df_in: pd.DataFrame, *,
+                                         entity_col: str,
+                                         cell_id_col: str = "cell_id",
+                                         nuclear_col: str = "overlaps_nucleus",
+                                         margin_tx: int = 1,
+                                         ) -> tuple[pd.DataFrame, dict]:
+    """Sibling of `_phase1_rerank_within_parent` that uses the input
+    `cell_id_col` for parent identity (works regardless of cell_id
+    format — integer or FFPE-style dash-containing) instead of regex-
+    parsing the label string.
 
-    Sub-partials follow their depth-1 ancestor's renaming. Naming
-    collisions (deposed main vs renumbered sub-partials of new main)
-    are resolved by reserving sub-suffix slots for rank-0's sub-partials
-    first and bumping deposed depth-1 entities past the reserved range.
+    Depth is determined by parsing the suffix that follows the cell_id
+    prefix. A tx with label ``L`` and cell_id ``C`` is:
 
-    Parent identity is derived from the label regex; no cell_id column
-    is read.
+      - main (depth 0):       ``L == C``
+      - depth-1 partial:      ``L == C + "-{k}"`` with k an integer
+      - sub-partial (depth 2):``L == C + "-{k}-{j}"``
 
-    Spec: docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
+    Cell_ids that natively contain dashes (e.g. PDAC's ``adohnpem-1``)
+    are handled correctly: the suffix-after-cell_id (``""`` /
+    ``"-1"`` / ``"-1-1"``) is parsed, not the cell_id itself.
+
+    Output semantics identical to the legacy version: sub-partials
+    follow their depth-1 ancestor's renaming, bump-on-collision for
+    deposed mains, strict `>` margin gate.
+
+    Reads from the `_etype` column when present to filter rerank
+    candidates (only ``cell`` / ``partial`` types are considered;
+    cascade ``component`` entities and ``unknown`` sentinels are
+    skipped). On dataframes without `_etype`, falls back to a label-
+    structure check that treats any pattern ``{cell_id}(-\\d+){0,2}``
+    as a rerank candidate.
     """
-    import re as _re
-
     df_out = df_in.copy()
     df_out[entity_col] = df_out[entity_col].astype(str)
     labels = df_out[entity_col].to_numpy(dtype=object).copy()
     is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+    cell_ids = df_out[cell_id_col].astype(str).to_numpy()
+    has_etype = "_etype" in df_out.columns
+    etype_arr = (
+        df_out["_etype"].astype(str).to_numpy() if has_etype else None
+    )
 
-    _re_label = _re.compile(r"^(\d+)(?:-(\d+)(?:-(\d+))?)?$")
+    # Set of labels classified as TRACER-managed entities (cell or
+    # partial). On dataframes with `_etype` we read directly; otherwise
+    # fall back to checking that the suffix-after-cell_id matches the
+    # `{cell_id}(-\\d+){0,2}` shape.
+    UNASSIGNED_SENTINELS = {"-1", "DROP", "UNASSIGNED", "nan"}
 
+    def _suffix_indices(lab: str, cid: str) -> list[int] | None:
+        """Return the integer suffix-after-cell_id components, or None
+        if the label doesn't follow the expected form for parent ``cid``.
+
+        Examples:
+          ('42',         '42')        → []
+          ('42-1',       '42')        → [1]
+          ('42-1-1',     '42')        → [1, 1]
+          ('adohnpem-1', 'adohnpem-1')→ []
+          ('adohnpem-1-1','adohnpem-1')→ [1]
+          ('cascade_3-1','42')        → None (different parent)
+        """
+        if lab == cid:
+            return []
+        if not lab.startswith(cid + "-"):
+            return None
+        suffix = lab[len(cid) + 1:]
+        parts = suffix.split("-")
+        try:
+            return [int(p) for p in parts]
+        except ValueError:
+            return None
+
+    # Bucket tx by (parent_cell_id, depth_1_label). Depth-1 label is
+    # `cid` for mains, `cid-{k}` for depth-1 partials, and for sub-
+    # partials we use their depth-1 ancestor (`cid-{k}`).
     parent_to_depth1_rows: dict[str, dict[str, list[int]]] = {}
-    for i, lab in enumerate(labels):
-        m = _re_label.match(str(lab))
-        if not m:
+    for i, (lab, cid) in enumerate(zip(labels, cell_ids)):
+        if cid in UNASSIGNED_SENTINELS:
             continue
-        parent = m.group(1)
-        d1 = m.group(2)
-        depth1 = parent if d1 is None else f"{parent}-{d1}"
-        parent_to_depth1_rows.setdefault(parent, {}).setdefault(
+        if has_etype and etype_arr[i] not in ("cell", "partial"):
+            continue
+        suffix_idx = _suffix_indices(str(lab), str(cid))
+        if suffix_idx is None or len(suffix_idx) > 2:
+            continue  # not a Phase 1-style entity (e.g., cascade)
+        depth1 = str(cid) if not suffix_idx else f"{cid}-{suffix_idx[0]}"
+        parent_to_depth1_rows.setdefault(str(cid), {}).setdefault(
             depth1, []
         ).append(i)
 
@@ -152,52 +205,62 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
         if sizes[0][0] == current_main:
             continue
 
+        # Count rank-0's sub-partials to reserve their suffix slots.
         rank0_old_d1 = sizes[0][0]
-        rank0_subs: set[str] = set()
+        rank0_subs: set[int] = set()
         for r in depth1_map[rank0_old_d1]:
-            m = _re_label.match(str(labels[r]))
-            assert m is not None
-            if m.group(3) is not None:
-                rank0_subs.add(m.group(3))
+            suffix_idx = _suffix_indices(str(labels[r]), parent)
+            assert suffix_idx is not None
+            if len(suffix_idx) == 2:
+                rank0_subs.add(suffix_idx[1])
         n_rank0_subs = len(rank0_subs)
 
+        # Build the depth-1 rename map.
         new_depth1: dict[str, str] = {}
         for k, (d1, _) in enumerate(sizes):
-            if k == 0:
-                new_depth1[d1] = parent
-            else:
-                new_depth1[d1] = f"{parent}-{k + n_rank0_subs}"
+            new_depth1[d1] = parent if k == 0 else f"{parent}-{k + n_rank0_subs}"
 
-        # Renumber sub-suffixes for EVERY old depth-1 (not just rank-0) so the
-        # output suffix set is always contiguous starting at 1. Spec says
-        # "preserved verbatim"; in practice Split-Phase1 emits contiguous
-        # suffixes so renumbering is a no-op for non-rank-0 entities. Keeping
-        # the uniform rule simplifies the code without observable behavior
-        # change on the production data.
-        sub_rename: dict[tuple[str, str], str] = {}
+        # Sub-suffix renumber: uniform per old depth-1, starting at 1.
+        sub_rename: dict[tuple[str, int], int] = {}
         for d1, _ in sizes:
-            old_d2js: list[str] = []
+            old_d2js: list[int] = []
             for r in depth1_map[d1]:
-                m = _re_label.match(str(labels[r]))
-                assert m is not None
-                if m.group(3) is not None and m.group(3) not in old_d2js:
-                    old_d2js.append(m.group(3))
-            old_d2js.sort(key=int)
+                suffix_idx = _suffix_indices(str(labels[r]), parent)
+                assert suffix_idx is not None
+                if len(suffix_idx) == 2 and suffix_idx[1] not in old_d2js:
+                    old_d2js.append(suffix_idx[1])
+            old_d2js.sort()
             for new_idx, old_d2j in enumerate(old_d2js, start=1):
-                sub_rename[(d1, old_d2j)] = str(new_idx)
+                sub_rename[(d1, old_d2j)] = new_idx
 
         all_rows = [r for rows in depth1_map.values() for r in rows]
+        rows_to_cell: list[int] = []
+        rows_to_partial: list[int] = []
         for r in all_rows:
-            m = _re_label.match(str(labels[r]))
-            assert m is not None
-            d1k = m.group(2)
-            d2j = m.group(3)
-            old_d1 = parent if d1k is None else f"{parent}-{d1k}"
+            suffix_idx = _suffix_indices(str(labels[r]), parent)
+            assert suffix_idx is not None
+            old_d1 = parent if not suffix_idx else f"{parent}-{suffix_idx[0]}"
             new_d1 = new_depth1[old_d1]
-            if d2j is None:
+            if len(suffix_idx) < 2:
                 labels[r] = new_d1
+                if new_d1 == parent:
+                    rows_to_cell.append(r)
+                else:
+                    rows_to_partial.append(r)
             else:
-                labels[r] = f"{new_d1}-{sub_rename[(old_d1, d2j)]}"
+                new_d2 = sub_rename[(old_d1, suffix_idx[1])]
+                labels[r] = f"{new_d1}-{new_d2}"
+                # sub-partial keeps its existing "partial" etype
+
+        if has_etype:
+            if rows_to_cell:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_cell] = True
+                df_out.loc[mask, "_etype"] = "cell"
+            if rows_to_partial:
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_to_partial] = True
+                df_out.loc[mask, "_etype"] = "partial"
 
         stats["n_parents_reranked"] += 1
         stats["n_tx_relabeled"] += len(all_rows)
@@ -300,14 +363,19 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
         m_part = _re.match(r"^(\d+)-(\d+)$", ent)
         m_sub = _re.match(r"^(\d+)-(\d+)-(\d+)$", ent)
 
+        # Collect (rows, new_etype) updates per parent for batched _etype write.
+        rows_to_unknown_local: list[np.ndarray] = []
+        rows_to_partial_local: list[np.ndarray] = []
+
         for k, gr in enumerate(groups_rows):
             sz = len(gr)
             if sz < min_size:
                 out_labels[gr] = unassigned_id
                 stats["tx_demoted_singletons"] += sz
+                rows_to_unknown_local.append(gr)
                 continue
             if k == 0:
-                continue  # largest keeps original label
+                continue  # largest keeps original label (and its existing _etype)
 
             # Mint fresh label without colliding with existing partials
             if m_main is not None:
@@ -330,6 +398,24 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
             out_labels[gr] = new_label
             stats["subgroups_minted"] += 1
             stats["tx_total_relabelled"] += sz
+            # New sub-group inherits "partial" etype regardless of whether
+            # the parent was a main (depth-1 partial emitted) or a partial
+            # (sub-partial emitted) — per the design, sub-partials are
+            # "partial" flat.
+            rows_to_partial_local.append(gr)
+
+        # Apply _etype updates for this parent
+        if "_etype" in df_out.columns:
+            if rows_to_unknown_local:
+                rows_concat = np.concatenate(rows_to_unknown_local)
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_concat] = True
+                df_out.loc[mask, "_etype"] = "unknown"
+            if rows_to_partial_local:
+                rows_concat = np.concatenate(rows_to_partial_local)
+                mask = np.zeros(len(df_out), dtype=bool)
+                mask[rows_concat] = True
+                df_out.loc[mask, "_etype"] = "partial"
 
     df_out[entity_col] = out_labels
     return df_out, stats
@@ -374,37 +460,24 @@ def _vectorized_mean_pmi_excl_self(W: np.ndarray,
     return out
 
 
-def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
-                                entity_col: str,
-                                aux: dict,
-                                cell_id_col: str = "cell_id",
-                                gene_col: str = "feature_name",
-                                nuclear_col: str = "overlaps_nucleus",
-                                margin: float = 0.05,
-                                threshold: float = 0.05,
-                                ) -> tuple[pd.DataFrame, dict]:
-    """Re-evaluate nuclear tx admitted to main entities against any
-    sibling partials emitted by Phase 1c. If a partial sibling has a
-    strictly higher mean-PMI fit than the main entity (by at least
-    `margin`), MOVE the tx to that partial.
+def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
+                                       entity_col: str,
+                                       aux: dict,
+                                       cell_id_col: str = "cell_id",
+                                       gene_col: str = "feature_name",
+                                       nuclear_col: str = "overlaps_nucleus",
+                                       margin: float = 0.05,
+                                       threshold: float = 0.05,
+                                       ) -> tuple[pd.DataFrame, dict]:
+    """Sibling of `_reassign_nuclear_post_1c` that uses the input
+    `cell_id_col` for parent identity instead of regex-parsing the
+    label string. Works on any cell_id format — integer (lung cancer)
+    or alphanumeric / dash-containing (Xenium FFPE / IO).
 
-    Vectorized rewrite of the per-parent inner loop:
-      - Build the (N_main_nuc, |S_seed|) PMI slice once per (parent, seed).
-      - Apply the sequential margin-walk vectorized across N
-        (preserving legacy semantics: `mp > best_mean + margin`).
-
-    Operates only on NUCLEAR tx (consistent with Phase 1's nuclear-only
-    admission policy). Cyto tx are left alone for downstream Rescue.
-
-    Closes Gap B: a nuclear tx weakly admitted to the main seed via
-    mean-PMI test (its gene NOT a true seed member) might fit a
-    1c-emitted partial's sub-seed strictly better. Currently it's
-    locked in the main entity; this stage frees it to the partial.
-
-    Returns (df_out, stats).
+    All other semantics identical to the legacy / regex version:
+    sequential margin walk, `mp > best_mean + margin` admission rule,
+    nuclear-only tx considered.
     """
-    import re as _re
-
     df_out = df_in.copy()
     df_out[entity_col] = df_out[entity_col].astype(str)
     label_arr = df_out[entity_col].to_numpy(dtype=object).copy()
@@ -422,64 +495,80 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
     cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
     nuc_idx = np.where(is_nuclear)[0]
 
-    # Build per-entity nuclear-gene set via pandas groupby — much faster
-    # than the per-tx Python loop on large frames.
+    has_etype = "_etype" in df_out.columns
+    etype_arr = (
+        df_out["_etype"].astype(str).to_numpy() if has_etype else None
+    )
+
+    # Build per-entity nuclear-gene set via pandas groupby.
     _UN = {"-1", "DROP", "UNASSIGNED", "nan"}
     label_s = pd.Series(label_arr)
-    is_un_label = label_s.isin(_UN) | label_s.str.startswith("UNASSIGNED_", na=False)
+    is_un_label = (
+        label_s.isin(_UN) | label_s.str.startswith("UNASSIGNED_", na=False)
+    )
     nuc_with_entity_mask = is_nuclear & (~is_un_label.to_numpy())
     if nuc_with_entity_mask.any():
-        gi_arr_all = pd.Series(nuc_genes).map(gene_to_idx).fillna(-1).astype(np.int64).to_numpy()
+        gi_arr_all = (
+            pd.Series(nuc_genes).map(gene_to_idx)
+            .fillna(-1).astype(np.int64).to_numpy()
+        )
         valid_for_build = nuc_with_entity_mask & (gi_arr_all >= 0)
         if valid_for_build.any():
             build_df = pd.DataFrame({
                 "entity": label_arr[valid_for_build].astype(str),
                 "gi":     gi_arr_all[valid_for_build],
             }).drop_duplicates()
-            entity_to_genes_lists = build_df.groupby("entity", sort=False)["gi"].apply(np.array).to_dict()
+            entity_to_genes_lists = (
+                build_df.groupby("entity", sort=False)["gi"]
+                .apply(np.array).to_dict()
+            )
             entity_to_genes: dict[str, set[int]] = {
-                e: set(int(x) for x in arr) for e, arr in entity_to_genes_lists.items()
+                e: set(int(x) for x in arr)
+                for e, arr in entity_to_genes_lists.items()
             }
         else:
             entity_to_genes = {}
     else:
         entity_to_genes = {}
 
-    # Group by parent cell_id (first numeric token of the label)
+    # Build parent_to_entities using the cell_id column — works on
+    # any cell_id format, no regex.
+    # For each entity, find its parent by looking up the cell_id of
+    # any tx labeled with that entity. Filter to entities that ARE
+    # the main label of some cell (label == cell_id) or a partial /
+    # sub-partial (label.startswith(cell_id + "-")).
+    SENT = _UN
     parent_to_entities: dict[str, list[str]] = {}
     for ent in entity_to_genes:
-        m = _re.match(r"^(\d+)(?:-\d+){0,2}$", ent)
-        if not m:
+        idx = np.where(label_arr == ent)[0]
+        if idx.size == 0:
             continue
-        parent_to_entities.setdefault(m.group(1), []).append(ent)
+        parent = str(cell_id_arr[idx[0]])
+        if parent in SENT:
+            continue
+        if ent != parent and not ent.startswith(parent + "-"):
+            continue  # not a Phase 1-family entity (e.g., cascade)
+        parent_to_entities.setdefault(parent, []).append(ent)
 
     n_moves = 0
     n_parents_with_partials = 0
+    moved_tx_indices: list[int] = []
 
-    # Precompute candidate tx indices per parent in ONE pass: for each
-    # nuclear tx whose entity label is purely numeric (a main label),
-    # record (parent, tx_idx). Avoids the per-parent boolean mask scan
-    # that was the dominant cost in the legacy implementation.
+    # Candidate tx per parent: nuclear, in main entity (label == cell_id),
+    # AND etype == "cell" if column present. Works on any cell_id format.
     cand_by_parent: dict[str, np.ndarray] = {}
     if nuc_idx.size > 0:
-        nuc_label_arr = label_arr[nuc_idx]
-        nuc_cell_id   = cell_id_arr[nuc_idx]
-        # Main labels are pure digits (no '-'); fast string filter
-        nuc_label_str = nuc_label_arr.astype(str)
-        is_main_label = np.fromiter(
-            (s.isdigit() for s in nuc_label_str),
-            dtype=bool, count=nuc_label_str.size,
-        )
-        # Also require label == cell_id (matches legacy's `cell_id_arr == parent` guard)
-        is_owned = nuc_label_str == nuc_cell_id
-        is_cand = is_main_label & is_owned
+        nuc_label = label_arr[nuc_idx].astype(str)
+        nuc_cid = cell_id_arr[nuc_idx]
+        is_cand = nuc_label == nuc_cid
+        if has_etype:
+            is_cand &= (etype_arr[nuc_idx] == "cell")
         if is_cand.any():
             cand_tx_idx = nuc_idx[is_cand]
-            cand_parent = nuc_label_str[is_cand]
+            cand_parent = nuc_cid[is_cand]
             order = np.argsort(cand_parent, kind="stable")
             cand_tx_idx_sorted = cand_tx_idx[order]
             cand_parent_sorted = cand_parent[order]
-            # Group boundaries
             change = np.r_[True, cand_parent_sorted[1:] != cand_parent_sorted[:-1]]
             starts = np.where(change)[0]
             ends = np.r_[starts[1:], cand_parent_sorted.size]
@@ -502,9 +591,11 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
             continue
 
         S_main = np.fromiter(entity_to_genes[main], dtype=np.int64)
-        S_partials_arrays = [np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials]
+        S_partials_arrays = [
+            np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials
+        ]
 
-        # Lazy gene-index lookup, only for this parent's candidates.
+        # Lazy gene-index lookup for this parent's candidates.
         cand_gene_idx = np.fromiter(
             (gene_to_idx.get(nuc_genes[i], -1) for i in cand_idx),
             dtype=np.int64, count=cand_idx.size,
@@ -515,21 +606,15 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
         cand_idx_v = cand_idx[valid_gene]
         cand_g_v = cand_gene_idx[valid_gene]
 
-        # mean PMI vs main (vectorized)
         mean_main_v = _vectorized_mean_pmi_excl_self(W, cand_g_v, S_main)
         finite_main_v = np.isfinite(mean_main_v)
         if not finite_main_v.any():
             continue
-        # Only consider tx with finite mean_main
         cand_idx_f = cand_idx_v[finite_main_v]
         cand_g_f = cand_g_v[finite_main_v]
         best_mean = mean_main_v[finite_main_v].copy()
         best_p_idx = np.full(best_mean.shape, -1, dtype=np.int32)
 
-        # Sequential margin walk, vectorized across tx for each partial.
-        # Iteration order over partials must match the legacy
-        # `for p, S_p in S_partials.items()`: dict insertion order ==
-        # insertion order of `partials` list.
         for k, S_p in enumerate(S_partials_arrays):
             mp = _vectorized_mean_pmi_excl_self(W, cand_g_f, S_p)
             accept = np.isfinite(mp) & (mp > best_mean + margin)
@@ -540,127 +625,19 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
         moves = best_p_idx >= 0
         if moves.any():
             for n_local in np.where(moves)[0]:
-                k = int(best_p_idx[n_local])
-                label_arr[cand_idx_f[n_local]] = partials[k]
+                kk = int(best_p_idx[n_local])
+                label_arr[cand_idx_f[n_local]] = partials[kk]
+                moved_tx_indices.append(int(cand_idx_f[n_local]))
             n_moves += int(moves.sum())
 
     df_out[entity_col] = label_arr
+    if has_etype and moved_tx_indices:
+        mask = np.zeros(len(df_out), dtype=bool)
+        mask[moved_tx_indices] = True
+        df_out.loc[mask, "_etype"] = "partial"
     return df_out, {
         "n_tx_moved": n_moves,
         "n_parents_with_partials": n_parents_with_partials,
-    }
-
-
-def _reassign_nuclear_post_1c_legacy(df_in: pd.DataFrame, *,
-                                entity_col: str,
-                                aux: dict,
-                                cell_id_col: str = "cell_id",
-                                gene_col: str = "feature_name",
-                                nuclear_col: str = "overlaps_nucleus",
-                                margin: float = 0.05,
-                                threshold: float = 0.05,
-                                ) -> tuple[pd.DataFrame, dict]:
-    """Legacy reference implementation of post-1c reassignment.
-
-    Kept for byte-identicality testing against the vectorized
-    `_reassign_nuclear_post_1c`. NOT called by the production pipeline.
-    See `_reassign_nuclear_post_1c` for the active implementation and
-    full docstring."""
-    import re as _re
-
-    df_out = df_in.copy()
-    df_out[entity_col] = df_out[entity_col].astype(str)
-    label_arr = df_out[entity_col].to_numpy(dtype=object).copy()
-
-    gene_to_idx = aux["gene_to_idx"]
-    W = aux["W"]
-    if hasattr(W, "dtype") and W.dtype != np.float32:
-        W = W.astype(np.float32)
-    if not isinstance(W, np.ndarray):
-        # sparse matrices: densify for the per-tx mean-PMI lookups
-        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
-                       dtype=np.float32)
-
-    # Build per-entity nuclear-gene set (using nuclear tx only)
-    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
-    nuc_idx = np.where(is_nuclear)[0]
-    nuc_genes = df_out[gene_col].astype(str).to_numpy()
-    nuc_labels = df_out[entity_col].to_numpy(dtype=object)
-
-    entity_to_genes: dict[str, set[int]] = {}
-    for i in nuc_idx:
-        e = nuc_labels[i]
-        if e in ("-1", "DROP", "UNASSIGNED", "nan") or str(e).startswith("UNASSIGNED_"):
-            continue
-        g = nuc_genes[i]
-        gi = gene_to_idx.get(g, -1)
-        if gi < 0:
-            continue
-        entity_to_genes.setdefault(str(e), set()).add(int(gi))
-
-    # Group by parent cell_id (first numeric token of the label)
-    parent_to_entities: dict[str, list[str]] = {}
-    for ent in entity_to_genes:
-        m = _re.match(r"^(\d+)(?:-\d+){0,2}$", ent)
-        if not m:
-            continue
-        parent_to_entities.setdefault(m.group(1), []).append(ent)
-
-    def _mean_pmi(g_idx: int, gene_set: set[int]) -> float:
-        if not gene_set:
-            return float("nan")
-        others = [x for x in gene_set if x != g_idx]
-        if not others:
-            return float("nan")
-        vals = W[g_idx, np.asarray(list(others), dtype=np.int64)]
-        finite = np.isfinite(vals)
-        if not finite.any():
-            return float("nan")
-        return float(vals[finite].mean())
-
-    n_moves = 0
-    cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
-
-    for parent, ent_list in parent_to_entities.items():
-        if len(ent_list) < 2:
-            continue
-        main = parent
-        if main not in entity_to_genes:
-            continue
-        partials = [e for e in ent_list if e != main]
-        if not partials:
-            continue
-
-        S_main = entity_to_genes[main]
-        S_partials = {p: entity_to_genes[p] for p in partials}
-
-        # Examine each NUCLEAR tx currently in the main entity
-        main_mask = (label_arr == main) & is_nuclear & (cell_id_arr == parent)
-        for tx_idx in np.where(main_mask)[0]:
-            g = nuc_genes[tx_idx]
-            gi = gene_to_idx.get(g, -1)
-            if gi < 0:
-                continue
-            mean_main = _mean_pmi(gi, S_main)
-            if not np.isfinite(mean_main):
-                continue
-            best_p = None
-            best_mean = mean_main
-            for p, S_p in S_partials.items():
-                mp = _mean_pmi(gi, S_p)
-                if np.isfinite(mp) and mp > best_mean + margin:
-                    best_mean = mp
-                    best_p = p
-            if best_p is not None:
-                label_arr[tx_idx] = best_p
-                n_moves += 1
-
-    df_out[entity_col] = label_arr
-    return df_out, {
-        "n_tx_moved": n_moves,
-        "n_parents_with_partials": int(sum(
-            1 for ents in parent_to_entities.values() if len(ents) >= 2
-        )),
     }
 
 
@@ -739,11 +716,13 @@ def _split_unassigned_components(df_in: pd.DataFrame, *,
         groups_rows.sort(key=lambda a: -len(a))
         stats["components_split"] += 1
 
+        demoted_rows_local: list[np.ndarray] = []
         for k, gr in enumerate(groups_rows):
             sz = len(gr)
             if sz < min_size:
                 out_labels[gr] = unassigned_id
                 stats["tx_demoted_singletons"] += sz
+                demoted_rows_local.append(gr)
                 continue
             if k == 0:
                 continue  # largest keeps original label
@@ -752,6 +731,13 @@ def _split_unassigned_components(df_in: pd.DataFrame, *,
             out_labels[gr] = new_label
             stats["subcomps_minted"] += 1
             stats["tx_total_relabelled"] += sz
+            # New sub-component label is still a Group component; _etype
+            # stays "component" — no update needed.
+        if demoted_rows_local and "_etype" in df_out.columns:
+            rows_concat = np.concatenate(demoted_rows_local)
+            mask = np.zeros(len(df_out), dtype=bool)
+            mask[rows_concat] = True
+            df_out.loc[mask, "_etype"] = "unknown"
 
     df_out[entity_col] = out_labels
     return df_out, stats
@@ -864,6 +850,8 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
         mask = df_out[entity_col].isin(bad_set)
         df_out.loc[mask, entity_col] = unassigned_id
         n_demoted = int(mask.sum())
+        if "_etype" in df_out.columns:
+            df_out.loc[mask, "_etype"] = "unknown"
 
     return df_out, {
         "entities_examined": int(entity_ids.size),
@@ -974,6 +962,12 @@ PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
                                         # count. See
                                         # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
 PHASE1_RERANK_MARGIN_TX: int = 1
+
+# The etype-aware path is now the only path (hardwired in commit
+# 3fbcc67). Legacy regex-based _phase1_rerank_within_parent and
+# _reassign_nuclear_post_1c functions remain in this module for
+# back-compat with tests that import them directly; they're not
+# called by run_segmented_pipeline anymore.
 
 
 # Opt-in: replace Group's `annotate_unassigned_components_fast` (G=8 self,
@@ -1145,7 +1139,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # nuclear tx weakly admitted to the main seed, whose gene fits a
     # 1c partial's sub-seed strictly better, get moved to the partial.
     if PHASE1_REASSIGN_AFTER_1C and "overlaps_nucleus" in df_pruned.columns:
-        df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
+        df_pruned, _reassign_stats = _reassign_nuclear_post_1c_etype(
             df_pruned, entity_col="tracer_id", aux=aux,
             cell_id_col="cell_id", gene_col="feature_name",
             nuclear_col="overlaps_nucleus",
@@ -1174,8 +1168,9 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # label. Defuses Phase 1's greedy 1a->1b->1c privilege.
     # Only runs when overlaps_nucleus is present (nuclear-seed prune path).
     if PHASE1_RERANK_ENABLED and "overlaps_nucleus" in df_pruned.columns:
-        df_pruned, _rerank_stats = _phase1_rerank_within_parent(
+        df_pruned, _rerank_stats = _phase1_rerank_within_parent_etype(
             df_pruned, entity_col="tracer_id",
+            cell_id_col="cell_id",
             nuclear_col="overlaps_nucleus",
             margin_tx=PHASE1_RERANK_MARGIN_TX,
         )

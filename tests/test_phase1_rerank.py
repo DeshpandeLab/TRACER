@@ -1,4 +1,4 @@
-"""Unit tests for `_phase1_rerank_within_parent`.
+"""Unit tests for `_phase1_rerank_within_parent_etype`.
 
 The function re-ranks depth-1 entities under each parent cell_id by
 nuclear-tx count and promotes the largest to the main `{cell_id}` label.
@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tests._pipeline_runner import _phase1_rerank_within_parent
+from tests._pipeline_runner import _phase1_rerank_within_parent_etype
 
 
 def _df(rows: list[tuple]) -> pd.DataFrame:
@@ -27,7 +27,7 @@ def test_no_partials_is_noop():
         ("42", "42", True),
         ("42", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -48,7 +48,7 @@ def test_single_swap_promotes_larger_partial():
         ("42-1", "42", True),
         ("42-1", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -67,7 +67,7 @@ def test_tie_keeps_original_main():
         ("42-1", "42", True),  ("42-1", "42", True),
         ("42-1", "42", True),  ("42-1", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -88,7 +88,7 @@ def test_three_way_reorder():
         ("42-2", "42", True), ("42-2", "42", True),
         ("42-2", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -119,7 +119,7 @@ def test_subpartial_follows_parent_with_bump_on_collision():
         ("42-1",   "42", True), ("42-1",   "42", True),
         ("42-1-1", "42", True), ("42-1-1", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -140,7 +140,7 @@ def test_unassigned_labels_untouched():
         ("-1",            "42", False),
         ("UNASSIGNED",   "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -161,7 +161,7 @@ def test_cyto_tx_dont_count_toward_size():
         ("42-1", "42", False), ("42-1", "42", False),
         ("42-1", "42", False), ("42-1", "42", False), ("42-1", "42", False),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -178,12 +178,12 @@ def test_idempotent():
         ("42-1", "42", True),  ("42-1", "42", True),
         ("42-1", "42", True),  ("42-1", "42", True),
     ])
-    out1, stats1 = _phase1_rerank_within_parent(
+    out1, stats1 = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
     assert stats1["n_parents_reranked"] == 1
-    out2, stats2 = _phase1_rerank_within_parent(
+    out2, stats2 = _phase1_rerank_within_parent_etype(
         out1, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )
@@ -198,7 +198,7 @@ def test_margin_tx_blocks_close_swaps():
         ("42-1", "42", True), ("42-1", "42", True),
         ("42-1", "42", True), ("42-1", "42", True),
     ])
-    out, stats = _phase1_rerank_within_parent(
+    out, stats = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=3,
     )
@@ -212,7 +212,7 @@ def test_qc_after_rerank_demotes_old_main_below_min_tx():
     Rerank the partial wears `42` (survives QC); the old main wears
     `42-1` with 2 tx and gets demoted by the next Phase 1-QC pass."""
     from tests._pipeline_runner import (
-        _phase1_rerank_within_parent,
+        _phase1_rerank_within_parent_etype,
         _qc_demote_small_phase1_entities,
         PHASE1_QC_MIN_TX,
     )
@@ -221,7 +221,7 @@ def test_qc_after_rerank_demotes_old_main_below_min_tx():
         ("42-1", "42", True), ("42-1", "42", True),
         ("42-1", "42", True), ("42-1", "42", True), ("42-1", "42", True),
     ])
-    rerk, _ = _phase1_rerank_within_parent(
+    rerk, _ = _phase1_rerank_within_parent_etype(
         df, entity_col="tracer_id",
         nuclear_col="overlaps_nucleus", margin_tx=1,
     )

@@ -1029,11 +1029,19 @@ def reassign_unassigned_to_nearby_entities(
     assigned_mask = (~unassigned_mask).to_numpy()
     if only_partial_component:
         # Keep only assigned tx whose entity_id is partial / component.
-        all_labels = df[entity_col].astype(str).to_numpy()
-        partial_or_component = np.array([
-            infer_entity_type(lab) in ("partial", "component")
-            for lab in all_labels
-        ], dtype=bool)
+        # Prefer the upstream-emitted _etype column when present
+        # (correct on FFPE cell_ids); fall back to label-string parsing.
+        if "_etype" in df.columns:
+            etype_arr = df["_etype"].astype(str).to_numpy()
+            partial_or_component = np.isin(
+                etype_arr, ("partial", "component")
+            )
+        else:
+            all_labels = df[entity_col].astype(str).to_numpy()
+            partial_or_component = np.array([
+                infer_entity_type(lab) in ("partial", "component")
+                for lab in all_labels
+            ], dtype=bool)
         assigned_mask = assigned_mask & partial_or_component
 
     if assigned_mask.sum() == 0:
@@ -1134,6 +1142,36 @@ def reassign_unassigned_to_nearby_entities(
                 df[out_col] = col_data.cat.add_categories(sorted(new_cats))
         df.iloc[sel_rows, col_pos] = new_labels[matched]
 
+        # Propagate _etype for Rescue-promoted tx so they don't carry
+        # stale "unknown" values into downstream stages. Look up the
+        # target entity's etype from existing tx already labeled with
+        # that entity.
+        if "_etype" in df.columns:
+            target_labels = pd.Series(new_labels[matched]).astype(str)
+            # Build label → etype from tx that already have non-unknown etype
+            etype_series = df["_etype"].astype(str)
+            label_series = df[out_col].astype(str)
+            known_mask = (etype_series != "unknown") & (~label_series.isin(
+                {"-1", "DROP", "UNASSIGNED", "nan"}
+            ))
+            if known_mask.any():
+                label_to_etype = (
+                    pd.DataFrame({
+                        "lab": label_series[known_mask].to_numpy(),
+                        "etype": etype_series[known_mask].to_numpy(),
+                    })
+                    .drop_duplicates("lab")
+                    .set_index("lab")["etype"]
+                )
+                new_etype = target_labels.map(label_to_etype)
+                # Apply only where we found a mapping
+                ok = new_etype.notna().to_numpy()
+                if ok.any():
+                    sel_with_etype = sel_rows[ok]
+                    df.loc[df.index[sel_with_etype], "_etype"] = (
+                        new_etype[ok].astype(str).to_numpy()
+                    )
+
     if n_reassigned > 0:
         d_arr = matched_dist[matched]
         mean_distance = float(d_arr.mean())
@@ -1232,13 +1270,27 @@ def demote_small_entities(
     counts = labels.value_counts()
     small_labels = set(counts.index[counts < min_size]) - set(keep_labels)
     if exempt_types:
-        # Lazy import to avoid circular dep at module load.
-        from .stitching import infer_entity_type
         exempt_set = set(exempt_types)
-        small_labels = {
-            lab for lab in small_labels
-            if infer_entity_type(lab) not in exempt_set
-        }
+        # Prefer _etype column when present (correct on FFPE cell_ids).
+        if "_etype" in df_out.columns:
+            # Build a label → etype map from the dataframe (drop dups)
+            lab_etype = (
+                df_out[[out_col, "_etype"]]
+                .drop_duplicates(out_col)
+                .set_index(out_col)["_etype"]
+                .astype(str)
+            )
+            small_labels = {
+                lab for lab in small_labels
+                if lab_etype.get(lab, "unknown") not in exempt_set
+            }
+        else:
+            # Lazy import to avoid circular dep at module load.
+            from .stitching import infer_entity_type
+            small_labels = {
+                lab for lab in small_labels
+                if infer_entity_type(lab) not in exempt_set
+            }
     if not small_labels:
         return df_out, 0
 
@@ -1253,6 +1305,9 @@ def demote_small_entities(
                 df_out[out_col] = col_data.cat.add_categories([unassigned_label])
         col_pos = df_out.columns.get_loc(out_col)
         df_out.iloc[np.where(demote_mask)[0], col_pos] = unassigned_label
+        # Mirror the demotion in _etype.
+        if "_etype" in df_out.columns:
+            df_out.loc[df_out.index[np.where(demote_mask)[0]], "_etype"] = "unknown"
 
     return df_out, n_demoted
 
@@ -1574,12 +1629,15 @@ def reassign_unassigned_grid_pool(
     entity_genes_lookup: dict[str, frozenset] = {}
     skip_entity_set: set[str] = set()
     z_col_idx = list(coord_cols).index("z") if "z" in coord_cols else None
+    # entity_summary carries `etype` per row (computed in build_entity_table,
+    # which prefers the upstream _etype column when available). Use that
+    # rather than label-parsing — correct on FFPE cell_ids.
     for ent_row in entity_summary.itertuples():
         eid = str(ent_row.entity_id)
         gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
         gi = gi[~pd.isna(gi)].astype(int).unique()
         entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        if only_partial_component and infer_entity_type(eid) == "cell":
+        if only_partial_component and str(ent_row.etype) == "cell":
             skip_entity_set.add(eid)
 
     # Assigned-tx pool for the bin index (excluding cells if requested).
@@ -1933,6 +1991,35 @@ def reassign_unassigned_grid_pool(
                 df_out[out_col] = col_data.cat.add_categories(sorted(new_cats))
         df_out.iloc[sel_rows, col_pos] = new_labels[matched]
 
+        # Propagate _etype for the rescued tx — copy the target
+        # entity's etype from an already-assigned tx with that label.
+        # Without this, rescued tx keep stale 'unknown' etype values
+        # which would bias entity-level aggregation in downstream
+        # build_entity_table calls.
+        if "_etype" in df_out.columns:
+            target_labels = pd.Series(new_labels[matched]).astype(str)
+            etype_series = df_out["_etype"].astype(str)
+            label_series = df_out[out_col].astype(str)
+            known_mask = (etype_series != "unknown") & (~label_series.isin(
+                {"-1", "DROP", "UNASSIGNED", "nan"}
+            ))
+            if known_mask.any():
+                label_to_etype = (
+                    pd.DataFrame({
+                        "lab": label_series[known_mask].to_numpy(),
+                        "etype": etype_series[known_mask].to_numpy(),
+                    })
+                    .drop_duplicates("lab")
+                    .set_index("lab")["etype"]
+                )
+                new_etype = target_labels.map(label_to_etype)
+                ok = new_etype.notna().to_numpy()
+                if ok.any():
+                    sel_with_etype = sel_rows[ok]
+                    df_out.loc[df_out.index[sel_with_etype], "_etype"] = (
+                        new_etype[ok].astype(str).to_numpy()
+                    )
+
     n_reassigned = int(matched.sum())
     if n_reassigned > 0:
         d_arr = matched_dist[matched]
@@ -2182,7 +2269,9 @@ def reassign_unassigned_to_nearest_tx_no_neg(
         gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
         gi = gi[~pd.isna(gi)].astype(int).unique()
         entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        if only_partial_component and infer_entity_type(eid) == "cell":
+        # entity_summary.etype is computed in build_entity_table from
+        # the upstream _etype column when present (FFPE-safe).
+        if only_partial_component and str(ent_row.etype) == "cell":
             skip_entity_set.add(eid)
 
     # Assigned transcripts -- the searchable index.
