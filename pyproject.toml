@@ -36,6 +36,10 @@ dependencies = [
   "torch>=1.10",
   "torch-geometric>=2.0",
   "open3d>=0.17",
+  # tomllib backport for Python <3.11. tracer.config calls tomllib;
+  # CI matrix still includes 3.10 (pyproject `requires-python = ">=3.9"`).
+  # Drop once requires-python bumps to >=3.11.
+  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

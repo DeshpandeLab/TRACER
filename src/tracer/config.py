@@ -26,10 +26,18 @@ pipeline.
 from __future__ import annotations
 
 import json
-import tomllib
+import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+# Python 3.11+ has tomllib in the stdlib; 3.10 (still in our CI matrix
+# per pyproject.toml `requires-python = ">=3.9"`) needs the `tomli`
+# backport. Same API; module name aliased.
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 # ---------------------------------------------------------------------------
 # Per-stage configs
