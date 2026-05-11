@@ -89,6 +89,26 @@ def _qc_demote_small_phase1_entities(df_in: pd.DataFrame, *,
     }
 
 
+def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
+                                   entity_col: str,
+                                   cell_id_col: str = "cell_id",
+                                   nuclear_col: str = "overlaps_nucleus",
+                                   margin_tx: int = 1,
+                                   ) -> tuple[pd.DataFrame, dict]:
+    """Within each parent cell, re-rank depth-1 entities by nuclear-tx
+    count and promote the largest to the main `{cell_id}` label.
+
+    Spec: docs/superpowers/specs/2026-05-11-phase1-rerank-design.md
+    """
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+
+    stats = {"n_parents_reranked": 0, "n_tx_relabeled": 0}
+    return df_out, stats
+
+
 def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
                                      entity_col: str,
                                      coord_cols=("x", "y", "z"),
