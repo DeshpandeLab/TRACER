@@ -1142,6 +1142,36 @@ def reassign_unassigned_to_nearby_entities(
                 df[out_col] = col_data.cat.add_categories(sorted(new_cats))
         df.iloc[sel_rows, col_pos] = new_labels[matched]
 
+        # Propagate _etype for Rescue-promoted tx so they don't carry
+        # stale "unknown" values into downstream stages. Look up the
+        # target entity's etype from existing tx already labeled with
+        # that entity.
+        if "_etype" in df.columns:
+            target_labels = pd.Series(new_labels[matched]).astype(str)
+            # Build label → etype from tx that already have non-unknown etype
+            etype_series = df["_etype"].astype(str)
+            label_series = df[out_col].astype(str)
+            known_mask = (etype_series != "unknown") & (~label_series.isin(
+                {"-1", "DROP", "UNASSIGNED", "nan"}
+            ))
+            if known_mask.any():
+                label_to_etype = (
+                    pd.DataFrame({
+                        "lab": label_series[known_mask].to_numpy(),
+                        "etype": etype_series[known_mask].to_numpy(),
+                    })
+                    .drop_duplicates("lab")
+                    .set_index("lab")["etype"]
+                )
+                new_etype = target_labels.map(label_to_etype)
+                # Apply only where we found a mapping
+                ok = new_etype.notna().to_numpy()
+                if ok.any():
+                    sel_with_etype = sel_rows[ok]
+                    df.loc[df.index[sel_with_etype], "_etype"] = (
+                        new_etype[ok].astype(str).to_numpy()
+                    )
+
     if n_reassigned > 0:
         d_arr = matched_dist[matched]
         mean_distance = float(d_arr.mean())
