@@ -56,3 +56,21 @@ def test_single_swap_promotes_larger_partial():
     assert counts == {"42": 5, "42-1": 3}
     assert stats["n_parents_reranked"] == 1
     assert stats["n_tx_relabeled"] == 8
+
+
+def test_tie_keeps_original_main():
+    """Main `42` and partial `42-1` both have 4 nuclear tx → strict >
+    means original main wins; no relabel."""
+    df = _df([
+        ("42",   "42", True),  ("42",   "42", True),
+        ("42",   "42", True),  ("42",   "42", True),
+        ("42-1", "42", True),  ("42-1", "42", True),
+        ("42-1", "42", True),  ("42-1", "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 4, "42-1": 4}
+    assert stats["n_parents_reranked"] == 0
