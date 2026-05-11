@@ -412,3 +412,25 @@ def test_rerank_on_records_stage_seg_smoke(monkeypatch, synthetic_inputs):
     idx_qc = stage_names.index("Phase1-QC")
     idx_rerank = stage_names.index("Phase1-Rerank")
     assert idx_split < idx_rerank < idx_qc
+
+
+def test_rerank_composes_with_reassign_1c(monkeypatch, synthetic_inputs):
+    """Both opt-in stages on simultaneously: Phase1-Reassign-1c sits
+    between Prune and Split-Phase1; Phase1-Rerank sits between
+    Split-Phase1 and Phase1-QC. Confirms the order is exactly
+    Prune → Phase1-Reassign-1c → Split-Phase1 → Phase1-Rerank → Phase1-QC."""
+    import tests._pipeline_runner as runner
+    monkeypatch.setattr(runner, "PHASE1_REASSIGN_AFTER_1C", True)
+    monkeypatch.setattr(runner, "PHASE1_RERANK_ENABLED", True)
+    df, panel, _gt = synthetic_inputs
+    # Force the nuclear-seed path: rename `is_nuclear` -> `overlaps_nucleus`
+    # so the column guard passes and both opt-in stages fire.
+    df = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+    _df_out, progression = runner.run_segmented_pipeline(df, panel)
+    stage_names = [p["stage"] for p in progression]
+    idx_prune = stage_names.index("Prune")
+    idx_reassign = stage_names.index("Phase1-Reassign-1c")
+    idx_split = stage_names.index("Split-Phase1")
+    idx_rerank = stage_names.index("Phase1-Rerank")
+    idx_qc = stage_names.index("Phase1-QC")
+    assert idx_prune < idx_reassign < idx_split < idx_rerank < idx_qc
