@@ -218,6 +218,45 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
     return df_out, stats
 
 
+def _vectorized_mean_pmi_excl_self(W: np.ndarray,
+                                     query_gene_idx: np.ndarray,
+                                     seed_gene_idx: np.ndarray
+                                     ) -> np.ndarray:
+    """For each gene index in `query_gene_idx`, compute the mean PMI
+    against `seed_gene_idx`, excluding any seed entry equal to the
+    query gene itself (matches the legacy `_mean_pmi(g, S)` semantics
+    where `others = [x for x in S if x != g]`).
+
+    Parameters
+    ----------
+    W : (G, G) float32 PMI matrix.
+    query_gene_idx : (N,) int array, values in [0, G). All entries
+        must be ≥ 0.
+    seed_gene_idx : (M,) int array, the seed gene-set indices. Order
+        is irrelevant; duplicates are allowed but treated as one slot.
+
+    Returns
+    -------
+    (N,) float64 array. NaN where the seed has no finite-PMI entries
+    after self-exclusion.
+    """
+    if query_gene_idx.size == 0 or seed_gene_idx.size == 0:
+        return np.full(query_gene_idx.shape, np.nan, dtype=np.float64)
+    # (N, M) PMI slice
+    pmi = W[np.ix_(query_gene_idx, seed_gene_idx)].astype(np.float64, copy=False)
+    # (N, M) self-exclusion mask: seed_j == query_i
+    self_mask = seed_gene_idx[None, :] == query_gene_idx[:, None]
+    valid = np.isfinite(pmi) & ~self_mask
+    # safe mean: sum / count
+    pmi_clean = np.where(valid, pmi, 0.0)
+    count = valid.sum(axis=1)
+    total = pmi_clean.sum(axis=1)
+    out = np.full(query_gene_idx.shape, np.nan, dtype=np.float64)
+    nonzero = count > 0
+    out[nonzero] = total[nonzero] / count[nonzero]
+    return out
+
+
 def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
                                 entity_col: str,
                                 aux: dict,
@@ -232,6 +271,11 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
     strictly higher mean-PMI fit than the main entity (by at least
     `margin`), MOVE the tx to that partial.
 
+    Vectorized rewrite of the per-parent inner loop:
+      - Build the (N_main_nuc, |S_seed|) PMI slice once per (parent, seed).
+      - Apply the sequential margin-walk vectorized across N
+        (preserving legacy semantics: `mp > best_mean + margin`).
+
     Operates only on NUCLEAR tx (consistent with Phase 1's nuclear-only
     admission policy). Cyto tx are left alone for downstream Rescue.
 
@@ -242,6 +286,169 @@ def _reassign_nuclear_post_1c(df_in: pd.DataFrame, *,
 
     Returns (df_out, stats).
     """
+    import re as _re
+
+    df_out = df_in.copy()
+    df_out[entity_col] = df_out[entity_col].astype(str)
+    label_arr = df_out[entity_col].to_numpy(dtype=object).copy()
+
+    gene_to_idx = aux["gene_to_idx"]
+    W = aux["W"]
+    if not isinstance(W, np.ndarray):
+        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
+                       dtype=np.float32)
+    if W.dtype != np.float32:
+        W = W.astype(np.float32)
+
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+    nuc_genes = df_out[gene_col].astype(str).to_numpy()
+    cell_id_arr = df_out[cell_id_col].astype(str).to_numpy()
+    nuc_idx = np.where(is_nuclear)[0]
+
+    # Build per-entity nuclear-gene set via pandas groupby — much faster
+    # than the per-tx Python loop on large frames.
+    _UN = {"-1", "DROP", "UNASSIGNED", "nan"}
+    label_s = pd.Series(label_arr)
+    is_un_label = label_s.isin(_UN) | label_s.str.startswith("UNASSIGNED_", na=False)
+    nuc_with_entity_mask = is_nuclear & (~is_un_label.to_numpy())
+    if nuc_with_entity_mask.any():
+        gi_arr_all = pd.Series(nuc_genes).map(gene_to_idx).fillna(-1).astype(np.int64).to_numpy()
+        valid_for_build = nuc_with_entity_mask & (gi_arr_all >= 0)
+        if valid_for_build.any():
+            build_df = pd.DataFrame({
+                "entity": label_arr[valid_for_build].astype(str),
+                "gi":     gi_arr_all[valid_for_build],
+            }).drop_duplicates()
+            entity_to_genes_lists = build_df.groupby("entity", sort=False)["gi"].apply(np.array).to_dict()
+            entity_to_genes: dict[str, set[int]] = {
+                e: set(int(x) for x in arr) for e, arr in entity_to_genes_lists.items()
+            }
+        else:
+            entity_to_genes = {}
+    else:
+        entity_to_genes = {}
+
+    # Group by parent cell_id (first numeric token of the label)
+    parent_to_entities: dict[str, list[str]] = {}
+    for ent in entity_to_genes:
+        m = _re.match(r"^(\d+)(?:-\d+){0,2}$", ent)
+        if not m:
+            continue
+        parent_to_entities.setdefault(m.group(1), []).append(ent)
+
+    n_moves = 0
+    n_parents_with_partials = 0
+
+    # Precompute candidate tx indices per parent in ONE pass: for each
+    # nuclear tx whose entity label is purely numeric (a main label),
+    # record (parent, tx_idx). Avoids the per-parent boolean mask scan
+    # that was the dominant cost in the legacy implementation.
+    cand_by_parent: dict[str, np.ndarray] = {}
+    if nuc_idx.size > 0:
+        nuc_label_arr = label_arr[nuc_idx]
+        nuc_cell_id   = cell_id_arr[nuc_idx]
+        # Main labels are pure digits (no '-'); fast string filter
+        nuc_label_str = nuc_label_arr.astype(str)
+        is_main_label = np.fromiter(
+            (s.isdigit() for s in nuc_label_str),
+            dtype=bool, count=nuc_label_str.size,
+        )
+        # Also require label == cell_id (matches legacy's `cell_id_arr == parent` guard)
+        is_owned = nuc_label_str == nuc_cell_id
+        is_cand = is_main_label & is_owned
+        if is_cand.any():
+            cand_tx_idx = nuc_idx[is_cand]
+            cand_parent = nuc_label_str[is_cand]
+            order = np.argsort(cand_parent, kind="stable")
+            cand_tx_idx_sorted = cand_tx_idx[order]
+            cand_parent_sorted = cand_parent[order]
+            # Group boundaries
+            change = np.r_[True, cand_parent_sorted[1:] != cand_parent_sorted[:-1]]
+            starts = np.where(change)[0]
+            ends = np.r_[starts[1:], cand_parent_sorted.size]
+            for s, e in zip(starts, ends):
+                cand_by_parent[str(cand_parent_sorted[s])] = cand_tx_idx_sorted[s:e]
+
+    for parent, ent_list in parent_to_entities.items():
+        if len(ent_list) < 2:
+            continue
+        main = parent
+        if main not in entity_to_genes:
+            continue
+        partials = [e for e in ent_list if e != main]
+        if not partials:
+            continue
+        n_parents_with_partials += 1
+
+        cand_idx = cand_by_parent.get(parent)
+        if cand_idx is None or cand_idx.size == 0:
+            continue
+
+        S_main = np.fromiter(entity_to_genes[main], dtype=np.int64)
+        S_partials_arrays = [np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials]
+
+        # Lazy gene-index lookup, only for this parent's candidates.
+        cand_gene_idx = np.fromiter(
+            (gene_to_idx.get(nuc_genes[i], -1) for i in cand_idx),
+            dtype=np.int64, count=cand_idx.size,
+        )
+        valid_gene = cand_gene_idx >= 0
+        if not valid_gene.any():
+            continue
+        cand_idx_v = cand_idx[valid_gene]
+        cand_g_v = cand_gene_idx[valid_gene]
+
+        # mean PMI vs main (vectorized)
+        mean_main_v = _vectorized_mean_pmi_excl_self(W, cand_g_v, S_main)
+        finite_main_v = np.isfinite(mean_main_v)
+        if not finite_main_v.any():
+            continue
+        # Only consider tx with finite mean_main
+        cand_idx_f = cand_idx_v[finite_main_v]
+        cand_g_f = cand_g_v[finite_main_v]
+        best_mean = mean_main_v[finite_main_v].copy()
+        best_p_idx = np.full(best_mean.shape, -1, dtype=np.int32)
+
+        # Sequential margin walk, vectorized across tx for each partial.
+        # Iteration order over partials must match the legacy
+        # `for p, S_p in S_partials.items()`: dict insertion order ==
+        # insertion order of `partials` list.
+        for k, S_p in enumerate(S_partials_arrays):
+            mp = _vectorized_mean_pmi_excl_self(W, cand_g_f, S_p)
+            accept = np.isfinite(mp) & (mp > best_mean + margin)
+            if accept.any():
+                best_mean[accept] = mp[accept]
+                best_p_idx[accept] = k
+
+        moves = best_p_idx >= 0
+        if moves.any():
+            for n_local in np.where(moves)[0]:
+                k = int(best_p_idx[n_local])
+                label_arr[cand_idx_f[n_local]] = partials[k]
+            n_moves += int(moves.sum())
+
+    df_out[entity_col] = label_arr
+    return df_out, {
+        "n_tx_moved": n_moves,
+        "n_parents_with_partials": n_parents_with_partials,
+    }
+
+
+def _reassign_nuclear_post_1c_legacy(df_in: pd.DataFrame, *,
+                                entity_col: str,
+                                aux: dict,
+                                cell_id_col: str = "cell_id",
+                                gene_col: str = "feature_name",
+                                nuclear_col: str = "overlaps_nucleus",
+                                margin: float = 0.05,
+                                threshold: float = 0.05,
+                                ) -> tuple[pd.DataFrame, dict]:
+    """Legacy reference implementation of post-1c reassignment.
+
+    Kept for byte-identicality testing against the vectorized
+    `_reassign_nuclear_post_1c`. NOT called by the production pipeline.
+    See `_reassign_nuclear_post_1c` for the active implementation and
+    full docstring."""
     import re as _re
 
     df_out = df_in.copy()
