@@ -467,3 +467,53 @@ def test_rerank_etype_unassigned_label_skipped():
     assert counts["42-1"] == 1
     assert counts["UNASSIGNED_7"] == 1
     assert counts["-1"] == 1
+
+
+def test_flag_on_integer_cell_ids_parity_with_legacy_seg_smoke(monkeypatch):
+    """Full SEG pipeline with USE_ETYPE_COLUMN=True must produce
+    byte-identical output to USE_ETYPE_COLUMN=False on integer cell_ids.
+
+    This is the byte-identicality gate for the migration: turning the
+    flag on should never change behavior on legacy/lung-style data.
+    Behavior change is only expected on FFPE/IO data (verified in
+    PDAC re-bench, separate)."""
+    from tests.synthetic import (
+        make_synthetic_transcripts,
+        make_synthetic_npmi_panel_for_transcripts,
+    )
+    import tests._pipeline_runner as runner
+    from tests._pipeline_runner import run_segmented_pipeline
+
+    df, gt = make_synthetic_transcripts(n_cells=15, n_types=3, seed=42)
+    panel = make_synthetic_npmi_panel_for_transcripts(df, gt)
+    df_nuc = df.rename(columns={"is_nuclear": "overlaps_nucleus"})
+
+    # Reset PHASE1_REASSIGN_AFTER_1C to False just for this test to
+    # avoid the reassign-1c path (which also has its own etype-aware
+    # version pending — not migrated yet). This isolates the rerank
+    # flag effect.
+    orig_reassign = runner.PHASE1_REASSIGN_AFTER_1C
+    orig_rerank = runner.PHASE1_RERANK_ENABLED
+    orig_flag = runner.USE_ETYPE_COLUMN
+    try:
+        runner.PHASE1_REASSIGN_AFTER_1C = False
+        runner.PHASE1_RERANK_ENABLED = True
+        runner.USE_ETYPE_COLUMN = False
+        out_legacy, _ = run_segmented_pipeline(df_nuc.copy(), panel)
+
+        runner.USE_ETYPE_COLUMN = True
+        out_etype, _ = run_segmented_pipeline(df_nuc.copy(), panel)
+    finally:
+        runner.PHASE1_REASSIGN_AFTER_1C = orig_reassign
+        runner.PHASE1_RERANK_ENABLED = orig_rerank
+        runner.USE_ETYPE_COLUMN = orig_flag
+
+    # Final labels must match exactly on integer cell_ids.
+    diff = (
+        out_legacy["tracer_id"].astype(str).to_numpy()
+        != out_etype["tracer_id"].astype(str).to_numpy()
+    )
+    assert not diff.any(), (
+        f"USE_ETYPE_COLUMN flag changes output on integer cell_ids "
+        f"(n_diff={int(diff.sum())}/{len(diff)}). Should be byte-identical."
+    )
