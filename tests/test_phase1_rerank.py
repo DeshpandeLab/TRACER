@@ -34,3 +34,25 @@ def test_no_partials_is_noop():
     assert (out["tracer_id"] == df["tracer_id"]).all()
     assert stats["n_parents_reranked"] == 0
     assert stats["n_tx_relabeled"] == 0
+
+
+def test_single_swap_promotes_larger_partial():
+    """Partial `42-1` has 5 nuclear tx, main `42` has 3 → swap."""
+    df = _df([
+        ("42",   "42", True),
+        ("42",   "42", True),
+        ("42",   "42", True),
+        ("42-1", "42", True),
+        ("42-1", "42", True),
+        ("42-1", "42", True),
+        ("42-1", "42", True),
+        ("42-1", "42", True),
+    ])
+    out, stats = _phase1_rerank_within_parent(
+        df, entity_col="tracer_id", cell_id_col="cell_id",
+        nuclear_col="overlaps_nucleus", margin_tx=1,
+    )
+    counts = out["tracer_id"].value_counts().to_dict()
+    assert counts == {"42": 5, "42-1": 3}
+    assert stats["n_parents_reranked"] == 1
+    assert stats["n_tx_relabeled"] == 8

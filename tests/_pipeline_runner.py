@@ -104,8 +104,70 @@ def _phase1_rerank_within_parent(df_in: pd.DataFrame, *,
 
     df_out = df_in.copy()
     df_out[entity_col] = df_out[entity_col].astype(str)
+    labels = df_out[entity_col].to_numpy(dtype=object).copy()
+    is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
+
+    _re_label = _re.compile(r"^(\d+)(?:-(\d+)(?:-(\d+))?)?$")
+
+    parent_to_depth1_rows: dict[str, dict[str, list[int]]] = {}
+    for i, lab in enumerate(labels):
+        m = _re_label.match(str(lab))
+        if not m:
+            continue
+        parent = m.group(1)
+        d1 = m.group(2)
+        depth1 = parent if d1 is None else f"{parent}-{d1}"
+        parent_to_depth1_rows.setdefault(parent, {}).setdefault(
+            depth1, []
+        ).append(i)
 
     stats = {"n_parents_reranked": 0, "n_tx_relabeled": 0}
+
+    for parent, depth1_map in parent_to_depth1_rows.items():
+        if len(depth1_map) < 2:
+            continue
+
+        sizes: list[tuple[str, int]] = []
+        current_main = parent if parent in depth1_map else None
+        for d1, rows in depth1_map.items():
+            n_nuc = int(sum(1 for r in rows if is_nuclear[r]))
+            sizes.append((d1, n_nuc))
+
+        def _sort_key(d1_size: tuple[str, int]) -> tuple:
+            d1, n = d1_size
+            is_curr_main = 1 if d1 == current_main else 0
+            return (-n, -is_curr_main, d1)
+        sizes.sort(key=_sort_key)
+
+        n_largest = sizes[0][1]
+        n_runner_up = sizes[1][1]
+        if (n_largest - n_runner_up) < margin_tx:
+            continue
+        if sizes[0][0] == current_main:
+            continue
+
+        new_depth1: dict[str, str] = {}
+        for k, (d1, _) in enumerate(sizes):
+            new_depth1[d1] = parent if k == 0 else f"{parent}-{k}"
+
+        all_rows = [r for rows in depth1_map.values() for r in rows]
+        for r in all_rows:
+            old_lab = str(labels[r])
+            m = _re_label.match(old_lab)
+            assert m is not None
+            d1k = m.group(2)
+            d2j = m.group(3)
+            old_d1 = parent if d1k is None else f"{parent}-{d1k}"
+            new_d1 = new_depth1[old_d1]
+            if d2j is None:
+                labels[r] = new_d1
+            else:
+                labels[r] = f"{new_d1}-{d2j}"
+
+        stats["n_parents_reranked"] += 1
+        stats["n_tx_relabeled"] += len(all_rows)
+
+    df_out[entity_col] = labels
     return df_out, stats
 
 
