@@ -960,9 +960,14 @@ RESCUE_POST_GROUP_PASSES: int = 3
 # sub-seed, is currently locked in the main entity. This stage moves
 # such tx to the partial sibling that gives strictly higher mean PMI.
 #
-#   False = off (current).
+#   False = off (legacy).
 #   True  = enable post-1c reassignment.
-PHASE1_REASSIGN_AFTER_1C: bool = False
+# Promoted to default-on 2026-05-11 after numpy vectorization eliminated
+# the wall-cost objection (3.1x full-pipeline speedup, byte-identical;
+# see benchmarks/reassign_full_tissue_speedup.json). The cells-only
+# coherence evidence (mean Δ +0.00316, win/loss 2070/954 on full tissue)
+# already supported promotion; only the +250s wall cost was the blocker.
+PHASE1_REASSIGN_AFTER_1C: bool = True
 
 PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
                                         # under each parent by nuclear-tx
@@ -1139,7 +1144,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # Phase-1 post-1c nuclear reassignment (opt-in). Closes Gap B:
     # nuclear tx weakly admitted to the main seed, whose gene fits a
     # 1c partial's sub-seed strictly better, get moved to the partial.
-    if PHASE1_REASSIGN_AFTER_1C:
+    if PHASE1_REASSIGN_AFTER_1C and "overlaps_nucleus" in df_pruned.columns:
         df_pruned, _reassign_stats = _reassign_nuclear_post_1c(
             df_pruned, entity_col="tracer_id", aux=aux,
             cell_id_col="cell_id", gene_col="feature_name",
