@@ -41,7 +41,7 @@ For each parent `cell_id`:
 1. **Identify depth-1 roots:** the main `{cell_id}` (if present) plus every label of the form `{cell_id}-k`. Sub-partials `{cell_id}-k-j` (from Split-Phase1's z-split) follow their depth-1 parent and are not candidates for the main slot on their own.
 2. **Compute subtree nuclear-tx counts:** for each depth-1 root, count all tx whose label is that root *or* descends from it (matches the pattern `{cell_id}-k(-j)?`).
 3. **Sort depth-1 roots by subtree size desc.** **Strict `>` only** — ties leave the original ranking untouched, so the original `{cell_id}` retains the main slot on equality.
-4. **If sort order changed**, apply renaming map `{old_depth1 → new_depth1}` where `new_depth1[0] = "{cell_id}"`, `new_depth1[k] = "{cell_id}-{k}"`. Rewrite every tx label under each old depth-1 with its new depth-1 prefix; sub-partial suffixes (`-1`, `-2`, …) preserved verbatim.
+4. **If sort order changed**, apply renaming map `{old_depth1 → new_depth1}`. To prevent collisions when the new main has sub-partials that would otherwise rename to the same slots as deposed depth-1 entities, reserve the first `n_rank0_subs` suffix slots for the new main's sub-partials. So: `new_depth1[0] = "{cell_id}"`; `new_depth1[k] = "{cell_id}-{k + n_rank0_subs}"` for `k ≥ 1`. Sub-partial suffixes are renumbered per old depth-1 starting at 1 (uniform rule applied to every depth-1, not just rank-0; in practice this is a no-op for non-rank-0 entities because Split-Phase1 emits contiguous suffixes — keeping the uniform rule simplifies the code without observable behavior change on production data).
 
 Pure relabeling — no tx demoted, no entities deleted, no coordinates moved. Downstream Phase 1-QC's size demotion runs after, unchanged.
 
