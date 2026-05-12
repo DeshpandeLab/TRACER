@@ -1055,7 +1055,20 @@ def _state_dict(df: pd.DataFrame, col: str) -> dict[str, int]:
 
 
 def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str):
-    progression.append({"stage": stage_name, **_state_dict(df, col)})
+    """Append a stage snapshot. Records wall-clock elapsed since the
+    previous _record_stage call so callers can see which stage dominates.
+    """
+    import time as _t
+    now = _t.time()
+    prev_ts = progression[-1]["_ts"] if progression else None
+    progression.append({
+        "stage": stage_name,
+        "_ts": now,
+        "stage_seconds": (
+            round(now - prev_ts, 3) if prev_ts is not None else None
+        ),
+        **_state_dict(df, col),
+    })
 
 
 def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,

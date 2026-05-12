@@ -98,6 +98,12 @@ def _fingerprint(df_out, progression, gt) -> dict:
     else:
         ari_truth = ami_truth = float("nan")
 
+    # Strip non-deterministic timing fields (_ts / stage_seconds) from
+    # the progression before fingerprinting — they change every run.
+    progression_clean = [
+        {k: v for k, v in stage.items() if k not in {"_ts", "stage_seconds"}}
+        for stage in progression
+    ]
     return {
         "n_cells": int(n_ent.get("cell", 0)),
         "n_partials": int(n_ent.get("partial", 0)),
@@ -106,7 +112,7 @@ def _fingerprint(df_out, progression, gt) -> dict:
         "coverage_pct": coverage_pct,
         "ari_vs_truth": ari_truth,
         "ami_vs_truth": ami_truth,
-        "stage_progression": progression,
+        "stage_progression": progression_clean,
     }
 
 
