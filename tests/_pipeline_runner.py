@@ -550,12 +550,8 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
             continue  # not a Phase 1-family entity (e.g., cascade)
         parent_to_entities.setdefault(parent, []).append(ent)
 
-    n_moves = 0
-    n_parents_with_partials = 0
-    moved_tx_indices: list[int] = []
-
     # Candidate tx per parent: nuclear, in main entity (label == cell_id),
-    # AND etype == "cell" if column present. Works on any cell_id format.
+    # AND etype == "cell" if column present.
     cand_by_parent: dict[str, np.ndarray] = {}
     if nuc_idx.size > 0:
         nuc_label = label_arr[nuc_idx].astype(str)
@@ -575,6 +571,10 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
             for s, e in zip(starts, ends):
                 cand_by_parent[str(cand_parent_sorted[s])] = cand_tx_idx_sorted[s:e]
 
+    # Build CSR-style flat arrays for the Cython kernel. Only enumerate
+    # parents that have ≥2 entities AND have candidate tx.
+    active_parents: list[str] = []
+    partials_per_parent: list[list[str]] = []
     for parent, ent_list in parent_to_entities.items():
         if len(ent_list) < 2:
             continue
@@ -584,51 +584,113 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
         partials = [e for e in ent_list if e != main]
         if not partials:
             continue
-        n_parents_with_partials += 1
-
-        cand_idx = cand_by_parent.get(parent)
-        if cand_idx is None or cand_idx.size == 0:
+        if parent not in cand_by_parent or cand_by_parent[parent].size == 0:
             continue
+        active_parents.append(parent)
+        partials_per_parent.append(partials)
 
-        S_main = np.fromiter(entity_to_genes[main], dtype=np.int64)
-        S_partials_arrays = [
-            np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials
-        ]
+    n_parents_with_partials = len(active_parents)
 
-        # Lazy gene-index lookup for this parent's candidates.
-        cand_gene_idx = np.fromiter(
-            (gene_to_idx.get(nuc_genes[i], -1) for i in cand_idx),
-            dtype=np.int64, count=cand_idx.size,
+    if n_parents_with_partials == 0:
+        df_out[entity_col] = label_arr
+        return df_out, {
+            "n_tx_moved": 0,
+            "n_parents_with_partials": 0,
+        }
+
+    # Build CSR arrays for the kernel.
+    # Per parent: cand_offsets (into cand_gene_idx + cand_tx_idx_flat),
+    # main_offsets (into main_genes), partial_offsets (into per-parent
+    # partial enumeration). Partial-gene CSR is keyed by global partial
+    # index pi = parent_partial_offsets[p] + local_idx.
+    cand_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    cand_tx_flat: list[np.ndarray] = []
+    cand_gene_flat: list[np.ndarray] = []
+    for i, p in enumerate(active_parents):
+        cand_idx = cand_by_parent[p]
+        cand_offsets[i + 1] = cand_offsets[i] + cand_idx.size
+        cand_tx_flat.append(cand_idx.astype(np.int32))
+        # Per-candidate gene index
+        g_idx = np.fromiter(
+            (gene_to_idx.get(nuc_genes[t], -1) for t in cand_idx),
+            dtype=np.int32, count=cand_idx.size,
         )
-        valid_gene = cand_gene_idx >= 0
-        if not valid_gene.any():
+        cand_gene_flat.append(g_idx)
+    cand_tx_arr = np.concatenate(cand_tx_flat).astype(np.int32)
+    cand_gene_arr = np.concatenate(cand_gene_flat).astype(np.int32)
+
+    main_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    main_flat: list[np.ndarray] = []
+    for i, p in enumerate(active_parents):
+        S = np.fromiter(entity_to_genes[p], dtype=np.int32)
+        main_offsets[i + 1] = main_offsets[i] + S.size
+        main_flat.append(S)
+    main_genes_arr = (
+        np.concatenate(main_flat).astype(np.int32)
+        if main_flat else np.zeros(0, dtype=np.int32)
+    )
+
+    # partial offsets: per parent, how many partials? Then per-partial
+    # gene CSR keyed by flat partial index.
+    partial_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    partial_gene_offsets_list: list[int] = [0]
+    partial_genes_flat: list[np.ndarray] = []
+    for i, partials in enumerate(partials_per_parent):
+        partial_offsets[i + 1] = partial_offsets[i] + len(partials)
+        for pe in partials:
+            S = np.fromiter(
+                entity_to_genes.get(pe, set()), dtype=np.int32,
+            )
+            partial_gene_offsets_list.append(
+                partial_gene_offsets_list[-1] + S.size
+            )
+            partial_genes_flat.append(S)
+    partial_gene_offsets_arr = np.asarray(
+        partial_gene_offsets_list, dtype=np.int32,
+    )
+    partial_genes_arr = (
+        np.concatenate(partial_genes_flat).astype(np.int32)
+        if partial_genes_flat else np.zeros(0, dtype=np.int32)
+    )
+
+    # Ensure W is C-contiguous float32 (kernel requirement).
+    if not (W.flags["C_CONTIGUOUS"] and W.dtype == np.float32):
+        W = np.ascontiguousarray(W, dtype=np.float32)
+
+    # Call the kernel — per-candidate local-partial-index decision.
+    from tracer._cy_reassign import reassign_nuclear_post_1c_kernel
+    out_partial_local_idx = reassign_nuclear_post_1c_kernel(
+        W,
+        cand_offsets,
+        cand_gene_arr,
+        main_offsets,
+        main_genes_arr,
+        partial_offsets,
+        partial_gene_offsets_arr,
+        partial_genes_arr,
+        float(margin),
+    )
+
+    # Apply moves: for each candidate with out>=0, relabel its tx to the
+    # corresponding partial.
+    moved_tx_indices: list[int] = []
+    n_moves = 0
+    for i in range(n_parents_with_partials):
+        s, e = int(cand_offsets[i]), int(cand_offsets[i + 1])
+        if s == e:
             continue
-        cand_idx_v = cand_idx[valid_gene]
-        cand_g_v = cand_gene_idx[valid_gene]
-
-        mean_main_v = _vectorized_mean_pmi_excl_self(W, cand_g_v, S_main)
-        finite_main_v = np.isfinite(mean_main_v)
-        if not finite_main_v.any():
+        choices = out_partial_local_idx[s:e]
+        moved_mask = choices >= 0
+        if not moved_mask.any():
             continue
-        cand_idx_f = cand_idx_v[finite_main_v]
-        cand_g_f = cand_g_v[finite_main_v]
-        best_mean = mean_main_v[finite_main_v].copy()
-        best_p_idx = np.full(best_mean.shape, -1, dtype=np.int32)
-
-        for k, S_p in enumerate(S_partials_arrays):
-            mp = _vectorized_mean_pmi_excl_self(W, cand_g_f, S_p)
-            accept = np.isfinite(mp) & (mp > best_mean + margin)
-            if accept.any():
-                best_mean[accept] = mp[accept]
-                best_p_idx[accept] = k
-
-        moves = best_p_idx >= 0
-        if moves.any():
-            for n_local in np.where(moves)[0]:
-                kk = int(best_p_idx[n_local])
-                label_arr[cand_idx_f[n_local]] = partials[kk]
-                moved_tx_indices.append(int(cand_idx_f[n_local]))
-            n_moves += int(moves.sum())
+        local_partials = partials_per_parent[i]
+        tx_slice = cand_tx_arr[s:e]
+        for n_local in np.where(moved_mask)[0]:
+            kk = int(choices[n_local])
+            tx_global = int(tx_slice[n_local])
+            label_arr[tx_global] = local_partials[kk]
+            moved_tx_indices.append(tx_global)
+        n_moves += int(moved_mask.sum())
 
     df_out[entity_col] = label_arr
     if has_etype and moved_tx_indices:
