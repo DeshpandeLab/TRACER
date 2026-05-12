@@ -46,6 +46,8 @@ def _tile_worker(args: dict) -> dict:
     Returns dict with `tile_idx`, `df_out`, `progression`, `wall_seconds`.
     """
     import os as _os
+    import sys as _sys
+    import resource as _res
     import time as _t  # repeat-import for worker process
     import tests._pipeline_runner as runner
     from tests._pipeline_runner import run_segmented_pipeline
@@ -73,6 +75,13 @@ def _tile_worker(args: dict) -> dict:
         runner.PHASE1_RERANK_ENABLED = orig_rerank
         runner.PHASE1_REASSIGN_AFTER_1C = orig_reassign
 
+    # Peak resident set across this worker process's lifetime.
+    # macOS: ru_maxrss is in bytes. Linux: ru_maxrss is in KB.
+    rusage = _res.getrusage(_res.RUSAGE_SELF)
+    peak_rss = int(rusage.ru_maxrss)
+    if _sys.platform != "darwin":
+        peak_rss *= 1024  # KB → bytes
+
     return {
         "tile_idx": tile_idx,
         "df_out": df_out,
@@ -80,6 +89,7 @@ def _tile_worker(args: dict) -> dict:
         "wall_seconds": round(wall, 2),
         "n_input_tx": int(len(df)),
         "n_input_cell_ids": int(df["cell_id"].nunique()),
+        "peak_rss_bytes": peak_rss,
     }
 
 
@@ -266,6 +276,7 @@ def run_segmented_pipeline_tiled(
             "n_out_partials": int(per.get("partial", 0)),
             "n_out_components": int(per.get("component", 0)),
             "n_out_unassigned_tx": int(is_un.sum()),
+            "peak_rss_bytes": int(r.get("peak_rss_bytes", 0)),
         }
 
     wall_max_tile = max(r["wall_seconds"] for r in per_tile_results.values())
@@ -273,6 +284,14 @@ def run_segmented_pipeline_tiled(
         sum(r["wall_seconds"] for r in per_tile_results.values()) / wall_total
         if wall_total > 0 else float("nan")
     )
+
+    # Aggregate per-worker peak RSS into max + sum (concurrent peak upper-bound).
+    rss_values = [
+        int(r.get("peak_rss_bytes", 0))
+        for r in per_tile_results.values()
+    ]
+    peak_rss_max_tile_bytes = max(rss_values) if rss_values else 0
+    peak_rss_sum_bytes = sum(rss_values)
 
     return {
         "df_out": df_out,
@@ -283,4 +302,6 @@ def run_segmented_pipeline_tiled(
         "wall_total_seconds": round(wall_total, 2),
         "wall_max_tile_seconds": round(wall_max_tile, 2),
         "speedup_vs_serial_estimate": round(speedup_vs_serial, 2),
+        "peak_rss_max_tile_bytes": peak_rss_max_tile_bytes,
+        "peak_rss_sum_bytes": peak_rss_sum_bytes,
     }

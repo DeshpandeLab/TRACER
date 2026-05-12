@@ -149,7 +149,15 @@ def main() -> int:
     ec_seq = _entity_counts(df_seq, col_seq)
     ec_seq["cells_lost"] = int(n_in_cells - ec_seq["n_cells"])
     ec_seq["retention_pct"] = round(100*ec_seq["n_cells"]/max(n_in_cells,1), 3)
-    log(f"  wall: {wall_seq:.1f}s  stages: {len(prog_seq)}")
+    # Peak RSS for the sequential run (this same process).
+    import resource as _res
+    import sys as _sys
+    _r = _res.getrusage(_res.RUSAGE_SELF)
+    seq_peak_rss = int(_r.ru_maxrss)
+    if _sys.platform != "darwin":
+        seq_peak_rss *= 1024
+    log(f"  wall: {wall_seq:.1f}s  stages: {len(prog_seq)}  peak RSS: "
+        f"{seq_peak_rss/(1024**3):.2f} GB")
     log(f"  entity counts: {ec_seq}")
     # Per-stage timing breakdown (stage_seconds added by _record_stage).
     stage_timings = [
@@ -166,6 +174,7 @@ def main() -> int:
         "stage_timings": [
             {"stage": s, "seconds": t} for s, t in stage_timings
         ],
+        "peak_rss_bytes": seq_peak_rss,
     }
     log()
 
@@ -201,6 +210,12 @@ def main() -> int:
             f"{result['speedup_vs_serial_estimate']:.2f}x")
         log(f"  actual speedup vs RUN 1: {wall_seq / wall:.2f}x")
         log(f"  entity counts: {ec}")
+        log(f"  per-worker peak RSS  max={result['peak_rss_max_tile_bytes']/(1024**3):.2f} GB"
+            f"  sum={result['peak_rss_sum_bytes']/(1024**3):.2f} GB")
+        for ti, per in sorted(result["per_tile"].items()):
+            log(f"    tile {ti}: wall={per['wall_seconds']:>6.2f}s  "
+                f"peak_rss={per['peak_rss_bytes']/(1024**3):>5.2f} GB  "
+                f"cells_in={per['n_input_cell_ids']:>5d}")
 
         summary["configs"][cfg_label] = {
             "n_tiles_xy": list(n_xy),
@@ -212,6 +227,12 @@ def main() -> int:
                 int(ti): float(per["wall_seconds"])
                 for ti, per in result["per_tile"].items()
             },
+            "per_tile_peak_rss_bytes": {
+                int(ti): int(per["peak_rss_bytes"])
+                for ti, per in result["per_tile"].items()
+            },
+            "peak_rss_max_tile_bytes": int(result["peak_rss_max_tile_bytes"]),
+            "peak_rss_sum_bytes": int(result["peak_rss_sum_bytes"]),
             "entity_counts": ec,
         }
         log()
@@ -235,6 +256,25 @@ def main() -> int:
             row.append(f"{v:>14}" if isinstance(v, (int, float))
                        else f"{'—':>14s}")
         log(f"  {m:30s}  " + " ".join(row))
+
+    # Peak-RSS row(s). Sequential has a single number; tiled has
+    # max-tile (worst single worker) and sum-tiles (concurrent
+    # upper-bound — what total memory the OS sees during the run).
+    def _gb(b):
+        return b / (1024**3) if b else 0.0
+    row_max = []
+    row_sum = []
+    for l in labels:
+        cfg = summary["configs"][l]
+        if l == "sequential":
+            v = cfg.get("peak_rss_bytes", 0)
+            row_max.append(f"{_gb(v):>13.2f}G")
+            row_sum.append(f"{_gb(v):>13.2f}G")
+        else:
+            row_max.append(f"{_gb(cfg.get('peak_rss_max_tile_bytes', 0)):>13.2f}G")
+            row_sum.append(f"{_gb(cfg.get('peak_rss_sum_bytes', 0)):>13.2f}G")
+    log(f"  {'peak_rss_max_worker':30s}  " + " ".join(row_max))
+    log(f"  {'peak_rss_sum_workers':30s}  " + " ".join(row_sum))
     log()
     log("Entity counts:")
     for m in ec_metrics:
