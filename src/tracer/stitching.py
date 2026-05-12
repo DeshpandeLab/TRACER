@@ -1222,97 +1222,192 @@ def stitch_entities_hierarchical(
             z_offsets_with_dz0 = list(range(-z_neighbor_depth, z_neighbor_depth + 1))
             z_offsets_strict_pos = list(range(1, z_neighbor_depth + 1))
 
-        candidate_pairs: set[tuple[int, int]] = set()
-        # Tx-tx supporting-edge count per candidate pair, used to apply
-        # the optional min_candidate_edges filter below.
-        pair_tx_edges: dict[tuple[int, int], int] = defaultdict(int)
-
-        # Per-entity unique-bin tracking for the optional
-        # `min_local_tx_per_entity` filter. Maps (lo, hi) → set of bin
-        # keys where lo (resp. hi) contributed. Empty when the filter
-        # is off (no memory cost).
         track_local = int(min_local_tx_per_entity) > 0
-        pair_lo_bins: dict[tuple[int, int], set] = (
-            defaultdict(set) if track_local else {}
+
+        # ----------------------------------------------------------------
+        # Vectorised candidate-pair enumeration via table-level merges.
+        # Replaces the per-bin Python record loop (~2.5M _record() calls
+        # on the densest PDAC sub-tile, 60% of Stitch wall) with a pandas
+        # hash-merge per (xy, z) offset followed by a single groupby
+        # aggregation. The bin_to_comps / bin_to_comp_counts dicts are
+        # preserved as-is for downstream filter compatibility.
+        # ----------------------------------------------------------------
+        bin_z_arr_for_df = (
+            bz_arr if G_z is not None
+            else np.zeros(len(comp_codes), dtype=np.int64)
         )
-        pair_hi_bins: dict[tuple[int, int], set] = (
-            defaultdict(set) if track_local else {}
+        bc_df = pd.DataFrame({
+            "bin_xy": xy_keys.astype(np.int64),
+            "bin_z":  bin_z_arr_for_df.astype(np.int64),
+            "comp":   comp_codes.astype(np.int64),
+        })
+        bc_grouped = (
+            bc_df.groupby(["bin_xy", "bin_z", "comp"], sort=False, as_index=False)
+            .size().rename(columns={"size": "n_tx"})
         )
+        bc_grouped["bin_xy"] = bc_grouped["bin_xy"].astype(np.int64)
+        bc_grouped["bin_z"] = bc_grouped["bin_z"].astype(np.int64)
+        bc_grouped["comp"] = bc_grouped["comp"].astype(np.int64)
+        bc_grouped["n_tx"] = bc_grouped["n_tx"].astype(np.int64)
 
-        def _record(a, b, n_tx, bk_a=None, bk_b=None):
-            if a == b or n_tx <= 0:
-                return
-            if a < b:
-                lo, hi = a, b
-                bk_lo, bk_hi = bk_a, bk_b
+        def _shift_bin_xy(xy: np.ndarray, dx: int, dy: int) -> np.ndarray:
+            bx = (xy >> np.int64(32)) - _BIN_BIAS
+            by = (xy & np.int64(0xFFFFFFFF)) - _BIN_BIAS
+            return (
+                ((bx + dx + _BIN_BIAS).astype(np.int64) << np.int64(32))
+                | (by + dy + _BIN_BIAS).astype(np.int64)
+            )
+
+        offsets_iter: list[tuple[int, int, int]] = [(0, 0, 0)]
+        if G_z is None:
+            offsets_iter += [(dx, dy, 0) for (dx, dy) in xy_half_offsets]
+        else:
+            offsets_iter += [
+                (dx, dy, dz)
+                for (dx, dy) in xy_half_offsets
+                for dz in z_offsets_with_dz0
+            ] + [(0, 0, dz) for dz in z_offsets_strict_pos]
+
+        records: list[pd.DataFrame] = []
+        for dx, dy, dz in offsets_iter:
+            if dx == 0 and dy == 0 and dz == 0:
+                merged = bc_grouped.merge(
+                    bc_grouped,
+                    on=["bin_xy", "bin_z"],
+                    suffixes=("_a", "_b"),
+                )
+                merged = merged[merged["comp_a"] < merged["comp_b"]]
+                if len(merged) == 0:
+                    continue
+                lo_arr = merged["comp_a"].to_numpy()
+                hi_arr = merged["comp_b"].to_numpy()
+                count_arr = (
+                    merged["n_tx_a"].to_numpy()
+                    * merged["n_tx_b"].to_numpy()
+                )
+                bin_lo_xy = merged["bin_xy"].to_numpy()
+                bin_lo_z = merged["bin_z"].to_numpy()
+                bin_hi_xy = bin_lo_xy
+                bin_hi_z = bin_lo_z
             else:
-                lo, hi = b, a
-                bk_lo, bk_hi = bk_b, bk_a
-            candidate_pairs.add((lo, hi))
-            pair_tx_edges[(lo, hi)] += int(n_tx)
-            if track_local and bk_lo is not None and bk_hi is not None:
-                pair_lo_bins[(lo, hi)].add(bk_lo)
-                pair_hi_bins[(lo, hi)].add(bk_hi)
+                right = bc_grouped.copy()
+                right["bin_xy_join"] = _shift_bin_xy(
+                    right["bin_xy"].to_numpy(), -dx, -dy
+                )
+                right["bin_z_join"] = right["bin_z"] - dz
+                merged = bc_grouped.merge(
+                    right,
+                    left_on=["bin_xy", "bin_z"],
+                    right_on=["bin_xy_join", "bin_z_join"],
+                    suffixes=("_a", "_b"),
+                )
+                merged = merged[merged["comp_a"] != merged["comp_b"]]
+                if len(merged) == 0:
+                    continue
+                comp_a = merged["comp_a"].to_numpy()
+                comp_b = merged["comp_b"].to_numpy()
+                count_arr = (
+                    merged["n_tx_a"].to_numpy()
+                    * merged["n_tx_b"].to_numpy()
+                )
+                bin_a_xy = merged["bin_xy_a"].to_numpy()
+                bin_a_z = merged["bin_z_a"].to_numpy()
+                bin_b_xy = merged["bin_xy_b"].to_numpy()
+                bin_b_z = merged["bin_z_b"].to_numpy()
+                swap_mask = comp_a > comp_b
+                lo_arr = np.where(swap_mask, comp_b, comp_a)
+                hi_arr = np.where(swap_mask, comp_a, comp_b)
+                bin_lo_xy = np.where(swap_mask, bin_b_xy, bin_a_xy)
+                bin_lo_z = np.where(swap_mask, bin_b_z, bin_a_z)
+                bin_hi_xy = np.where(swap_mask, bin_a_xy, bin_b_xy)
+                bin_hi_z = np.where(swap_mask, bin_a_z, bin_b_z)
 
-        for bk, comps in bin_to_comps.items():
-            cc_a = bin_to_comp_counts[bk]
-            # within-bin: all unordered pairs of distinct components
-            if len(comps) > 1:
-                for a, b in itertools.combinations(sorted(comps), 2):
-                    _record(a, b, cc_a[a] * cc_a[b], bk_a=bk, bk_b=bk)
+            out = pd.DataFrame({
+                "lo": lo_arr.astype(np.int64),
+                "hi": hi_arr.astype(np.int64),
+                "count": count_arr.astype(np.int64),
+            })
+            if track_local:
+                out["blxy"] = bin_lo_xy.astype(np.int64)
+                out["blz"] = bin_lo_z.astype(np.int64)
+                out["bhxy"] = bin_hi_xy.astype(np.int64)
+                out["bhz"] = bin_hi_z.astype(np.int64)
+            records.append(out)
 
-            # Cross-bin: emit each unordered (bin_a, bin_b) exactly once.
-            # In the 2D path we use the "half" xy offsets at dz=0.
-            # In the 3D path we use:
-            #   - half xy offsets at every dz in [-depth..+depth]
-            #   - full xy (offset 0,0) at strictly-positive dz only
-            # so each unordered xy/z bin pair is enumerated once.
-            if G_z is None:
-                xy_packed = bk
-                bx, by = unpack_bin(xy_packed)
-                for dx, dy in xy_half_offsets:
-                    nb_xy_int = int(
-                        (np.int64(bx + dx + _BIN_BIAS) << np.int64(32))
-                        | np.int64(by + dy + _BIN_BIAS)
-                    )
-                    nb_comps = bin_to_comps.get(nb_xy_int)
-                    if not nb_comps:
-                        continue
-                    cc_b = bin_to_comp_counts[nb_xy_int]
-                    for a in comps:
-                        for b in nb_comps:
-                            _record(a, b, cc_a[a] * cc_b[b],
-                                    bk_a=bk, bk_b=nb_xy_int)
-            else:
-                xy_packed, bz = bk
-                bx, by = unpack_bin(xy_packed)
-                # (a) half xy offsets across all dz (incl. dz=0)
-                for dx, dy in xy_half_offsets:
-                    for dz in z_offsets_with_dz0:
-                        nb_xy_int = int(
-                        (np.int64(bx + dx + _BIN_BIAS) << np.int64(32))
-                        | np.int64(by + dy + _BIN_BIAS)
-                    )
-                        nb_key = (nb_xy_int, bz + dz)
-                        nb_comps = bin_to_comps.get(nb_key)
-                        if not nb_comps:
-                            continue
-                        cc_b = bin_to_comp_counts[nb_key]
-                        for a in comps:
-                            for b in nb_comps:
-                                _record(a, b, cc_a[a] * cc_b[b],
-                                        bk_a=bk, bk_b=nb_key)
-                # (b) same xy bin (dx=dy=0), strictly-positive dz
-                for dz in z_offsets_strict_pos:
-                    nb_key = (xy_packed, bz + dz)
-                    nb_comps = bin_to_comps.get(nb_key)
-                    if not nb_comps:
-                        continue
-                    cc_b = bin_to_comp_counts[nb_key]
-                    for a in comps:
-                        for b in nb_comps:
-                            _record(a, b, cc_a[a] * cc_b[b],
-                                    bk_a=bk, bk_b=nb_key)
+        if records:
+            all_records = pd.concat(records, ignore_index=True, copy=False)
+            agg = (
+                all_records.groupby(["lo", "hi"], sort=False, as_index=False)
+                ["count"].sum()
+            )
+            pair_tx_edges: dict[tuple[int, int], int] = {
+                (int(l), int(h)): int(c)
+                for l, h, c in zip(
+                    agg["lo"].to_numpy(), agg["hi"].to_numpy(),
+                    agg["count"].to_numpy(),
+                )
+            }
+            candidate_pairs: set[tuple[int, int]] = set(pair_tx_edges.keys())
+        else:
+            pair_tx_edges = {}
+            candidate_pairs = set()
+
+        # Pre-compute per-pair witness counts (n_lo, n_hi) via vectorised
+        # joins. Previously we stored full pair_lo_bins / pair_hi_bins
+        # sets and let the filter iterate them, which was ~50K small
+        # per-pair Python set constructions and dominated this phase. The
+        # filter only needs the SUM of bin_to_comp_counts[bin][comp] over
+        # unique witness bins per pair — computable in a single merge +
+        # groupby pair (no Python iteration).
+        pair_n_lo: dict[tuple[int, int], int] = {}
+        pair_n_hi: dict[tuple[int, int], int] = {}
+        if track_local and records:
+            lo_unique = (
+                all_records[["lo", "hi", "blxy", "blz"]]
+                .drop_duplicates()
+                .merge(
+                    bc_grouped,
+                    left_on=["blxy", "blz", "lo"],
+                    right_on=["bin_xy", "bin_z", "comp"],
+                    how="left",
+                )
+            )
+            lo_unique["n_tx"] = lo_unique["n_tx"].fillna(0).astype(np.int64)
+            lo_summed = (
+                lo_unique.groupby(["lo", "hi"], sort=False, as_index=False)
+                ["n_tx"].sum()
+            )
+            pair_n_lo = {
+                (int(l), int(h)): int(n)
+                for l, h, n in zip(
+                    lo_summed["lo"].to_numpy(),
+                    lo_summed["hi"].to_numpy(),
+                    lo_summed["n_tx"].to_numpy(),
+                )
+            }
+            hi_unique = (
+                all_records[["lo", "hi", "bhxy", "bhz"]]
+                .drop_duplicates()
+                .merge(
+                    bc_grouped,
+                    left_on=["bhxy", "bhz", "hi"],
+                    right_on=["bin_xy", "bin_z", "comp"],
+                    how="left",
+                )
+            )
+            hi_unique["n_tx"] = hi_unique["n_tx"].fillna(0).astype(np.int64)
+            hi_summed = (
+                hi_unique.groupby(["lo", "hi"], sort=False, as_index=False)
+                ["n_tx"].sum()
+            )
+            pair_n_hi = {
+                (int(l), int(h)): int(n)
+                for l, h, n in zip(
+                    hi_summed["lo"].to_numpy(),
+                    hi_summed["hi"].to_numpy(),
+                    hi_summed["n_tx"].to_numpy(),
+                )
+            }
 
         # Optional minimum-supporting-edges filter.
         if min_candidate_edges:
@@ -1339,17 +1434,15 @@ def stitch_entities_hierarchical(
         # product count alone would pass `min_candidate_edges`.
         if track_local:
             mlt = int(min_local_tx_per_entity)
-            kept_local = set()
-            for (lo, hi) in candidate_pairs:
-                lo_bins = pair_lo_bins.get((lo, hi), ())
-                hi_bins = pair_hi_bins.get((lo, hi), ())
-                # Each tx is in exactly one bin (we floored coords), so
-                # summing per-bin per-entity tx counts over UNIQUE bins
-                # = the unique-tx witness count for that entity.
-                n_lo = sum(bin_to_comp_counts[b][lo] for b in lo_bins)
-                n_hi = sum(bin_to_comp_counts[b][hi] for b in hi_bins)
-                if n_lo >= mlt and n_hi >= mlt:
-                    kept_local.add((lo, hi))
+            # Witness counts are pre-summed per pair via the merge above,
+            # so the filter is a single comprehension — no per-pair
+            # Python set iteration. Same semantics as the prior code:
+            # for each pair, require ≥mlt UNIQUE tx of EACH side across
+            # all bins where the pair co-occurs.
+            kept_local = {
+                p for p in candidate_pairs
+                if pair_n_lo.get(p, 0) >= mlt and pair_n_hi.get(p, 0) >= mlt
+            }
             candidate_pairs = kept_local
 
         # Optional per-pair median |Δz| guard. Reject candidate pairs
