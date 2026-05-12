@@ -786,6 +786,7 @@ _LEGACY_STITCH_KWARG_SENTINEL = object()
 # call. Read by callers after the call returns (e.g. CLI / sweep tooling
 # that wants to log how many pairs the gate captured).
 _LAST_GATE_STATS: dict[str, int] = {}
+_LAST_STITCH_PHASE_TIMINGS: dict[str, float] = {}
 
 
 def _stitch_entities_hierarchical_decomposable(
@@ -1102,6 +1103,18 @@ def stitch_entities_hierarchical(
     if N <= 1:
         return {entity_ids[0]: entity_ids[0]}, {}
 
+    # Diagnostic phase-timing (visible via _LAST_STITCH_PHASE_TIMINGS
+    # after the call). Negligible overhead; flat dict, ~0.3 µs/write.
+    import time as _stitch_t
+    _phase_t0 = _stitch_t.time()
+    _phase_timings: dict[str, float] = {}
+
+    def _phase(name: str) -> None:
+        nonlocal _phase_t0
+        now = _stitch_t.time()
+        _phase_timings[name] = round(now - _phase_t0, 3)
+        _phase_t0 = now
+
     # ----------------------------------------------------------------
     # Candidate edge enumeration: Delaunay over centroids OR bin-grid
     # ----------------------------------------------------------------
@@ -1391,6 +1404,7 @@ def stitch_entities_hierarchical(
 
         # Indices are no longer needed after initial enumeration; release memory.
         del bin_to_comps
+    _phase("candidate_enum")
 
     # cluster metadata tracked at DSU roots
     dsu = DSU(N)
@@ -1735,6 +1749,7 @@ def stitch_entities_hierarchical(
         except Exception:
             gate_keep_mask = None  # graceful fallback: no gating
 
+    _phase("setup_root_state")
     heap = []
     for ei, (i, j) in enumerate(edges):
         # Tier 1 (positive override): spatial-overlap bypass. If the
@@ -1764,6 +1779,7 @@ def stitch_entities_hierarchical(
             # time and merged via the spatial-override path.
             heapq.heappush(heap, _heap_item(di, i, j))
 
+    _phase("heap_init")
     # greedy merging
     while heap:
         neg_dc, a, b = heapq.heappop(heap)
@@ -1981,10 +1997,14 @@ def stitch_entities_hierarchical(
         root_to_label[r] = label
 
     entity_to_stitched = {entity_ids[i]: root_to_label[dsu.find(i)] for i in range(N)}
+    _phase("merge_loop")
+    _LAST_STITCH_PHASE_TIMINGS.clear()
+    _LAST_STITCH_PHASE_TIMINGS.update(_phase_timings)
     info = {
         "root_to_label": root_to_label,
         "coherence_cache_hits": cache_hits,
         "coherence_cache_misses": cache_misses,
+        "phase_timings": dict(_phase_timings),
     }
     return entity_to_stitched, info
 
