@@ -352,9 +352,16 @@ def build_entity_table(
     bbox_min = grouped_coords.min().rename(columns={c: f"{c}_min" for c in coord_cols})
     bbox_max = grouped_coords.max().rename(columns={c: f"{c}_max" for c in coord_cols})
 
-    # unique genes per entity (sorted for deterministic downstream mapping)
+    # unique genes per entity (sorted for deterministic downstream mapping).
+    # Pre-cast gene_col to plain str ONCE so the per-group lambda doesn't
+    # have to convert from Categorical inside `.apply()` — previously that
+    # was ~6 s cumulative across 103K invocations on the densest PDAC
+    # sub-tile (per cProfile). After pre-cast, per-group work reduces to
+    # a single np.sort on an object array (no element-wise conversion).
+    if isinstance(df[gene_col].dtype, pd.CategoricalDtype):
+        df[gene_col] = df[gene_col].astype(str)
     genes = df.groupby(entity_col, sort=True, observed=True)[gene_col].unique()
-    genes = genes.apply(lambda arr: np.sort(arr.astype(str)))
+    genes = genes.apply(np.sort)
 
     etype = df.groupby(entity_col, observed=True)["_etype"].first()
 
