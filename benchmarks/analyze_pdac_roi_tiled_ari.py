@@ -33,7 +33,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import (
+    adjusted_rand_score,
+    rand_score,
+    normalized_mutual_info_score,
+    homogeneity_completeness_v_measure,
+)
 
 PDAC_PARQUET = Path(
     "/Users/adeshpa6/1_Projects/01.10_Lab/GENESIS/tutorials/pdac_io/"
@@ -148,48 +153,84 @@ def main() -> int:
         tiled_labels = tiled_part["label"].astype(str)
         tiled_un = _is_unassigned(tiled_labels)
 
-        # (1) ARI with each unassigned tx as a unique singleton cluster.
-        seq_codes_singleton = _codes_with_singletons(seq_labels)
-        tiled_codes_singleton = _codes_with_singletons(tiled_labels)
-        ari_singletons = float(
-            adjusted_rand_score(seq_codes_singleton, tiled_codes_singleton)
-        )
-        print(f"  ARI (unassigned=singletons, all tx):   {ari_singletons:.4f}")
+        # Encodings ----------------------------------------------------
+        # Mega-class: all unassigned → single cluster id (-1).
+        seq_codes_mega, _ = pd.factorize(seq_labels.to_numpy(), sort=False)
+        seq_codes_mega = seq_codes_mega.astype(np.int64); seq_codes_mega[seq_un] = -1
+        t_codes_mega, _ = pd.factorize(tiled_labels.to_numpy(), sort=False)
+        t_codes_mega = t_codes_mega.astype(np.int64); t_codes_mega[tiled_un] = -1
 
-        # (2) ARI on union(seq_assigned, tiled_assigned). Unassigned tx
-        # inside the union are still singletons; tx unassigned in BOTH
-        # are dropped (they would be co-clustered as singletons in both,
-        # which doesn't really test anything).
+        # Singleton: each unassigned → unique tx-idx-aligned id (same tx
+        # gets the same singleton id across partitions).
+        tx_idx = np.arange(seq_labels.size, dtype=np.int64)
+        seq_codes_sing = seq_codes_mega.copy()
+        seq_codes_sing[seq_un] = -2 - tx_idx[seq_un]
+        t_codes_sing = t_codes_mega.copy()
+        t_codes_sing[tiled_un] = -2 - tx_idx[tiled_un]
+
+        # Assigned-in-both intersection (sub-RI on the union of tx that
+        # both partitions claim are real entities).
         assigned_union = (~seq_un) | (~tiled_un)
-        s_codes_u = seq_codes_singleton[assigned_union]
-        t_codes_u = tiled_codes_singleton[assigned_union]
-        ari_union = float(adjusted_rand_score(s_codes_u, t_codes_u))
+        assigned_both = (~seq_un) & (~tiled_un)
         n_union = int(assigned_union.sum())
-        print(f"  ARI on union(seq, tiled) assigned tx:  {ari_union:.4f}   "
-              f"(n={n_union:,})")
+        n_both = int(assigned_both.sum())
 
-        # (3) ARI on tile interiors (>= BUFFER_UM from any tile edge).
+        # Tile-interior mask (>= BUFFER_UM from any tile edge).
         interior_mask = _compute_tile_interior_mask(df_raw, n_xy, BUFFER_UM)
-        # Combine with union-assigned mask so we only score tx that
-        # contribute meaningful signal.
         interior_union = interior_mask & assigned_union
-        s_codes_i = seq_codes_singleton[interior_union]
-        t_codes_i = tiled_codes_singleton[interior_union]
-        if int(interior_union.sum()) >= 2:
-            ari_interior = float(adjusted_rand_score(s_codes_i, t_codes_i))
-        else:
-            ari_interior = float("nan")
-        n_interior = int(interior_union.sum())
-        print(f"  ARI on tile-interior (≥{BUFFER_UM:.0f} µm buffer): {ari_interior:.4f}   "
-              f"(n={n_interior:,}, {100*n_interior/n_union:.2f}% of union)")
 
-        summary["configs"][label] = {
-            "ari_singletons": ari_singletons,
-            "ari_union": ari_union,
-            "ari_interior": ari_interior,
+        # Score sets to report. Each tuple: (label, seq_codes, tiled_codes, n).
+        score_sets = [
+            ("mega-class (all tx)",
+             seq_codes_mega, t_codes_mega, seq_labels.size),
+            ("singletons (all tx)",
+             seq_codes_sing, t_codes_sing, seq_labels.size),
+            ("assigned-in-both",
+             seq_codes_mega[assigned_both], t_codes_mega[assigned_both], n_both),
+            ("interior (singletons)",
+             seq_codes_sing[interior_union], t_codes_sing[interior_union],
+             int(interior_union.sum())),
+        ]
+
+        # Purity: per seq-entity, fraction of tx in dominant tiled label.
+        # Computed on assigned-in-seq tx (since "unassigned in seq" has no
+        # source-entity to be pure about).
+        sub = pd.DataFrame({
+            "seq": seq_labels[~seq_un].to_numpy(),
+            "til": tiled_labels[~seq_un].to_numpy(),
+        })
+        by_seq = sub.groupby("seq")["til"]
+        sizes = by_seq.size()
+        mode_count = by_seq.apply(lambda x: x.value_counts().iloc[0])
+        purity_per_seq = (mode_count / sizes).to_numpy()
+        purity_avg = float(np.average(purity_per_seq, weights=sizes.to_numpy()))
+
+        # Print + accumulate
+        cfg_summary: dict = {
             "n_union_assigned": n_union,
-            "n_interior_union": n_interior,
+            "n_both_assigned": n_both,
+            "n_interior_union": int(interior_union.sum()),
+            "purity_seq_to_tiled": purity_avg,
+            "metrics": {},
         }
+        print(f"  {'set':24s}  {'n':>9s}  {'ARI':>7s}  {'RI':>7s}  "
+              f"{'NMI':>7s}  {'h':>7s}  {'c':>7s}  {'V':>7s}")
+        for set_label, sl, tl, n_in_set in score_sets:
+            if n_in_set < 2:
+                continue
+            ari = float(adjusted_rand_score(sl, tl))
+            ri = float(rand_score(sl, tl))
+            nmi = float(normalized_mutual_info_score(sl, tl))
+            h, c, v = homogeneity_completeness_v_measure(sl, tl)
+            print(f"  {set_label:24s}  {n_in_set:>9,}  "
+                  f"{ari:>7.4f}  {ri:>7.4f}  {nmi:>7.4f}  "
+                  f"{h:>7.4f}  {c:>7.4f}  {v:>7.4f}")
+            cfg_summary["metrics"][set_label] = {
+                "n": n_in_set, "ARI": ari, "RI": ri, "NMI": nmi,
+                "h": float(h), "c": float(c), "V": float(v),
+            }
+        print(f"  purity (seq-entity → tiled-mode):  {purity_avg:.4f}")
+        summary["configs"][label] = cfg_summary
 
     out_path = IN_DIR / "ari_refined_summary.json"
     out_path.write_text(json.dumps(summary, indent=2, default=str))
