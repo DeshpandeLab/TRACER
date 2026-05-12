@@ -531,24 +531,46 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
     else:
         entity_to_genes = {}
 
-    # Build parent_to_entities using the cell_id column — works on
-    # any cell_id format, no regex.
-    # For each entity, find its parent by looking up the cell_id of
-    # any tx labeled with that entity. Filter to entities that ARE
-    # the main label of some cell (label == cell_id) or a partial /
-    # sub-partial (label.startswith(cell_id + "-")).
+    # Build parent_to_entities using the cell_id + _etype columns.
+    # Previous version did `np.where(label_arr == ent)` once per
+    # entity — O(N_entities * N_tx). On dense PDAC scale (~5K
+    # entities × ~500K tx) that was ~2.5B compares, dominating wall.
+    #
+    # New approach: single groupby('cell_id') over tx that are in
+    # a Phase 1 cell-or-partial entity (etype ∈ {cell, partial} when
+    # the column is present; falls back to label-prefix check otherwise).
+    # Each parent's entity list is unique(tracer_id) inside its group.
+    # No per-entity scan; O(N_tx · log N_tx).
     SENT = _UN
     parent_to_entities: dict[str, list[str]] = {}
-    for ent in entity_to_genes:
-        idx = np.where(label_arr == ent)[0]
-        if idx.size == 0:
-            continue
-        parent = str(cell_id_arr[idx[0]])
-        if parent in SENT:
-            continue
-        if ent != parent and not ent.startswith(parent + "-"):
-            continue  # not a Phase 1-family entity (e.g., cascade)
-        parent_to_entities.setdefault(parent, []).append(ent)
+
+    if has_etype:
+        # Fast path: etype filter on column.
+        keep_mask = np.isin(etype_arr, ("cell", "partial"))
+    else:
+        # Fallback: label is either the cell_id itself or starts with cell_id+'-'.
+        # Build a per-tx boolean: label==cid OR label.startswith(cid+'-').
+        lab_s = pd.Series(label_arr, dtype=str)
+        cid_s = pd.Series(cell_id_arr, dtype=str)
+        keep_mask = (lab_s == cid_s) | (
+            lab_s.str.startswith(cid_s.add("-"), na=False)
+        )
+        keep_mask = keep_mask.to_numpy()
+
+    # Drop sentinel cell_ids too.
+    cid_str = cell_id_arr.astype(str)
+    keep_mask = keep_mask & (~np.isin(cid_str, list(SENT)))
+
+    if keep_mask.any():
+        sub_df = pd.DataFrame({
+            "parent": cid_str[keep_mask],
+            "ent":    pd.Series(label_arr, dtype=str).to_numpy()[keep_mask],
+        }).drop_duplicates()
+        for parent, grp in sub_df.groupby("parent", sort=False):
+            ent_list = [e for e in grp["ent"].tolist()
+                        if e in entity_to_genes]
+            if ent_list:
+                parent_to_entities[parent] = ent_list
 
     # Candidate tx per parent: nuclear, in main entity (label == cell_id),
     # AND etype == "cell" if column present.
@@ -598,59 +620,99 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
             "n_parents_with_partials": 0,
         }
 
-    # Build CSR arrays for the kernel.
-    # Per parent: cand_offsets (into cand_gene_idx + cand_tx_idx_flat),
-    # main_offsets (into main_genes), partial_offsets (into per-parent
-    # partial enumeration). Partial-gene CSR is keyed by global partial
-    # index pi = parent_partial_offsets[p] + local_idx.
-    cand_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
-    cand_tx_flat: list[np.ndarray] = []
-    cand_gene_flat: list[np.ndarray] = []
-    for i, p in enumerate(active_parents):
-        cand_idx = cand_by_parent[p]
-        cand_offsets[i + 1] = cand_offsets[i] + cand_idx.size
-        cand_tx_flat.append(cand_idx.astype(np.int32))
-        # Per-candidate gene index
-        g_idx = np.fromiter(
-            (gene_to_idx.get(nuc_genes[t], -1) for t in cand_idx),
-            dtype=np.int32, count=cand_idx.size,
+    # Vectorize gene-string → gene-index for ALL nuclear tx in one pass
+    # (rather than per-parent dict lookups). The result is a global
+    # int32 array we can index into cheaply per parent.
+    nuc_gene_idx_global = (
+        pd.Series(nuc_genes).map(gene_to_idx)
+        .fillna(-1).astype(np.int32).to_numpy()
+    )
+
+    # Pre-convert entity_to_genes to a single concatenated int32 array
+    # plus offsets, with a name → (start, end) lookup. Avoids the
+    # per-parent np.fromiter cost.
+    entity_names = list(entity_to_genes.keys())
+    name_to_eindex = {n: i for i, n in enumerate(entity_names)}
+    entity_gene_arrays = [
+        np.fromiter(entity_to_genes[n], dtype=np.int32)
+        for n in entity_names
+    ]
+    entity_gene_offsets = np.zeros(len(entity_names) + 1, dtype=np.int32)
+    if entity_gene_arrays:
+        entity_gene_offsets[1:] = np.cumsum(
+            [a.size for a in entity_gene_arrays], dtype=np.int32,
         )
-        cand_gene_flat.append(g_idx)
-    cand_tx_arr = np.concatenate(cand_tx_flat).astype(np.int32)
-    cand_gene_arr = np.concatenate(cand_gene_flat).astype(np.int32)
+        entity_gene_flat = np.concatenate(entity_gene_arrays).astype(np.int32)
+    else:
+        entity_gene_flat = np.zeros(0, dtype=np.int32)
 
+    def _entity_gene_slice(name: str) -> tuple[int, int]:
+        ei = name_to_eindex[name]
+        return int(entity_gene_offsets[ei]), int(entity_gene_offsets[ei + 1])
+
+    # Build CSR arrays for the kernel. The loops below are now light:
+    # just offset arithmetic + array indexing, no dict / map calls.
+    cand_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    cand_sizes = np.fromiter(
+        (cand_by_parent[p].size for p in active_parents),
+        dtype=np.int32, count=n_parents_with_partials,
+    )
+    cand_offsets[1:] = np.cumsum(cand_sizes, dtype=np.int32)
+    cand_tx_arr = np.concatenate(
+        [cand_by_parent[p] for p in active_parents]
+    ).astype(np.int32)
+    cand_gene_arr = nuc_gene_idx_global[cand_tx_arr]
+
+    main_sizes = np.fromiter(
+        (
+            entity_gene_offsets[name_to_eindex[p] + 1]
+            - entity_gene_offsets[name_to_eindex[p]]
+            for p in active_parents
+        ),
+        dtype=np.int32, count=n_parents_with_partials,
+    )
     main_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
-    main_flat: list[np.ndarray] = []
-    for i, p in enumerate(active_parents):
-        S = np.fromiter(entity_to_genes[p], dtype=np.int32)
-        main_offsets[i + 1] = main_offsets[i] + S.size
-        main_flat.append(S)
-    main_genes_arr = (
-        np.concatenate(main_flat).astype(np.int32)
-        if main_flat else np.zeros(0, dtype=np.int32)
-    )
+    main_offsets[1:] = np.cumsum(main_sizes, dtype=np.int32)
+    main_genes_arr = np.concatenate([
+        entity_gene_flat[
+            entity_gene_offsets[name_to_eindex[p]]:
+            entity_gene_offsets[name_to_eindex[p] + 1]
+        ]
+        for p in active_parents
+    ]).astype(np.int32) if active_parents else np.zeros(0, dtype=np.int32)
 
-    # partial offsets: per parent, how many partials? Then per-partial
-    # gene CSR keyed by flat partial index.
-    partial_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
-    partial_gene_offsets_list: list[int] = [0]
-    partial_genes_flat: list[np.ndarray] = []
-    for i, partials in enumerate(partials_per_parent):
-        partial_offsets[i + 1] = partial_offsets[i] + len(partials)
-        for pe in partials:
-            S = np.fromiter(
-                entity_to_genes.get(pe, set()), dtype=np.int32,
-            )
-            partial_gene_offsets_list.append(
-                partial_gene_offsets_list[-1] + S.size
-            )
-            partial_genes_flat.append(S)
-    partial_gene_offsets_arr = np.asarray(
-        partial_gene_offsets_list, dtype=np.int32,
+    # Partials: enumerate flat per-parent, then per-partial CSR.
+    partial_counts = np.fromiter(
+        (len(partials) for partials in partials_per_parent),
+        dtype=np.int32, count=n_parents_with_partials,
     )
+    partial_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    partial_offsets[1:] = np.cumsum(partial_counts, dtype=np.int32)
+    flat_partial_names = [
+        pe for partials in partials_per_parent for pe in partials
+    ]
+    partial_sizes = np.fromiter(
+        (
+            (entity_gene_offsets[name_to_eindex[pe] + 1]
+             - entity_gene_offsets[name_to_eindex[pe]])
+            if pe in name_to_eindex else 0
+            for pe in flat_partial_names
+        ),
+        dtype=np.int32, count=len(flat_partial_names),
+    )
+    partial_gene_offsets_arr = np.zeros(len(flat_partial_names) + 1, dtype=np.int32)
+    partial_gene_offsets_arr[1:] = np.cumsum(partial_sizes, dtype=np.int32)
+    partial_genes_flat_chunks = []
+    for pe in flat_partial_names:
+        if pe in name_to_eindex:
+            s = entity_gene_offsets[name_to_eindex[pe]]
+            e = entity_gene_offsets[name_to_eindex[pe] + 1]
+            partial_genes_flat_chunks.append(entity_gene_flat[s:e])
+        else:
+            partial_genes_flat_chunks.append(np.zeros(0, dtype=np.int32))
     partial_genes_arr = (
-        np.concatenate(partial_genes_flat).astype(np.int32)
-        if partial_genes_flat else np.zeros(0, dtype=np.int32)
+        np.concatenate(partial_genes_flat_chunks).astype(np.int32)
+        if partial_genes_flat_chunks else np.zeros(0, dtype=np.int32)
     )
 
     # Ensure W is C-contiguous float32 (kernel requirement).
