@@ -28,7 +28,7 @@ else:
     omp_link_args = ["-fopenmp"]
 
 ext_specs = [
-    {"name": "_cy_prune",    "src": "src/tracer/_cy_prune.pyx",    "openmp": False},
+    {"name": "_cy_prune",    "src": "src/tracer/_cy_prune.pyx",    "openmp": True},
     {"name": "_cy_spatial",  "src": "src/tracer/_cy_spatial.pyx",  "openmp": False},
     {"name": "_cy_reassign", "src": "src/tracer/_cy_reassign.pyx", "openmp": True},
 ]

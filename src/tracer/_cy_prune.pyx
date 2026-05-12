@@ -3,6 +3,8 @@
 import numpy as np
 cimport numpy as cnp
 from libc.stdlib cimport malloc, free
+from cython.parallel cimport prange
+cimport openmp
 
 
 def prune_cells(list g_lists, cnp.ndarray[cnp.float32_t, ndim=2] W, double threshold):
@@ -927,6 +929,231 @@ cdef inline double _percentile_sorted(float *sorted_buf, int n, double p) noexce
     return sorted_buf[lo] * (1.0 - frac) + sorted_buf[hi] * frac
 
 
+cdef void _rescue_one_tx(
+    int i,
+    int tid,
+    int current_gen,
+    float *pmi_buf,                # per-thread slice (caller already offsets)
+    cnp.int8_t[:, :] cache_mv,     # (n_threads, n_ent)
+    cnp.int32_t[:, :] gen_mv,      # (n_threads, n_ent)
+    int n_ent,
+    int max_bin_key_plus_one,
+    int has_z,
+    double z_bound,
+    int veto_mode,
+    int rs_active,
+    double rs_thr,
+    double agg_p,
+    double mean_threshold,
+    int small_entity_guard_n,
+    double neg_npmi_threshold,
+    double min_admit_threshold,
+    cnp.float32_t[:, :] una_c_mv,
+    cnp.int64_t[:] una_g_mv,
+    cnp.int64_t[:, :] nb_bins_mv,
+    cnp.float32_t[:, :] ass_c_mv,
+    cnp.int32_t[:] ass_ent_mv,
+    cnp.int64_t[:] bin_off_mv,
+    cnp.int64_t[:] bin_data_mv,
+    cnp.int32_t[:] ent_off_mv,
+    cnp.int32_t[:] ent_g_mv,
+    cnp.float32_t[:, :] W_mv,
+    cnp.int32_t[:] best_ent_mv,
+    cnp.float32_t[:] best_dist_mv,
+    cnp.int32_t[:] reason_mv,
+    cnp.int32_t[:] sef_mv,
+) nogil:
+    """Per-tx Rescue body. Extracted from `rescue_per_tx_batch`'s inner
+    loop so it can be called from prange without tripping Cython's
+    reduction-variable detection. All scalar work is function-local.
+
+    Per-thread mutable state (`cache_row`, `gen_row`, `pmi_buf` slice)
+    is passed in by the caller; the helper writes to them but they
+    never alias across threads.
+    """
+    cdef int j, k, b, off_lo, off_hi, ass_li, ent
+    cdef int e_off_lo, e_off_hi, n_ent_genes, ig, eg
+    cdef int g_idx, vetoed, any_vetoed, found_neg, n_finite, used_fallback
+    cdef int g_in_E
+    cdef int n_signal
+    cdef float v_f, av_f, min_signal_f
+    cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p, min_pmi
+    cdef double p_aggregate
+
+    g_idx = <int> una_g_mv[i]
+    if g_idx < 0:
+        reason_mv[i] = 1
+        return
+
+    best_d = 1e300
+    best_ent_mv[i] = -1
+    any_vetoed = 0
+    used_fallback = 0
+
+    for j in range(9):
+        b = <int> nb_bins_mv[i, j]
+        if b < 0 or b >= max_bin_key_plus_one:
+            continue
+        off_lo = <int> bin_off_mv[b]
+        off_hi = <int> bin_off_mv[b + 1]
+        for k in range(off_lo, off_hi):
+            ass_li = <int> bin_data_mv[k]
+            if has_z:
+                dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
+                if dz < 0: dz = -dz
+                if dz > z_bound:
+                    continue
+
+            ent = ass_ent_mv[ass_li]
+            if ent < 0 or ent >= n_ent:
+                continue
+
+            if gen_mv[tid, ent] == current_gen:
+                if cache_mv[tid, ent] == 1:
+                    continue
+                # else cached as OK; fall through to distance update
+            else:
+                e_off_lo = ent_off_mv[ent]
+                e_off_hi = ent_off_mv[ent + 1]
+                n_ent_genes = e_off_hi - e_off_lo
+                vetoed = 0
+
+                if n_ent_genes == 0:
+                    vetoed = 0
+                elif veto_mode == 0:
+                    for ig in range(e_off_lo, e_off_hi):
+                        eg = ent_g_mv[ig]
+                        if eg == g_idx:
+                            continue
+                        if W_mv[g_idx, eg] < neg_npmi_threshold:
+                            vetoed = 1
+                            break
+                elif veto_mode == 1:
+                    if rs_active:
+                        n_signal = 0
+                        for ig in range(e_off_lo, e_off_hi):
+                            eg = ent_g_mv[ig]
+                            if eg == g_idx:
+                                continue
+                            v_f = W_mv[g_idx, eg]
+                            if v_f != v_f:
+                                continue
+                            av_f = v_f if v_f >= 0.0 else -v_f
+                            if av_f <= rs_thr:
+                                continue
+                            pmi_buf[n_signal] = v_f
+                            n_signal += 1
+                        if n_signal == 0:
+                            vetoed = 0
+                        else:
+                            _insertion_sort_floats(pmi_buf, n_signal)
+                            p_aggregate = _percentile_sorted(
+                                pmi_buf, n_signal, agg_p
+                            )
+                            vetoed = 1 if p_aggregate <= mean_threshold else 0
+                    else:
+                        pmi_sum = 0.0
+                        n_finite = 0
+                        found_neg = 0
+                        for ig in range(e_off_lo, e_off_hi):
+                            eg = ent_g_mv[ig]
+                            if eg == g_idx:
+                                continue
+                            pmi_val = W_mv[g_idx, eg]
+                            if pmi_val == pmi_val:
+                                pmi_sum += pmi_val
+                                n_finite += 1
+                                if pmi_val < neg_npmi_threshold:
+                                    found_neg = 1
+                        if n_finite < small_entity_guard_n:
+                            vetoed = found_neg
+                            if not found_neg and n_finite > 0:
+                                used_fallback += 1
+                        elif n_finite == 0:
+                            vetoed = 1
+                        else:
+                            mean_p = pmi_sum / n_finite
+                            vetoed = 1 if mean_p <= mean_threshold else 0
+                else:
+                    # hybrid (veto_mode == 2)
+                    g_in_E = 0
+                    for ig in range(e_off_lo, e_off_hi):
+                        if ent_g_mv[ig] == g_idx:
+                            g_in_E = 1
+                            break
+                    if g_in_E:
+                        vetoed = 0
+                    else:
+                        if rs_active:
+                            n_signal = 0
+                            min_signal_f = 1e30
+                            for ig in range(e_off_lo, e_off_hi):
+                                eg = ent_g_mv[ig]
+                                v_f = W_mv[g_idx, eg]
+                                if v_f != v_f:
+                                    continue
+                                av_f = v_f if v_f >= 0.0 else -v_f
+                                if av_f <= rs_thr:
+                                    continue
+                                pmi_buf[n_signal] = v_f
+                                if v_f < min_signal_f:
+                                    min_signal_f = v_f
+                                n_signal += 1
+                            if n_signal == 0:
+                                vetoed = 0
+                            elif min_signal_f > min_admit_threshold:
+                                vetoed = 0
+                            else:
+                                _insertion_sort_floats(pmi_buf, n_signal)
+                                p_aggregate = _percentile_sorted(
+                                    pmi_buf, n_signal, agg_p
+                                )
+                                vetoed = 1 if p_aggregate <= mean_threshold else 0
+                        else:
+                            pmi_sum = 0.0
+                            n_finite = 0
+                            min_pmi = 1e300
+                            for ig in range(e_off_lo, e_off_hi):
+                                eg = ent_g_mv[ig]
+                                pmi_val = W_mv[g_idx, eg]
+                                if pmi_val == pmi_val:
+                                    pmi_sum += pmi_val
+                                    n_finite += 1
+                                    if pmi_val < min_pmi:
+                                        min_pmi = pmi_val
+                            if n_finite == 0:
+                                vetoed = 1
+                            elif min_pmi > min_admit_threshold:
+                                vetoed = 0
+                            elif pmi_sum / n_finite > mean_threshold:
+                                vetoed = 0
+                            else:
+                                vetoed = 1
+
+                cache_mv[tid, ent] = 1 if vetoed else 2
+                gen_mv[tid, ent] = current_gen
+
+            if cache_mv[tid, ent] == 1:
+                any_vetoed = 1
+                continue
+
+            dx = ass_c_mv[ass_li, 0] - una_c_mv[i, 0]
+            dy = ass_c_mv[ass_li, 1] - una_c_mv[i, 1]
+            d = dx * dx + dy * dy
+            if has_z:
+                dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
+                d += dz * dz
+            if d < best_d:
+                best_d = d
+                best_ent_mv[i] = ent
+
+    if best_ent_mv[i] == -1:
+        reason_mv[i] = 2 if any_vetoed else 1
+    else:
+        best_dist_mv[i] = <cnp.float32_t> (best_d ** 0.5)
+    sef_mv[i] = used_fallback
+
+
 def rescue_per_tx_batch(
     cnp.ndarray[cnp.float32_t, ndim=2] una_coords,    # [n_una, 3] (x,y,z)
     cnp.ndarray[cnp.int64_t, ndim=1] una_g_idx,       # [n_una], gene-vocab idx, -1 = skip
@@ -1001,12 +1228,21 @@ def rescue_per_tx_batch(
     cdef cnp.int32_t[:]     reason_mv = reason_arr
     cdef cnp.int32_t[:]     sef_mv = sef_arr
 
-    # Per-entity decision cache, invalidated per tx via generation counter.
-    # cache_state: 0=unset, 1=vetoed, 2=ok.
-    cdef cnp.ndarray[cnp.int8_t, ndim=1] ent_cache = np.zeros(n_ent, dtype=np.int8)
-    cdef cnp.int8_t[:] cache_mv = ent_cache
-    cdef cnp.ndarray[cnp.int32_t, ndim=1] cache_gen = np.zeros(n_ent, dtype=np.int32)
-    cdef cnp.int32_t[:] gen_mv = cache_gen
+    # Per-entity decision cache: per-thread storage so prange iters
+    # don't collide. Shape (n_threads × n_ent). gen counter is unique
+    # per tx (current_gen = i+1) so different iters never see stale hits.
+    cdef int n_threads = openmp.omp_get_max_threads()
+    if n_threads < 1:
+        n_threads = 1
+    cdef cnp.ndarray[cnp.int8_t, ndim=2] ent_cache = np.zeros(
+        (n_threads, n_ent), dtype=np.int8,
+    )
+    cdef cnp.int8_t[:, :] cache_mv = ent_cache
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] cache_gen = np.zeros(
+        (n_threads, n_ent), dtype=np.int32,
+    )
+    cdef cnp.int32_t[:, :] gen_mv = cache_gen
+    cdef int tid
     cdef int current_gen = 0
 
     # Real-players gate state. Buffer sized to max entity gene count
@@ -1025,215 +1261,36 @@ def rescue_per_tx_batch(
                 max_ent_size = _ent_size
         if max_ent_size < 1:
             max_ent_size = 1
-    cdef float *pmi_buf = <float*> malloc(<size_t>(max_ent_size if rs_active else 1) * sizeof(float))
+    cdef int pmi_buf_per_thread = max_ent_size if rs_active else 1
+    cdef float *pmi_buf = <float*> malloc(
+        <size_t>(n_threads * pmi_buf_per_thread) * sizeof(float)
+    )
     if pmi_buf == NULL:
         raise MemoryError("rescue_per_tx_batch: failed to allocate pmi_buf")
 
-    cdef int i, j, b, off_lo, off_hi, ass_li, ent
-    cdef int e_off_lo, e_off_hi, n_ent_genes, ig, eg
-    cdef int g_idx, vetoed, any_vetoed, found_neg, n_finite, used_fallback
-    cdef int g_in_E
-    cdef int n_signal
-    cdef float v_f, av_f, min_signal_f
-    cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p, min_pmi
-    cdef double p_aggregate
+    cdef int i
+    cdef int tid_loop
 
     try:
-        for i in range(n_una):
-            current_gen += 1
-            g_idx = <int> una_g_mv[i]
-            if g_idx < 0:
-                reason_mv[i] = 1
-                continue
-
-            best_d = 1e300
-            best_ent_mv[i] = -1
-            any_vetoed = 0
-            used_fallback = 0
-
-            for j in range(9):
-                b = <int> nb_bins_mv[i, j]
-                if b < 0 or b >= max_bin_key_plus_one:
-                    continue
-                off_lo = <int> bin_off_mv[b]
-                off_hi = <int> bin_off_mv[b + 1]
-                for k in range(off_lo, off_hi):
-                    ass_li = <int> bin_data_mv[k]
-                    # z-bound filter
-                    if has_z:
-                        dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
-                        if dz < 0: dz = -dz
-                        if dz > z_bound:
-                            continue
-
-                    ent = ass_ent_mv[ass_li]
-                    if ent < 0 or ent >= n_ent:
-                        continue
-
-                    # Cache check
-                    if gen_mv[ent] == current_gen:
-                        if cache_mv[ent] == 1:
-                            continue
-                        # else cache_mv[ent] == 2 → OK; fall through
-                    else:
-                        # Compute veto for this entity (this tx).
-                        e_off_lo = ent_off_mv[ent]
-                        e_off_hi = ent_off_mv[ent + 1]
-                        n_ent_genes = e_off_hi - e_off_lo
-                        vetoed = 0
-
-                        if n_ent_genes == 0:
-                            vetoed = 0
-                        elif veto_mode == 0:
-                            # min-mode: any entity gene with W[g, eg] < neg_thr → veto
-                            for ig in range(e_off_lo, e_off_hi):
-                                eg = ent_g_mv[ig]
-                                if eg == g_idx:
-                                    continue
-                                if W_mv[g_idx, eg] < neg_npmi_threshold:
-                                    vetoed = 1
-                                    break
-                        elif veto_mode == 1:
-                            # mean-mode
-                            if rs_active:
-                                # Real-players gate: collect pairs with
-                                # |PMI| > rs_thr; veto if percentile-aggregate
-                                # ≤ mean_threshold. Defers to spatial when
-                                # no real-signal pairs (n_signal == 0).
-                                n_signal = 0
-                                for ig in range(e_off_lo, e_off_hi):
-                                    eg = ent_g_mv[ig]
-                                    if eg == g_idx:
-                                        continue
-                                    v_f = W_mv[g_idx, eg]
-                                    if v_f != v_f:  # NaN
-                                        continue
-                                    av_f = v_f if v_f >= 0.0 else -v_f
-                                    if av_f <= rs_thr:
-                                        continue
-                                    pmi_buf[n_signal] = v_f
-                                    n_signal += 1
-                                if n_signal == 0:
-                                    vetoed = 0  # defer to spatial
-                                else:
-                                    _insertion_sort_floats(pmi_buf, n_signal)
-                                    p_aggregate = _percentile_sorted(
-                                        pmi_buf, n_signal, agg_p
-                                    )
-                                    vetoed = 1 if p_aggregate <= mean_threshold else 0
-                            else:
-                                # Legacy mean-of-finite path (back-compat).
-                                pmi_sum = 0.0
-                                n_finite = 0
-                                found_neg = 0
-                                for ig in range(e_off_lo, e_off_hi):
-                                    eg = ent_g_mv[ig]
-                                    if eg == g_idx:
-                                        continue
-                                    pmi_val = W_mv[g_idx, eg]
-                                    if pmi_val == pmi_val:  # not NaN
-                                        pmi_sum += pmi_val
-                                        n_finite += 1
-                                        if pmi_val < neg_npmi_threshold:
-                                            found_neg = 1
-                                if n_finite < small_entity_guard_n:
-                                    # fall back to min-mode
-                                    vetoed = found_neg
-                                    if not found_neg and n_finite > 0:
-                                        used_fallback += 1
-                                elif n_finite == 0:
-                                    vetoed = 1
-                                else:
-                                    mean_p = pmi_sum / n_finite
-                                    vetoed = 1 if mean_p <= mean_threshold else 0
-                        else:
-                            # hybrid mode (veto_mode == 2):
-                            #   if g ∈ E.genes → admit (no test).
-                            #   else if min PMI(g, E\{g}) > min_admit_threshold → admit.
-                            #   else if percentile-aggregate of real-signal
-                            #         (or mean if rs_active==0) > mean_threshold → admit.
-                            #   else → veto.
-                            g_in_E = 0
-                            for ig in range(e_off_lo, e_off_hi):
-                                if ent_g_mv[ig] == g_idx:
-                                    g_in_E = 1
-                                    break
-                            if g_in_E:
-                                vetoed = 0
-                            else:
-                                if rs_active:
-                                    # Real-players gate (parallel to mean
-                                    # branch above), but with hybrid's
-                                    # unanimous-strong fast-pass on top.
-                                    n_signal = 0
-                                    min_signal_f = 1e30
-                                    for ig in range(e_off_lo, e_off_hi):
-                                        eg = ent_g_mv[ig]
-                                        v_f = W_mv[g_idx, eg]
-                                        if v_f != v_f:  # NaN
-                                            continue
-                                        av_f = v_f if v_f >= 0.0 else -v_f
-                                        if av_f <= rs_thr:
-                                            continue
-                                        pmi_buf[n_signal] = v_f
-                                        if v_f < min_signal_f:
-                                            min_signal_f = v_f
-                                        n_signal += 1
-                                    if n_signal == 0:
-                                        vetoed = 0  # defer to spatial
-                                    elif min_signal_f > min_admit_threshold:
-                                        vetoed = 0  # unanimous-strong fast-pass
-                                    else:
-                                        _insertion_sort_floats(pmi_buf, n_signal)
-                                        p_aggregate = _percentile_sorted(
-                                            pmi_buf, n_signal, agg_p
-                                        )
-                                        vetoed = 1 if p_aggregate <= mean_threshold else 0
-                                else:
-                                    # Legacy mean-of-finite hybrid (back-compat).
-                                    pmi_sum = 0.0
-                                    n_finite = 0
-                                    min_pmi = 1e300
-                                    for ig in range(e_off_lo, e_off_hi):
-                                        eg = ent_g_mv[ig]
-                                        pmi_val = W_mv[g_idx, eg]
-                                        if pmi_val == pmi_val:  # not NaN
-                                            pmi_sum += pmi_val
-                                            n_finite += 1
-                                            if pmi_val < min_pmi:
-                                                min_pmi = pmi_val
-                                    if n_finite == 0:
-                                        vetoed = 1
-                                    elif min_pmi > min_admit_threshold:
-                                        vetoed = 0  # unanimous-positive fast-pass
-                                    elif pmi_sum / n_finite > mean_threshold:
-                                        vetoed = 0  # aggregate-positive slow-pass
-                                    else:
-                                        vetoed = 1
-
-                        cache_mv[ent] = 1 if vetoed else 2
-                        gen_mv[ent] = current_gen
-
-                    if cache_mv[ent] == 1:
-                        any_vetoed = 1
-                        continue
-
-                    # Distance (squared; final sqrt at write-out)
-                    dx = ass_c_mv[ass_li, 0] - una_c_mv[i, 0]
-                    dy = ass_c_mv[ass_li, 1] - una_c_mv[i, 1]
-                    d = dx * dx + dy * dy
-                    if has_z:
-                        dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
-                        d += dz * dz
-                    if d < best_d:
-                        best_d = d
-                        best_ent_mv[i] = ent
-
-            if best_ent_mv[i] == -1:
-                reason_mv[i] = 2 if any_vetoed else 1
-            else:
-                best_dist_mv[i] = <cnp.float32_t> (best_d ** 0.5)
-            sef_mv[i] = used_fallback
+        # Per-tx work runs in parallel via prange. Per-thread state
+        # (pmi_buf slice + cache row + gen row) is passed into the
+        # helper through tid indexing; helper is nogil-safe.
+        for i in prange(n_una, nogil=True, schedule="dynamic"):
+            tid_loop = openmp.omp_get_thread_num()
+            _rescue_one_tx(
+                i, tid_loop, i + 1,
+                pmi_buf + tid_loop * pmi_buf_per_thread,
+                cache_mv, gen_mv,
+                n_ent, max_bin_key_plus_one,
+                has_z, z_bound, veto_mode,
+                rs_active, rs_thr, agg_p,
+                mean_threshold, small_entity_guard_n,
+                neg_npmi_threshold, min_admit_threshold,
+                una_c_mv, una_g_mv, nb_bins_mv,
+                ass_c_mv, ass_ent_mv, bin_off_mv, bin_data_mv,
+                ent_off_mv, ent_g_mv, W_mv,
+                best_ent_mv, best_dist_mv, reason_mv, sef_mv,
+            )
     finally:
         free(pmi_buf)
 
