@@ -1057,18 +1057,41 @@ def _state_dict(df: pd.DataFrame, col: str) -> dict[str, int]:
 def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str):
     """Append a stage snapshot. Records wall-clock elapsed since the
     previous _record_stage call so callers can see which stage dominates.
+
+    When the env var ``TRACER_STAGE_VERBOSE`` is set (any truthy value),
+    prints a one-line summary as each stage completes — useful for live
+    progress on long-running benches. Workers inherit the env var
+    through fork/spawn so process-pool runs are also chatty.
     """
+    import os as _os
     import time as _t
     now = _t.time()
     prev_ts = progression[-1]["_ts"] if progression else None
-    progression.append({
+    stage_seconds = (
+        round(now - prev_ts, 3) if prev_ts is not None else None
+    )
+    entry = {
         "stage": stage_name,
         "_ts": now,
-        "stage_seconds": (
-            round(now - prev_ts, 3) if prev_ts is not None else None
-        ),
+        "stage_seconds": stage_seconds,
         **_state_dict(df, col),
-    })
+    }
+    progression.append(entry)
+    if _os.environ.get("TRACER_STAGE_VERBOSE"):
+        tag = _os.environ.get("TRACER_STAGE_TAG", "")
+        prefix = f"[stage {tag}]" if tag else "[stage]"
+        secs_str = (
+            f"{stage_seconds:>7.2f}s" if stage_seconds is not None
+            else f"{'(t0)':>8s}"
+        )
+        print(
+            f"{prefix} {stage_name:<22s} "
+            f"{secs_str}  "
+            f"cells={entry.get('n_cells', 0):>7,} "
+            f"partials={entry.get('n_partials', 0):>7,} "
+            f"unassigned_tx={entry.get('n_unassigned_tx', 0):>9,}",
+            flush=True,
+        )
 
 
 def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,

@@ -45,6 +45,7 @@ def _tile_worker(args: dict) -> dict:
 
     Returns dict with `tile_idx`, `df_out`, `progression`, `wall_seconds`.
     """
+    import os as _os
     import time as _t  # repeat-import for worker process
     import tests._pipeline_runner as runner
     from tests._pipeline_runner import run_segmented_pipeline
@@ -54,6 +55,11 @@ def _tile_worker(args: dict) -> dict:
     panel = args["panel"]
     rerank = bool(args.get("rerank", True))
     reassign = bool(args.get("reassign", True))
+
+    # Tag stage-verbose output with the tile index so workers' interleaved
+    # output is parseable.
+    if _os.environ.get("TRACER_STAGE_VERBOSE"):
+        _os.environ["TRACER_STAGE_TAG"] = f"tile{tile_idx}"
 
     orig_rerank = runner.PHASE1_RERANK_ENABLED
     orig_reassign = runner.PHASE1_REASSIGN_AFTER_1C
