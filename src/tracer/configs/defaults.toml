@@ -63,8 +63,27 @@ min_tx = 3
 # recovery without coherence regression.
 # ---------------------------------------------------------------------
 [phase1_rerank]
-enabled = false
+# 2026-05-13: enabled flipped false → true after PDAC + lung cross-tissue
+# validation (89%/67% retention; cell C mean 0.93 with strict-PMI).
+enabled = true
 margin_tx = 1
+
+
+# ---------------------------------------------------------------------
+# Phase 1 post-1c nuclear reassignment (Gap-B fix).
+# Nuclear tx weakly admitted to the main seed but strong-fit to a 1c
+# partial sub-seed get moved to the partial. Default-on since 2026-05-11
+# (Cython kernel landed 2026-05-13).
+# ---------------------------------------------------------------------
+[phase1_reassign]
+enabled = true
+margin = 0.05
+
+# ---------------------------------------------------------------------
+# Demote — drop entities smaller than min_size after Stitch.
+# ---------------------------------------------------------------------
+[demote]
+min_size = 5
 
 
 # ---------------------------------------------------------------------

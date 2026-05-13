@@ -181,7 +181,7 @@ def test_phase1_rerank_invariants(kwargs, match):
 
 def test_phase1_rerank_defaults():
     cfg = Phase1RerankConfig()
-    assert cfg.enabled is False
+    assert cfg.enabled is True  # promoted to default-on 2026-05-13
     assert cfg.margin_tx == 1
 
 

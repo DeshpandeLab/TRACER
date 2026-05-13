@@ -99,11 +99,15 @@ class Phase1RerankConfig:
     """Re-rank depth-1 entities under each parent cell by nuclear-tx
     count; promote the largest to the main `{cell_id}` slot.
 
-    Opt-in (default off). Defuses Phase 1's greedy 1a→1b→1c privilege
-    when a partial ends up with more nuclear tx than the main. See
+    Defuses Phase 1's greedy 1a→1b→1c privilege when a partial ends up
+    with more nuclear tx than the main. See
     `docs/superpowers/specs/2026-05-11-phase1-rerank-design.md`.
+
+    2026-05-13: promoted to default-on after PDAC + lung cross-tissue
+    validation (89%/67% retention, cell C mean 0.93 with strict-PMI
+    defaults; no failure mode observed).
     """
-    enabled: bool = False
+    enabled: bool = True
     margin_tx: int = 1   # minimum (n_largest - n_runner_up) required
                          # to swap. margin_tx=1 ⇒ strict >.
 
@@ -111,6 +115,47 @@ class Phase1RerankConfig:
         if self.margin_tx < 1:
             raise ValueError(
                 f"phase1_rerank.margin_tx must be >= 1; got {self.margin_tx}"
+            )
+
+
+@dataclass(frozen=True)
+class Phase1ReassignConfig:
+    """Phase-1 post-1c nuclear reassignment (Gap-B fix).
+
+    Nuclear tx weakly admitted to the main seed, but strong-fit to a
+    1c partial sub-seed, get moved to the partial. Wired in commit
+    `8454454`; numpy-vectorized in `0217585` (3.1× speedup); Cython
+    kernel `_cy_reassign` with OpenMP prange added 2026-05-13.
+
+    Default-on since 2026-05-11 (commit `a9718fd`); promoted to FROZEN
+    2026-05-13.
+    """
+    enabled: bool = True
+    margin: float = 0.05   # min Δ(partial-fit - main-fit) PMI to trigger move
+
+    def __post_init__(self) -> None:
+        if self.margin < 0.0:
+            raise ValueError(
+                f"phase1_reassign.margin must be >= 0; got {self.margin}"
+            )
+
+
+@dataclass(frozen=True)
+class DemoteConfig:
+    """Demote entities smaller than `min_size` to unassigned (post-Stitch).
+
+    Runs once between Stitch and Final Rescue. Catches sub-threshold
+    entities that survived Stitch via lucky merges but are too small
+    to be biologically meaningful.
+
+    Promoted to FROZEN 2026-05-13.
+    """
+    min_size: int = 5
+
+    def __post_init__(self) -> None:
+        if self.min_size < 1:
+            raise ValueError(
+                f"demote.min_size must be >= 1; got {self.min_size}"
             )
 
 
@@ -361,8 +406,10 @@ class PipelineConfig:
     split_phase1: SplitPhase1Config = field(default_factory=SplitPhase1Config)
     phase1_qc: Phase1QcConfig = field(default_factory=Phase1QcConfig)
     phase1_rerank: Phase1RerankConfig = field(default_factory=Phase1RerankConfig)
+    phase1_reassign: Phase1ReassignConfig = field(default_factory=Phase1ReassignConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     group: GroupConfig = field(default_factory=GroupConfig)
+    demote: DemoteConfig = field(default_factory=DemoteConfig)
     final_rescue: RescueConfig = field(
         default_factory=lambda: RescueConfig(small_entity_guard_n=0)
     )
@@ -382,8 +429,10 @@ _SECTION_TO_CLS: dict[str, type] = {
     "split_phase1": SplitPhase1Config,
     "phase1_qc": Phase1QcConfig,
     "phase1_rerank": Phase1RerankConfig,
+    "phase1_reassign": Phase1ReassignConfig,
     "rescue": RescueConfig,
     "group": GroupConfig,
+    "demote": DemoteConfig,
     "final_rescue": RescueConfig,
     "bootstrap": BootstrapConfig,
 }
@@ -542,8 +591,10 @@ __all__ = [
     "SplitPhase1Config",
     "Phase1QcConfig",
     "Phase1RerankConfig",
+    "Phase1ReassignConfig",
     "RescueConfig",
     "GroupConfig",
+    "DemoteConfig",
     "BootstrapConfig",
     "PipelineConfig",
     "load_config",

@@ -1096,7 +1096,7 @@ RESCUE_POST_GROUP_PASSES: int = 3
 # already supported promotion; only the +250s wall cost was the blocker.
 PHASE1_REASSIGN_AFTER_1C: bool = True
 
-PHASE1_RERANK_ENABLED: bool = False    # opt-in: rerank depth-1 entities
+PHASE1_RERANK_ENABLED: bool = True     # rerank depth-1 entities — promoted to default-on 2026-05-13
                                         # under each parent by nuclear-tx
                                         # count. See
                                         # docs/superpowers/specs/2026-05-11-phase1-rerank-design.md

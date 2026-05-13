@@ -384,11 +384,14 @@ class TestSegVsNoSegConsistency:
 # Phase1-Rerank opt-in smoke tests
 # ============================================================================
 
-def test_rerank_off_omits_stage_seg_smoke(synthetic_inputs):
-    """With PHASE1_RERANK_ENABLED=False (default), Phase1-Rerank is
-    not recorded in the SEG progression."""
+def test_rerank_off_omits_stage_seg_smoke(monkeypatch, synthetic_inputs):
+    """With PHASE1_RERANK_ENABLED=False, Phase1-Rerank is not recorded
+    in the SEG progression. Default is now True (promoted 2026-05-13)
+    so this test monkey-patches it off."""
+    import tests._pipeline_runner as runner
+    monkeypatch.setattr(runner, "PHASE1_RERANK_ENABLED", False)
     df, panel, _gt = synthetic_inputs
-    _df_out, progression = run_segmented_pipeline(df, panel)
+    _df_out, progression = runner.run_segmented_pipeline(df, panel)
     stage_names = [p["stage"] for p in progression]
     assert "Phase1-Rerank" not in stage_names
 
