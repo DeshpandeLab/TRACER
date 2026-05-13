@@ -1,0 +1,25 @@
+{
+  "n_input_tx": 3457184,
+  "n_input_cells": 33603,
+  "sequential_assigned_tx": 3347076,
+  "tiled_2x2": {
+    "wall_seconds": 56.01,
+    "ari_full": 0.7570904224470841,
+    "ari_restricted": 0.9162054290619742,
+    "n_seq_assigned": 3347076,
+    "n_tiled_assigned": 3320290,
+    "n_both_assigned": 3317905,
+    "n_only_seq": 29171,
+    "n_only_tiled": 2385
+  },
+  "tiled_3x3": {
+    "wall_seconds": 47.55,
+    "ari_full": 0.7170663994187646,
+    "ari_restricted": 0.9066706087520319,
+    "n_seq_assigned": 3347076,
+    "n_tiled_assigned": 3314307,
+    "n_both_assigned": 3311776,
+    "n_only_seq": 35300,
+    "n_only_tiled": 2531
+  }
+}

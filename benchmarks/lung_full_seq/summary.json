@@ -1,0 +1,17 @@
+{
+  "panel_path": "/Users/adeshpa6/1_Projects/01.10_Lab/GENESIS/tutorials/lung_cancer/data/lung_cancer_npmi.csv",
+  "panel_rows": 4068,
+  "wall_seconds": 97.67,
+  "peak_rss_gb": 3.88,
+  "n_input_tx": 1436900,
+  "n_input_cells": 58406,
+  "n_cells_out": 22193,
+  "cells_lost": 36213,
+  "retention_pct": 37.998,
+  "n_partials": 36186,
+  "n_components": 0,
+  "n_assigned_tx": 1171978,
+  "n_unassigned_tx": 264922,
+  "coverage_pct": 81.563,
+  "label_column": "stitched"
+}
