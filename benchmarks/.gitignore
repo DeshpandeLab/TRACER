@@ -10,6 +10,10 @@
 !*summary*.csv
 !*summary*.json
 !coherence_*.csv
+!coherence_*.json
+!markers_*.csv
+!cluster_origin_composition.csv
+!ari_refined_summary.json
 
 # Compiled/generated artifacts
 __pycache__/
