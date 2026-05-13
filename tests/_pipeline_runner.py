@@ -44,7 +44,14 @@ from tracer.density_cascade import cascade_as_residual_handler
 # fill in nuclear-seed Prune, threshold ≈ 0 admits any non-negative
 # evidence to the seed, which gave +29 % ARI(vs Xenium cell_id) on the
 # 50×50 µm validation crop (0.442 → 0.573).
-PMI_THR = 0.05
+#
+# 2026-05-13: PMI_THR raised 0.05 → 0.2 (= 1.22× chance, real enrichment
+# cutoff in natural-log PMI space). Validated on PDAC + lung full-tissue:
+# small retention cost (−0.3 pp) for major coherence gains (cell C
+# mean 0.80→0.93, p10 0.57→0.82). RESCUE_NEG_THR / ANNOTATE_NEG_THR
+# scale with this. See benchmarks/pdac_pmi_sweep/ and
+# benchmarks/pdac_full_seq{,_thr0}_strict/ for the validation suite.
+PMI_THR = 0.2
 SEED_COHERENCE_FLOOR = 0.10
 TX_WEIGHTED_PRUNE = True   # tx-weighted greedy bad-edge prune (1a/1c)
 SPLIT_PHASE1_DZ = 2.0      # µm; if consecutive z-sorted tx gap > this,
@@ -531,31 +538,49 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
     else:
         entity_to_genes = {}
 
-    # Build parent_to_entities using the cell_id column — works on
-    # any cell_id format, no regex.
-    # For each entity, find its parent by looking up the cell_id of
-    # any tx labeled with that entity. Filter to entities that ARE
-    # the main label of some cell (label == cell_id) or a partial /
-    # sub-partial (label.startswith(cell_id + "-")).
+    # Build parent_to_entities using the cell_id + _etype columns.
+    # Previous version did `np.where(label_arr == ent)` once per
+    # entity — O(N_entities * N_tx). On dense PDAC scale (~5K
+    # entities × ~500K tx) that was ~2.5B compares, dominating wall.
+    #
+    # New approach: single groupby('cell_id') over tx that are in
+    # a Phase 1 cell-or-partial entity (etype ∈ {cell, partial} when
+    # the column is present; falls back to label-prefix check otherwise).
+    # Each parent's entity list is unique(tracer_id) inside its group.
+    # No per-entity scan; O(N_tx · log N_tx).
     SENT = _UN
     parent_to_entities: dict[str, list[str]] = {}
-    for ent in entity_to_genes:
-        idx = np.where(label_arr == ent)[0]
-        if idx.size == 0:
-            continue
-        parent = str(cell_id_arr[idx[0]])
-        if parent in SENT:
-            continue
-        if ent != parent and not ent.startswith(parent + "-"):
-            continue  # not a Phase 1-family entity (e.g., cascade)
-        parent_to_entities.setdefault(parent, []).append(ent)
 
-    n_moves = 0
-    n_parents_with_partials = 0
-    moved_tx_indices: list[int] = []
+    if has_etype:
+        # Fast path: etype filter on column.
+        keep_mask = np.isin(etype_arr, ("cell", "partial"))
+    else:
+        # Fallback: label is either the cell_id itself or starts with cell_id+'-'.
+        # Build a per-tx boolean: label==cid OR label.startswith(cid+'-').
+        lab_s = pd.Series(label_arr, dtype=str)
+        cid_s = pd.Series(cell_id_arr, dtype=str)
+        keep_mask = (lab_s == cid_s) | (
+            lab_s.str.startswith(cid_s.add("-"), na=False)
+        )
+        keep_mask = keep_mask.to_numpy()
+
+    # Drop sentinel cell_ids too.
+    cid_str = cell_id_arr.astype(str)
+    keep_mask = keep_mask & (~np.isin(cid_str, list(SENT)))
+
+    if keep_mask.any():
+        sub_df = pd.DataFrame({
+            "parent": cid_str[keep_mask],
+            "ent":    pd.Series(label_arr, dtype=str).to_numpy()[keep_mask],
+        }).drop_duplicates()
+        for parent, grp in sub_df.groupby("parent", sort=False):
+            ent_list = [e for e in grp["ent"].tolist()
+                        if e in entity_to_genes]
+            if ent_list:
+                parent_to_entities[parent] = ent_list
 
     # Candidate tx per parent: nuclear, in main entity (label == cell_id),
-    # AND etype == "cell" if column present. Works on any cell_id format.
+    # AND etype == "cell" if column present.
     cand_by_parent: dict[str, np.ndarray] = {}
     if nuc_idx.size > 0:
         nuc_label = label_arr[nuc_idx].astype(str)
@@ -575,6 +600,10 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
             for s, e in zip(starts, ends):
                 cand_by_parent[str(cand_parent_sorted[s])] = cand_tx_idx_sorted[s:e]
 
+    # Build CSR-style flat arrays for the Cython kernel. Only enumerate
+    # parents that have ≥2 entities AND have candidate tx.
+    active_parents: list[str] = []
+    partials_per_parent: list[list[str]] = []
     for parent, ent_list in parent_to_entities.items():
         if len(ent_list) < 2:
             continue
@@ -584,51 +613,153 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
         partials = [e for e in ent_list if e != main]
         if not partials:
             continue
-        n_parents_with_partials += 1
-
-        cand_idx = cand_by_parent.get(parent)
-        if cand_idx is None or cand_idx.size == 0:
+        if parent not in cand_by_parent or cand_by_parent[parent].size == 0:
             continue
+        active_parents.append(parent)
+        partials_per_parent.append(partials)
 
-        S_main = np.fromiter(entity_to_genes[main], dtype=np.int64)
-        S_partials_arrays = [
-            np.fromiter(entity_to_genes[p], dtype=np.int64) for p in partials
-        ]
+    n_parents_with_partials = len(active_parents)
 
-        # Lazy gene-index lookup for this parent's candidates.
-        cand_gene_idx = np.fromiter(
-            (gene_to_idx.get(nuc_genes[i], -1) for i in cand_idx),
-            dtype=np.int64, count=cand_idx.size,
+    if n_parents_with_partials == 0:
+        df_out[entity_col] = label_arr
+        return df_out, {
+            "n_tx_moved": 0,
+            "n_parents_with_partials": 0,
+        }
+
+    # Vectorize gene-string → gene-index for ALL nuclear tx in one pass
+    # (rather than per-parent dict lookups). The result is a global
+    # int32 array we can index into cheaply per parent.
+    nuc_gene_idx_global = (
+        pd.Series(nuc_genes).map(gene_to_idx)
+        .fillna(-1).astype(np.int32).to_numpy()
+    )
+
+    # Pre-convert entity_to_genes to a single concatenated int32 array
+    # plus offsets, with a name → (start, end) lookup. Avoids the
+    # per-parent np.fromiter cost.
+    entity_names = list(entity_to_genes.keys())
+    name_to_eindex = {n: i for i, n in enumerate(entity_names)}
+    entity_gene_arrays = [
+        np.fromiter(entity_to_genes[n], dtype=np.int32)
+        for n in entity_names
+    ]
+    entity_gene_offsets = np.zeros(len(entity_names) + 1, dtype=np.int32)
+    if entity_gene_arrays:
+        entity_gene_offsets[1:] = np.cumsum(
+            [a.size for a in entity_gene_arrays], dtype=np.int32,
         )
-        valid_gene = cand_gene_idx >= 0
-        if not valid_gene.any():
+        entity_gene_flat = np.concatenate(entity_gene_arrays).astype(np.int32)
+    else:
+        entity_gene_flat = np.zeros(0, dtype=np.int32)
+
+    def _entity_gene_slice(name: str) -> tuple[int, int]:
+        ei = name_to_eindex[name]
+        return int(entity_gene_offsets[ei]), int(entity_gene_offsets[ei + 1])
+
+    # Build CSR arrays for the kernel. The loops below are now light:
+    # just offset arithmetic + array indexing, no dict / map calls.
+    cand_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    cand_sizes = np.fromiter(
+        (cand_by_parent[p].size for p in active_parents),
+        dtype=np.int32, count=n_parents_with_partials,
+    )
+    cand_offsets[1:] = np.cumsum(cand_sizes, dtype=np.int32)
+    cand_tx_arr = np.concatenate(
+        [cand_by_parent[p] for p in active_parents]
+    ).astype(np.int32)
+    cand_gene_arr = nuc_gene_idx_global[cand_tx_arr]
+
+    main_sizes = np.fromiter(
+        (
+            entity_gene_offsets[name_to_eindex[p] + 1]
+            - entity_gene_offsets[name_to_eindex[p]]
+            for p in active_parents
+        ),
+        dtype=np.int32, count=n_parents_with_partials,
+    )
+    main_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    main_offsets[1:] = np.cumsum(main_sizes, dtype=np.int32)
+    main_genes_arr = np.concatenate([
+        entity_gene_flat[
+            entity_gene_offsets[name_to_eindex[p]]:
+            entity_gene_offsets[name_to_eindex[p] + 1]
+        ]
+        for p in active_parents
+    ]).astype(np.int32) if active_parents else np.zeros(0, dtype=np.int32)
+
+    # Partials: enumerate flat per-parent, then per-partial CSR.
+    partial_counts = np.fromiter(
+        (len(partials) for partials in partials_per_parent),
+        dtype=np.int32, count=n_parents_with_partials,
+    )
+    partial_offsets = np.zeros(n_parents_with_partials + 1, dtype=np.int32)
+    partial_offsets[1:] = np.cumsum(partial_counts, dtype=np.int32)
+    flat_partial_names = [
+        pe for partials in partials_per_parent for pe in partials
+    ]
+    partial_sizes = np.fromiter(
+        (
+            (entity_gene_offsets[name_to_eindex[pe] + 1]
+             - entity_gene_offsets[name_to_eindex[pe]])
+            if pe in name_to_eindex else 0
+            for pe in flat_partial_names
+        ),
+        dtype=np.int32, count=len(flat_partial_names),
+    )
+    partial_gene_offsets_arr = np.zeros(len(flat_partial_names) + 1, dtype=np.int32)
+    partial_gene_offsets_arr[1:] = np.cumsum(partial_sizes, dtype=np.int32)
+    partial_genes_flat_chunks = []
+    for pe in flat_partial_names:
+        if pe in name_to_eindex:
+            s = entity_gene_offsets[name_to_eindex[pe]]
+            e = entity_gene_offsets[name_to_eindex[pe] + 1]
+            partial_genes_flat_chunks.append(entity_gene_flat[s:e])
+        else:
+            partial_genes_flat_chunks.append(np.zeros(0, dtype=np.int32))
+    partial_genes_arr = (
+        np.concatenate(partial_genes_flat_chunks).astype(np.int32)
+        if partial_genes_flat_chunks else np.zeros(0, dtype=np.int32)
+    )
+
+    # Ensure W is C-contiguous float32 (kernel requirement).
+    if not (W.flags["C_CONTIGUOUS"] and W.dtype == np.float32):
+        W = np.ascontiguousarray(W, dtype=np.float32)
+
+    # Call the kernel — per-candidate local-partial-index decision.
+    from tracer._cy_reassign import reassign_nuclear_post_1c_kernel
+    out_partial_local_idx = reassign_nuclear_post_1c_kernel(
+        W,
+        cand_offsets,
+        cand_gene_arr,
+        main_offsets,
+        main_genes_arr,
+        partial_offsets,
+        partial_gene_offsets_arr,
+        partial_genes_arr,
+        float(margin),
+    )
+
+    # Apply moves: for each candidate with out>=0, relabel its tx to the
+    # corresponding partial.
+    moved_tx_indices: list[int] = []
+    n_moves = 0
+    for i in range(n_parents_with_partials):
+        s, e = int(cand_offsets[i]), int(cand_offsets[i + 1])
+        if s == e:
             continue
-        cand_idx_v = cand_idx[valid_gene]
-        cand_g_v = cand_gene_idx[valid_gene]
-
-        mean_main_v = _vectorized_mean_pmi_excl_self(W, cand_g_v, S_main)
-        finite_main_v = np.isfinite(mean_main_v)
-        if not finite_main_v.any():
+        choices = out_partial_local_idx[s:e]
+        moved_mask = choices >= 0
+        if not moved_mask.any():
             continue
-        cand_idx_f = cand_idx_v[finite_main_v]
-        cand_g_f = cand_g_v[finite_main_v]
-        best_mean = mean_main_v[finite_main_v].copy()
-        best_p_idx = np.full(best_mean.shape, -1, dtype=np.int32)
-
-        for k, S_p in enumerate(S_partials_arrays):
-            mp = _vectorized_mean_pmi_excl_self(W, cand_g_f, S_p)
-            accept = np.isfinite(mp) & (mp > best_mean + margin)
-            if accept.any():
-                best_mean[accept] = mp[accept]
-                best_p_idx[accept] = k
-
-        moves = best_p_idx >= 0
-        if moves.any():
-            for n_local in np.where(moves)[0]:
-                kk = int(best_p_idx[n_local])
-                label_arr[cand_idx_f[n_local]] = partials[kk]
-                moved_tx_indices.append(int(cand_idx_f[n_local]))
-            n_moves += int(moves.sum())
+        local_partials = partials_per_parent[i]
+        tx_slice = cand_tx_arr[s:e]
+        for n_local in np.where(moved_mask)[0]:
+            kk = int(choices[n_local])
+            tx_global = int(tx_slice[n_local])
+            label_arr[tx_global] = local_partials[kk]
+            moved_tx_indices.append(tx_global)
+        n_moves += int(moved_mask.sum())
 
     df_out[entity_col] = label_arr
     if has_etype and moved_tx_indices:
@@ -862,8 +993,10 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
 
 
 NUCLEAR_ONLY_ADMIT = True   # restrict 1b/1c to nuclear tx; cyto via Rescue
-RESCUE_NEG_THR = -0.05
-ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
+# 2026-05-13: RESCUE_NEG_THR paired with PMI_THR (both 0.2 in PMI scale).
+# Symmetric ± 0.2 dead zone around chance.
+RESCUE_NEG_THR = -0.2
+ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)  # scales with PMI_THR; -0.4 at PMI_THR=0.2
 # Iterative Rescue caps: 3 passes captures ≥98 % of asymptotic gain at
 # any scale (per /tmp/iterative_rescue_*.png diagnostic). Early-stop
 # fires when a pass adds zero tx — covers tight crops in 1–2 passes.
@@ -875,7 +1008,10 @@ RESCUE_MAX_PASSES = 3
 #   4. Else → reject. Tx remains "-1".
 RESCUE_VETO_MODE = "hybrid"
 RESCUE_MIN_ADMIT = 0.0      # any negative pair drops to mean-stage
-RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
+# 2026-05-13: RESCUE_MEAN_ADMIT raised 0.1 → 0.5 (PMI scale; ≈1.65× chance).
+# Validated: substantially cleaner low-coherence tail (cell C p10 0.57→0.82
+# on PDAC, partial p10 0.56→0.79). −2 pp coverage / ~−0.3 pp retention.
+RESCUE_MEAN_ADMIT = 0.5     # aggregate must be solidly positive
 
 # Stitch spatial-gate tightening — opt-in knobs. Defaults preserve
 # current production behavior; raise values to tighten.
@@ -926,7 +1062,10 @@ REAL_SIGNAL_THRESHOLD: float = 0.05
 # Percentile of real-signal PMIs used in the Rescue mean/hybrid veto.
 # 50 = median. <50 = stricter (more pairs must clear mean_threshold).
 # >50 = liberal (tolerates a long left tail of weak/negative pairs).
-RESCUE_AGGREGATOR_PERCENTILE: float = 50.0
+# 2026-05-13: lowered 50 → 25 — pairs with stricter Rescue produced
+# substantially cleaner low-coherence tail at zero retention cost in the
+# pdac_pmi_sweep validation. See benchmarks/pdac_pmi_sweep/.
+RESCUE_AGGREGATOR_PERCENTILE: float = 25.0
 
 # Post-Group Rescue (between Group and Stitch). Closes the gap where
 # Group's UNASSIGNED_* components — freshly created — cannot serve as
@@ -1055,7 +1194,43 @@ def _state_dict(df: pd.DataFrame, col: str) -> dict[str, int]:
 
 
 def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str):
-    progression.append({"stage": stage_name, **_state_dict(df, col)})
+    """Append a stage snapshot. Records wall-clock elapsed since the
+    previous _record_stage call so callers can see which stage dominates.
+
+    When the env var ``TRACER_STAGE_VERBOSE`` is set (any truthy value),
+    prints a one-line summary as each stage completes — useful for live
+    progress on long-running benches. Workers inherit the env var
+    through fork/spawn so process-pool runs are also chatty.
+    """
+    import os as _os
+    import time as _t
+    now = _t.time()
+    prev_ts = progression[-1]["_ts"] if progression else None
+    stage_seconds = (
+        round(now - prev_ts, 3) if prev_ts is not None else None
+    )
+    entry = {
+        "stage": stage_name,
+        "_ts": now,
+        "stage_seconds": stage_seconds,
+        **_state_dict(df, col),
+    }
+    progression.append(entry)
+    if _os.environ.get("TRACER_STAGE_VERBOSE"):
+        tag = _os.environ.get("TRACER_STAGE_TAG", "")
+        prefix = f"[stage {tag}]" if tag else "[stage]"
+        secs_str = (
+            f"{stage_seconds:>7.2f}s" if stage_seconds is not None
+            else f"{'(t0)':>8s}"
+        )
+        print(
+            f"{prefix} {stage_name:<22s} "
+            f"{secs_str}  "
+            f"cells={entry.get('n_cells', 0):>7,} "
+            f"partials={entry.get('n_partials', 0):>7,} "
+            f"unassigned_tx={entry.get('n_unassigned_tx', 0):>9,}",
+            flush=True,
+        )
 
 
 def _grid_3d_graph_fn(df_in, *, k=None, dist_threshold=None,

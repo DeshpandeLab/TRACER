@@ -40,7 +40,7 @@ from tracer.config import (
 def test_default_pipelineconfig_instantiates():
     cfg = PipelineConfig()
     assert cfg.rescue.veto_mode == "hybrid"
-    assert cfg.rescue.mean_admit_threshold == 0.1
+    assert cfg.rescue.mean_admit_threshold == 0.5
     assert cfg.phase1.tx_weighted_prune is True
     # final_rescue defaults derive from rescue
     assert cfg.final_rescue.veto_mode == "hybrid"
@@ -91,8 +91,8 @@ def test_user_override_patches_keys(tmp_path: Path):
     assert cfg.rescue.max_passes == 5
     assert cfg.phase1.tx_weighted_prune is False
     # unpatched keys still at defaults
-    assert cfg.rescue.mean_admit_threshold == 0.1
-    assert cfg.phase1.pmi_threshold == 0.05
+    assert cfg.rescue.mean_admit_threshold == 0.5
+    assert cfg.phase1.pmi_threshold == 0.2
 
 
 def test_user_override_runs_validation(tmp_path: Path):

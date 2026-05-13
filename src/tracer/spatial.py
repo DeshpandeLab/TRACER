@@ -1399,11 +1399,29 @@ def reassign_unassigned_by_gene_compat(
     gene_to_idx = aux["gene_to_idx"]
     n_genes = W.shape[0]
 
-    entity_genes: list[frozenset] = []
-    for genes in entities["genes"].values:
-        gi = pd.Index(np.asarray(genes, dtype=str)).map(gene_to_idx)
-        gi = gi[~pd.isna(gi)].astype(int).unique()
-        entity_genes.append(frozenset(int(x) for x in gi))
+    # Vectorized: flat-map all (entity_row_idx, gene) pairs in one
+    # pandas .map() call instead of N pd.Index(...).map() calls.
+    gene_lists_a = entities["genes"].to_numpy()
+    if len(gene_lists_a) > 0:
+        row_ids = np.concatenate([
+            np.full(len(g), i, dtype=np.int64)
+            for i, g in enumerate(gene_lists_a)
+        ])
+        flat_genes_a = np.concatenate([
+            np.asarray(g, dtype=str) for g in gene_lists_a
+        ])
+        flat_g_idx_a = pd.Series(flat_genes_a).map(gene_to_idx)
+        valid_a = flat_g_idx_a.notna().to_numpy()
+        row_ids_v = row_ids[valid_a]
+        g_idx_v = flat_g_idx_a[valid_a].astype(int).to_numpy()
+        per_row: dict[int, list[int]] = {}
+        for r, g in zip(row_ids_v, g_idx_v):
+            per_row.setdefault(int(r), []).append(int(g))
+        entity_genes = [
+            frozenset(per_row.get(i, [])) for i in range(len(gene_lists_a))
+        ]
+    else:
+        entity_genes = []
 
     entity_coords = entities[list(coord_cols)].to_numpy(dtype=np.float32)
     entity_ids = entities["entity_id"].to_numpy(dtype=object)
@@ -1628,19 +1646,45 @@ def reassign_unassigned_grid_pool(
     gene_to_idx = aux["gene_to_idx"]
     W = aux["W"]
 
-    entity_genes_lookup: dict[str, frozenset] = {}
     skip_entity_set: set[str] = set()
     z_col_idx = list(coord_cols).index("z") if "z" in coord_cols else None
-    # entity_summary carries `etype` per row (computed in build_entity_table,
-    # which prefers the upstream _etype column when available). Use that
-    # rather than label-parsing — correct on FFPE cell_ids.
-    for ent_row in entity_summary.itertuples():
-        eid = str(ent_row.entity_id)
-        gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
-        gi = gi[~pd.isna(gi)].astype(int).unique()
-        entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        if only_partial_component and str(ent_row.etype) == "cell":
-            skip_entity_set.add(eid)
+    # Vectorized entity → gene-idx-set lookup. Previously a per-entity
+    # `pd.Index(...).map(gene_to_idx)` cost N_entities × pandas-Index
+    # overhead — measured at ~3 s/call × 7 calls = ~21 s on dense PDAC
+    # tiles. Replaced with one flat map across all (entity, gene) pairs
+    # followed by a groupby — O(total_genes) pandas overhead.
+    eids = entity_summary["entity_id"].astype(str).to_numpy()
+    gene_lists = entity_summary["genes"].to_numpy()
+    if len(gene_lists) > 0:
+        flat_ents = np.concatenate([
+            np.full(len(g), eid, dtype=object)
+            for eid, g in zip(eids, gene_lists)
+        ])
+        flat_genes = np.concatenate([
+            np.asarray(g, dtype=str) for g in gene_lists
+        ])
+        flat_g_idx = pd.Series(flat_genes).map(gene_to_idx)
+        valid = flat_g_idx.notna().to_numpy()
+        flat_ents_v = flat_ents[valid]
+        flat_g_idx_v = flat_g_idx[valid].astype(int).to_numpy()
+        # Build entity → frozenset(int) in one groupby pass.
+        ent_gene_df = pd.DataFrame({"e": flat_ents_v, "g": flat_g_idx_v})
+        ent_gene_df = ent_gene_df.drop_duplicates()
+        entity_genes_lookup: dict[str, frozenset] = {
+            str(e): frozenset(int(x) for x in grp["g"].to_numpy())
+            for e, grp in ent_gene_df.groupby("e", sort=False)
+        }
+    else:
+        entity_genes_lookup = {}
+    # Ensure every entity_id has an entry (empty if no valid genes).
+    for eid in eids:
+        entity_genes_lookup.setdefault(str(eid), frozenset())
+
+    if only_partial_component:
+        # etype column per entity row; collect cell-type IDs to skip.
+        for ent_row in entity_summary.itertuples():
+            if str(ent_row.etype) == "cell":
+                skip_entity_set.add(str(ent_row.entity_id))
 
     # Assigned-tx pool for the bin index (excluding cells if requested).
     assigned_mask = ~unassigned_mask
@@ -2264,17 +2308,40 @@ def reassign_unassigned_to_nearest_tx_no_neg(
     gene_to_idx = aux["gene_to_idx"]
     W = aux["W"]
 
-    entity_genes_lookup: dict[str, frozenset] = {}
+    # Vectorized entity → gene-idx-set lookup (same approach as in
+    # reassign_unassigned_grid_pool; eliminates the per-entity
+    # pd.Index(...).map() pandas overhead).
     skip_entity_set: set[str] = set()
-    for ent_row in entity_summary.itertuples():
-        eid = str(ent_row.entity_id)
-        gi = pd.Index(np.asarray(ent_row.genes, dtype=str)).map(gene_to_idx)
-        gi = gi[~pd.isna(gi)].astype(int).unique()
-        entity_genes_lookup[eid] = frozenset(int(x) for x in gi)
-        # entity_summary.etype is computed in build_entity_table from
-        # the upstream _etype column when present (FFPE-safe).
-        if only_partial_component and str(ent_row.etype) == "cell":
-            skip_entity_set.add(eid)
+    eids_x = entity_summary["entity_id"].astype(str).to_numpy()
+    gene_lists_x = entity_summary["genes"].to_numpy()
+    if len(gene_lists_x) > 0:
+        flat_ents_x = np.concatenate([
+            np.full(len(g), eid, dtype=object)
+            for eid, g in zip(eids_x, gene_lists_x)
+        ])
+        flat_genes_x = np.concatenate([
+            np.asarray(g, dtype=str) for g in gene_lists_x
+        ])
+        flat_g_idx_x = pd.Series(flat_genes_x).map(gene_to_idx)
+        valid_x = flat_g_idx_x.notna().to_numpy()
+        flat_ents_xv = flat_ents_x[valid_x]
+        flat_g_idx_xv = flat_g_idx_x[valid_x].astype(int).to_numpy()
+        ent_gene_df_x = pd.DataFrame({"e": flat_ents_xv, "g": flat_g_idx_xv})
+        ent_gene_df_x = ent_gene_df_x.drop_duplicates()
+        entity_genes_lookup: dict[str, frozenset] = {
+            str(e): frozenset(int(x) for x in grp["g"].to_numpy())
+            for e, grp in ent_gene_df_x.groupby("e", sort=False)
+        }
+    else:
+        entity_genes_lookup = {}
+    for eid in eids_x:
+        entity_genes_lookup.setdefault(str(eid), frozenset())
+    # entity_summary.etype is computed in build_entity_table from
+    # the upstream _etype column when present (FFPE-safe).
+    if only_partial_component:
+        for ent_row in entity_summary.itertuples():
+            if str(ent_row.etype) == "cell":
+                skip_entity_set.add(str(ent_row.entity_id))
 
     # Assigned transcripts -- the searchable index.
     assigned_mask = ~unassigned_mask

@@ -1,0 +1,158 @@
+{
+  "roi_center": [
+    7255.0,
+    3023.7
+  ],
+  "roi_half_side": 1000.0,
+  "n_input_tx": 3457184,
+  "n_input_cells": 33603,
+  "panel_rows": 22321,
+  "configs": {
+    "sequential": {
+      "wall_total_seconds": 130.29,
+      "entity_counts": {
+        "n_cells": 30951,
+        "n_partials": 27725,
+        "n_components": 0,
+        "n_unassigned_tx": 110108,
+        "n_assigned_tx": 3347076,
+        "coverage_pct": 96.815,
+        "cells_lost": 2652,
+        "retention_pct": 92.108
+      },
+      "stage_timings": [
+        {
+          "stage": "Prune",
+          "seconds": 8.789
+        },
+        {
+          "stage": "Phase1-Reassign-1c",
+          "seconds": 3.339
+        },
+        {
+          "stage": "Split-Phase1",
+          "seconds": 1.329
+        },
+        {
+          "stage": "Phase1-Rerank",
+          "seconds": 3.362
+        },
+        {
+          "stage": "Phase1-QC",
+          "seconds": 0.77
+        },
+        {
+          "stage": "Rescue",
+          "seconds": 52.768
+        },
+        {
+          "stage": "Group",
+          "seconds": 2.3
+        },
+        {
+          "stage": "Mid-QC",
+          "seconds": 2.479
+        },
+        {
+          "stage": "Post-Group Rescue",
+          "seconds": 21.253
+        },
+        {
+          "stage": "Stitch",
+          "seconds": 24.355
+        },
+        {
+          "stage": "Demote",
+          "seconds": 0.972
+        },
+        {
+          "stage": "Final Rescue",
+          "seconds": 7.493
+        },
+        {
+          "stage": "Finalize",
+          "seconds": 0.533
+        }
+      ],
+      "peak_rss_bytes": 10117447680
+    },
+    "tiled_2x2": {
+      "n_tiles_xy": [
+        2,
+        2
+      ],
+      "wall_total_seconds": 60.27,
+      "wall_max_tile_seconds": 55.65,
+      "speedup_vs_serial_sum_estimate": 2.67,
+      "actual_speedup_vs_sequential": 2.13,
+      "per_tile_wall": {
+        "1": 27.75,
+        "2": 36.34,
+        "0": 41.49,
+        "3": 55.65
+      },
+      "per_tile_peak_rss_bytes": {
+        "1": 2368782336,
+        "2": 2878963712,
+        "0": 3588194304,
+        "3": 3270049792
+      },
+      "peak_rss_max_tile_bytes": 3588194304,
+      "peak_rss_sum_bytes": 12105990144,
+      "entity_counts": {
+        "n_cells": 30951,
+        "n_partials": 29130,
+        "n_components": 0,
+        "n_unassigned_tx": 136894,
+        "n_assigned_tx": 3320290,
+        "coverage_pct": 96.04,
+        "cells_lost": 2652,
+        "retention_pct": 92.108
+      }
+    },
+    "tiled_3x3": {
+      "n_tiles_xy": [
+        3,
+        3
+      ],
+      "wall_total_seconds": 45.99,
+      "wall_max_tile_seconds": 41.03,
+      "speedup_vs_serial_sum_estimate": 3.48,
+      "actual_speedup_vs_sequential": 2.78,
+      "per_tile_wall": {
+        "8": 11.31,
+        "5": 12.12,
+        "7": 12.24,
+        "2": 12.75,
+        "1": 14.96,
+        "6": 16.29,
+        "3": 18.94,
+        "0": 20.47,
+        "4": 41.03
+      },
+      "per_tile_peak_rss_bytes": {
+        "8": 1335902208,
+        "5": 1484292096,
+        "7": 1472069632,
+        "2": 1463861248,
+        "1": 1615118336,
+        "6": 1785397248,
+        "3": 2069741568,
+        "0": 2173042688,
+        "4": 2684239872
+      },
+      "peak_rss_max_tile_bytes": 2684239872,
+      "peak_rss_sum_bytes": 16083664896,
+      "entity_counts": {
+        "n_cells": 30951,
+        "n_partials": 30094,
+        "n_components": 0,
+        "n_unassigned_tx": 142877,
+        "n_assigned_tx": 3314307,
+        "coverage_pct": 95.867,
+        "cells_lost": 2652,
+        "retention_pct": 92.108
+      }
+    }
+  }
+}

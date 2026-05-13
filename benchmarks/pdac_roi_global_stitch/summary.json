@@ -1,0 +1,11 @@
+{
+  "wall_naive_seconds": 47.32,
+  "wall_gs_seconds": 54.25,
+  "global_stitch_stats": {
+    "wall_disambig": 1.29,
+    "wall_aux": 0.0,
+    "wall_stitch": 26.57,
+    "wall_rescue": 7.46,
+    "n_rescued": 26240
+  }
+}

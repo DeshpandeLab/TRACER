@@ -1,0 +1,17 @@
+{
+  "panel_path": "/Users/adeshpa6/1_Projects/01.10_Lab/GENESIS/.claude/worktrees/bootstrap-only-flavor/benchmarks/bootstrap_thr_pdac/W_thr0.parquet",
+  "panel_rows": 12142,
+  "wall_seconds": 1039.83,
+  "peak_rss_gb": 38.787,
+  "n_input_tx": 20734426,
+  "n_input_cells": 234959,
+  "n_cells_out": 206163,
+  "cells_lost": 28796,
+  "retention_pct": 87.744,
+  "n_partials": 284635,
+  "n_components": 0,
+  "n_assigned_tx": 19345759,
+  "n_unassigned_tx": 1388667,
+  "coverage_pct": 93.303,
+  "label_column": "stitched"
+}

@@ -1,0 +1,17 @@
+{
+  "panel_path": "/Users/adeshpa6/1_Projects/01.10_Lab/GENESIS/tutorials/lung_cancer/data/pmi_bs_lung_cancer_C_5_95.csv",
+  "panel_rows": 1203,
+  "wall_seconds": 81.45,
+  "peak_rss_gb": 3.887,
+  "n_input_tx": 1436900,
+  "n_input_cells": 58406,
+  "n_cells_out": 39042,
+  "cells_lost": 19364,
+  "retention_pct": 66.846,
+  "n_partials": 15300,
+  "n_components": 0,
+  "n_assigned_tx": 1192145,
+  "n_unassigned_tx": 244755,
+  "coverage_pct": 82.966,
+  "label_column": "stitched"
+}
