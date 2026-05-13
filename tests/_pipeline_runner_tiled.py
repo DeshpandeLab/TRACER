@@ -151,6 +151,137 @@ def _assign_cells_to_tiles(
 # Public entry
 # ---------------------------------------------------------------------------
 
+def _build_aux_from_panel(npmi_panel: pd.DataFrame, metric_col: str = "NPMI") -> dict:
+    """Build the gene_to_idx + W dict that Stitch/Rescue expect from a panel."""
+    panel = npmi_panel.copy()
+    panel["gene_i"] = panel["gene_i"].astype(str)
+    panel["gene_j"] = panel["gene_j"].astype(str)
+    all_genes = pd.unique(
+        pd.concat([panel["gene_i"], panel["gene_j"]], ignore_index=True)
+    )
+    gene_to_idx = {g: i for i, g in enumerate(all_genes)}
+    G = len(all_genes)
+    W = np.full((G, G), np.nan, dtype=np.float32)
+    gi = panel["gene_i"].map(gene_to_idx).to_numpy()
+    gj = panel["gene_j"].map(gene_to_idx).to_numpy()
+    val = panel[metric_col].to_numpy(dtype=np.float32)
+    W[gi, gj] = val
+    W[gj, gi] = val
+    return {"gene_to_idx": gene_to_idx, "W": W}
+
+
+def _disambiguate_tile_labels(
+    df_out: pd.DataFrame,
+    cell_to_tile: dict,
+    label_col: str,
+    cell_id_col: str = "cell_id",
+) -> pd.Series:
+    """Prefix tile-local generic labels (cascade_*, UNASSIGNED_*) with
+    ``tile<idx>_`` so cross-tile concat does not merge unrelated entities.
+
+    Returns a new label Series (does not modify df_out)."""
+    labels = df_out[label_col].astype(str)
+    needs_prefix = (
+        labels.str.startswith("cascade_") | labels.str.startswith("UNASSIGNED_")
+    )
+    tile_per_tx = df_out[cell_id_col].map(cell_to_tile).astype("Int64")
+    tile_prefix = "tile" + tile_per_tx.astype(str) + "_"
+    out = labels.copy()
+    out.loc[needs_prefix] = tile_prefix.loc[needs_prefix] + labels.loc[needs_prefix]
+    return out
+
+
+def _apply_global_post_tile_stitch(
+    df_out: pd.DataFrame,
+    npmi_panel: pd.DataFrame,
+    cell_to_tile: dict,
+    *,
+    label_col: str = "stitched",
+    cell_id_col: str = "cell_id",
+    stitch_dist_threshold: float = 5.0,   # matches per-tile Stitch default; only ~13 cross-tile pairs would qualify anyway
+    show_progress: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    """Global post-tile Stitch + Final Rescue pass.
+
+    Pipeline (after per-tile concat):
+      1. Disambiguate cascade_*/UNASSIGNED_* labels with tile prefix so
+         the global frame has unique entity IDs.
+      2. Build aux (gene_to_idx + W) from the npmi_panel.
+      3. Run apply_stitching_to_transcripts_memory_efficient over the
+         merged frame — re-merges cross-tile fragments of the same
+         underlying entity.
+      4. Run reassign_unassigned_grid_pool — rescues tx that were left
+         unassigned by their tile-local QC but find a global home.
+
+    Reads runner-module constants (PMI_THR, RESCUE_*, STITCH_*) so the
+    parameter overrides set by the caller propagate through.
+
+    Returns ``(df_out, stats)`` where stats has wall_seconds + n_rescued.
+    """
+    import tests._pipeline_runner as runner
+    from tracer.stitching import apply_stitching_to_transcripts_memory_efficient
+    from tracer.spatial import reassign_unassigned_grid_pool
+
+    t0 = time.time()
+    # 1. Disambiguate
+    df_out = df_out.copy()
+    df_out[label_col] = _disambiguate_tile_labels(
+        df_out, cell_to_tile, label_col, cell_id_col
+    ).to_numpy()
+    t_disambig = time.time() - t0
+
+    # 2. aux
+    t = time.time()
+    aux = _build_aux_from_panel(npmi_panel, metric_col="NPMI")
+    t_aux = time.time() - t
+
+    # 3. Global Stitch
+    t = time.time()
+    df_out, _ = apply_stitching_to_transcripts_memory_efficient(
+        df_final=df_out, aux=aux,
+        entity_col=label_col, gene_col="feature_name",
+        coord_cols=("x", "y", "z"),
+        mode="count", threshold=runner.PMI_THR, metric="pmi",
+        penalize_simplicity=True, deltaC_min=0.03,
+        dist_threshold=stitch_dist_threshold, out_col=label_col, show_progress=False,
+        candidate_source="grid", G=2.0, stitch_neighborhood="8",
+        G_z=(runner.STITCH_GZ_UM if runner.STITCH_GZ_UM is not None else 1.0),
+        z_neighbor_depth=1,
+        min_local_tx_per_entity=runner.STITCH_MIN_LOCAL_TX,
+    )
+    t_stitch = time.time() - t
+
+    # 4. Final Rescue
+    t = time.time()
+    df_out, n_rescued, _ = reassign_unassigned_grid_pool(
+        df_out, aux=aux,
+        entity_col=label_col, gene_col="feature_name",
+        coord_cols=("x", "y", "z"), out_col=label_col,
+        G=2.0, pos_npmi_threshold=runner.PMI_THR,
+        neg_npmi_threshold=runner.RESCUE_NEG_THR,
+        only_partial_component=False,
+        veto_mode=runner.RESCUE_VETO_MODE,
+        mean_threshold=runner.RESCUE_MEAN_ADMIT,
+        min_admit_threshold=runner.RESCUE_MIN_ADMIT,
+        real_signal_threshold=0.0,
+        aggregator_percentile=runner.RESCUE_AGGREGATOR_PERCENTILE,
+    )
+    t_rescue = time.time() - t
+
+    if show_progress:
+        print(f"[global-stitch] disambig {t_disambig:.1f}s + aux {t_aux:.1f}s "
+              f"+ stitch {t_stitch:.1f}s + rescue {t_rescue:.1f}s "
+              f"(rescued {n_rescued:,} tx)", flush=True)
+
+    return df_out, {
+        "wall_disambig": round(t_disambig, 2),
+        "wall_aux": round(t_aux, 2),
+        "wall_stitch": round(t_stitch, 2),
+        "wall_rescue": round(t_rescue, 2),
+        "n_rescued": int(n_rescued),
+    }
+
+
 def run_segmented_pipeline_tiled(
     df: pd.DataFrame,
     npmi_panel: pd.DataFrame,
@@ -161,6 +292,7 @@ def run_segmented_pipeline_tiled(
     coord_cols: tuple[str, str] = ("x", "y"),
     rerank: bool = True,
     reassign: bool = True,
+    global_stitch: bool = False,
     show_progress: bool = False,
 ) -> dict:
     """Run run_segmented_pipeline across a spatial tile grid in parallel.
@@ -252,6 +384,25 @@ def run_segmented_pipeline_tiled(
     parts = [per_tile_results[ti]["df_out"] for ti in sorted(per_tile_results)]
     df_out = pd.concat(parts, axis=0, ignore_index=True)
 
+    # 4b. Optional global post-tile Stitch + Final Rescue.
+    #     Re-merges cross-tile fragments of the same underlying entity and
+    #     rescues tx whose best fit lives in a neighboring tile.
+    global_stitch_stats: dict | None = None
+    if global_stitch:
+        if show_progress:
+            print(f"[tiled] running global post-tile Stitch + Rescue ...", flush=True)
+        col = "stitched" if "stitched" in df_out.columns else "tracer_id"
+        df_out, global_stitch_stats = _apply_global_post_tile_stitch(
+            df_out, npmi_panel, cell_to_tile,
+            label_col=col, cell_id_col=cell_id_col,
+            show_progress=show_progress,
+        )
+        # Refresh _etype after the global pass since labels may have changed
+        from tracer._etype import infer_etype_from_label
+        df_out["_etype"] = np.asarray(
+            infer_etype_from_label(df_out[col])
+        ).astype(str)
+
     # 5. Compute per-tile entity stats for the result summary.
     summary_per_tile: dict[int, dict] = {}
     for ti, r in per_tile_results.items():
@@ -304,4 +455,5 @@ def run_segmented_pipeline_tiled(
         "speedup_vs_serial_estimate": round(speedup_vs_serial, 2),
         "peak_rss_max_tile_bytes": peak_rss_max_tile_bytes,
         "peak_rss_sum_bytes": peak_rss_sum_bytes,
+        "global_stitch_stats": global_stitch_stats,
     }

@@ -47,7 +47,9 @@ else:
 @dataclass(frozen=True)
 class Phase1Config:
     """Phase 1 (a/b/c) — nuclear-anchored greedy prune + admission."""
-    pmi_threshold: float = 0.05
+    # 2026-05-13: pmi_threshold raised 0.05 → 0.2 to match the new
+    # bootstrap-PMI calibration (PMI=0.2 = 1.22× chance in natural-log).
+    pmi_threshold: float = 0.2
     seed_coherence_floor: float = 0.10
     tx_weighted_prune: bool = True
     nuclear_only_admit: bool = True
@@ -117,8 +119,10 @@ class RescueConfig:
     """Spatial-prior rescue veto (used by main Rescue and Final Rescue)."""
     veto_mode: Literal["min", "mean", "hybrid"] = "hybrid"
     min_admit_threshold: float = 0.0      # hybrid: unanimous-pos cutoff
-    mean_admit_threshold: float = 0.1     # hybrid/mean: aggregate-pos cutoff
-    neg_threshold: float = -0.05          # cluster-guard / min-mode veto
+    # 2026-05-13: mean_admit_threshold raised 0.1 → 0.5 to match the new
+    # bootstrap-PMI calibration. Validated cell C mean 0.80→0.93 on PDAC.
+    mean_admit_threshold: float = 0.5     # hybrid/mean: aggregate-pos cutoff
+    neg_threshold: float = -0.2           # cluster-guard / min-mode veto; paired with phase1.pmi_threshold
     max_passes: int = 3
     bin_size_um: float = 2.0
     z_bound_um: float | None = None       # None → G * sqrt(2)
@@ -179,7 +183,7 @@ class GroupConfig:
     # Cascade internal params — shared between SEG and NOSEG paths
     cascade_bin_size_um: float = 2.0           # G in cascade_as_residual_handler
     cascade_territory_radius_bins: int = 1      # Moore radius (3×3 = 9 bins)
-    cascade_pmi_threshold: float = 0.05         # mirrors phase1.pmi_threshold
+    cascade_pmi_threshold: float = 0.2          # mirrors phase1.pmi_threshold
     cascade_min_anchor_tx: int = 3
 
     # Legacy spatial-CC fallback — used when *_cascade=False

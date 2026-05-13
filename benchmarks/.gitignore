@@ -1,0 +1,15 @@
+# Benchmark output files — regeneratable from the scripts in this dir.
+# Large binary outputs (partition_*.parquet are 200-450MB each at full tissue
+# scale; .h5ad files 200-400MB; embeddings_*.parquet ~1-10MB each).
+*.parquet
+*.h5ad
+*.log
+
+# Keep small summary/diagnostic files — they're the actual evidence and
+# are referenced by the per-branch memory notes.
+!*summary*.csv
+!*summary*.json
+!coherence_*.csv
+
+# Compiled/generated artifacts
+__pycache__/

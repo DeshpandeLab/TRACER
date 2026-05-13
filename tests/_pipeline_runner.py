@@ -44,7 +44,14 @@ from tracer.density_cascade import cascade_as_residual_handler
 # fill in nuclear-seed Prune, threshold ≈ 0 admits any non-negative
 # evidence to the seed, which gave +29 % ARI(vs Xenium cell_id) on the
 # 50×50 µm validation crop (0.442 → 0.573).
-PMI_THR = 0.05
+#
+# 2026-05-13: PMI_THR raised 0.05 → 0.2 (= 1.22× chance, real enrichment
+# cutoff in natural-log PMI space). Validated on PDAC + lung full-tissue:
+# small retention cost (−0.3 pp) for major coherence gains (cell C
+# mean 0.80→0.93, p10 0.57→0.82). RESCUE_NEG_THR / ANNOTATE_NEG_THR
+# scale with this. See benchmarks/pdac_pmi_sweep/ and
+# benchmarks/pdac_full_seq{,_thr0}_strict/ for the validation suite.
+PMI_THR = 0.2
 SEED_COHERENCE_FLOOR = 0.10
 TX_WEIGHTED_PRUNE = True   # tx-weighted greedy bad-edge prune (1a/1c)
 SPLIT_PHASE1_DZ = 2.0      # µm; if consecutive z-sorted tx gap > this,
@@ -986,8 +993,10 @@ def _qc_demote_low_coherence(df_in: pd.DataFrame, *,
 
 
 NUCLEAR_ONLY_ADMIT = True   # restrict 1b/1c to nuclear tx; cyto via Rescue
-RESCUE_NEG_THR = -0.05
-ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)
+# 2026-05-13: RESCUE_NEG_THR paired with PMI_THR (both 0.2 in PMI scale).
+# Symmetric ± 0.2 dead zone around chance.
+RESCUE_NEG_THR = -0.2
+ANNOTATE_NEG_THR = -0.1 * (PMI_THR / 0.05)  # scales with PMI_THR; -0.4 at PMI_THR=0.2
 # Iterative Rescue caps: 3 passes captures ≥98 % of asymptotic gain at
 # any scale (per /tmp/iterative_rescue_*.png diagnostic). Early-stop
 # fires when a pass adds zero tx — covers tight crops in 1–2 passes.
@@ -999,7 +1008,10 @@ RESCUE_MAX_PASSES = 3
 #   4. Else → reject. Tx remains "-1".
 RESCUE_VETO_MODE = "hybrid"
 RESCUE_MIN_ADMIT = 0.0      # any negative pair drops to mean-stage
-RESCUE_MEAN_ADMIT = 0.1     # aggregate must be solidly positive
+# 2026-05-13: RESCUE_MEAN_ADMIT raised 0.1 → 0.5 (PMI scale; ≈1.65× chance).
+# Validated: substantially cleaner low-coherence tail (cell C p10 0.57→0.82
+# on PDAC, partial p10 0.56→0.79). −2 pp coverage / ~−0.3 pp retention.
+RESCUE_MEAN_ADMIT = 0.5     # aggregate must be solidly positive
 
 # Stitch spatial-gate tightening — opt-in knobs. Defaults preserve
 # current production behavior; raise values to tighten.
@@ -1050,7 +1062,10 @@ REAL_SIGNAL_THRESHOLD: float = 0.05
 # Percentile of real-signal PMIs used in the Rescue mean/hybrid veto.
 # 50 = median. <50 = stricter (more pairs must clear mean_threshold).
 # >50 = liberal (tolerates a long left tail of weak/negative pairs).
-RESCUE_AGGREGATOR_PERCENTILE: float = 50.0
+# 2026-05-13: lowered 50 → 25 — pairs with stricter Rescue produced
+# substantially cleaner low-coherence tail at zero retention cost in the
+# pdac_pmi_sweep validation. See benchmarks/pdac_pmi_sweep/.
+RESCUE_AGGREGATOR_PERCENTILE: float = 25.0
 
 # Post-Group Rescue (between Group and Stitch). Closes the gap where
 # Group's UNASSIGNED_* components — freshly created — cannot serve as
