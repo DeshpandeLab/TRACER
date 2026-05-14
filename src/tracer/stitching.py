@@ -798,6 +798,9 @@ def _stitch_entities_hierarchical_decomposable(
     metric: str = "npmi",
     penalize_simplicity=True,
     deltaC_min=0.0,
+    c_union_bypass: float | None = None,
+    c_union_bypass_max_n_tx: int | None = None,
+    max_merger_depth: int | None = None,
     use_3d=True,
     dist_threshold: float | None = None,
     candidate_source: str = "delaunay",
@@ -874,6 +877,9 @@ def _stitch_entities_hierarchical_decomposable(
         summary_df=summary_df, aux=aux,
         mode=mode, threshold=threshold, metric=metric,
         penalize_simplicity=penalize_simplicity, deltaC_min=deltaC_min,
+        c_union_bypass=c_union_bypass,
+        c_union_bypass_max_n_tx=c_union_bypass_max_n_tx,
+        max_merger_depth=max_merger_depth,
         use_3d=use_3d, dist_threshold=dist_threshold,
         candidate_source=candidate_source, G=G,
         stitch_neighborhood=stitch_neighborhood,
@@ -898,6 +904,32 @@ def stitch_entities_hierarchical(
     metric: str = "npmi",
     penalize_simplicity=True,
     deltaC_min=0.0,
+    # Optional acceptance bypass: when set, a pair that fails ΔC ≥
+    # deltaC_min is still accepted if the raw post-merge coherence
+    # C(union) ≥ c_union_bypass. Spatial-witness / candidate-source
+    # gates still apply. Designed to recover same-program fragment
+    # absorptions where both parents are already at C ≈ 1.0 and ΔC
+    # has no headroom regardless of how perfect the union is.
+    # None = off (legacy behavior). Recommended 0.9 when enabled.
+    c_union_bypass: float | None = None,
+    # When set, the C(union) bypass only applies if the merged entity's
+    # total tx count is at or below this threshold. Recovers small
+    # within-cell fragment consolidations (where ΔC has no headroom
+    # because both parents are at C ≈ 1.0) while requiring the strong
+    # ΔC signal for large mergers (where the bypass risks bridging
+    # cross-cell compartments). None = no size cap on the bypass.
+    c_union_bypass_max_n_tx: int | None = None,
+    # Optional cap on per-component merger-tree depth (height of the
+    # binary tree built by greedy merging, leaves = pre-stitch entities,
+    # internal nodes = merge events). Each DSU root carries
+    # `depth = max(child_depth) + 1`; a merger is blocked when either
+    # side has already reached the cap. Balanced N-entity merges cost
+    # log2(N) depth; chain merges cost N-1 — so the cap intrinsically
+    # rewards balanced consolidations and penalises one-component-
+    # repeatedly-absorbing-neighbours growth. None = off (legacy).
+    # Recommended 3 when enabled (allows up to 8 balanced entities or
+    # 4 chain entities per stitched component).
+    max_merger_depth: int | None = None,
     use_3d=True,
     dist_threshold: float | None = None,
     candidate_source: str = "delaunay",
@@ -1148,9 +1180,15 @@ def stitch_entities_hierarchical(
     else:  # candidate_source == "grid"
         if G is None:
             raise ValueError("G must be provided when candidate_source='grid'")
-        if stitch_neighborhood not in ("0", "4", "8"):
+        if stitch_neighborhood not in ("0", "4", "8") and not (
+            isinstance(stitch_neighborhood, str)
+            and stitch_neighborhood.startswith("R")
+            and stitch_neighborhood[1:].isdigit()
+            and int(stitch_neighborhood[1:]) >= 1
+        ):
             raise ValueError(
-                f"stitch_neighborhood must be '0', '4' or '8' (got {stitch_neighborhood!r})"
+                f"stitch_neighborhood must be '0', '4', '8', or 'R<N>' "
+                f"(got {stitch_neighborhood!r})"
             )
         if z_neighbor_depth < 0:
             raise ValueError(f"z_neighbor_depth must be ≥ 0 (got {z_neighbor_depth})")
@@ -1204,12 +1242,43 @@ def stitch_entities_hierarchical(
             entity_tx_total[c] += 1
 
         # Half-neighborhood directions in xy. "0" → empty (same-bin pairs only).
+        # "4" / "8" — orthogonal-only / full Moore-1 (24 → 8 raw offsets / 4 half).
+        # "R<N>" — Moore-N: every (dx, dy) with max(|dx|,|dy|) in 1..N, restricted
+        # to the upper half-plane (dy > 0 OR (dy == 0 AND dx > 0)) so each
+        # unordered bin-pair appears once. R1 ≡ "8".
         if stitch_neighborhood == "0":
             xy_half_offsets: tuple[tuple[int, int], ...] = ()
         elif stitch_neighborhood == "4":
             xy_half_offsets = ((0, 1), (1, 0))
-        else:  # "8"
+        elif stitch_neighborhood == "8":
             xy_half_offsets = ((0, 1), (1, -1), (1, 0), (1, 1))
+        elif (isinstance(stitch_neighborhood, str)
+                and stitch_neighborhood.startswith("R")):
+            try:
+                R = int(stitch_neighborhood[1:])
+            except ValueError as exc:
+                raise ValueError(
+                    f"stitch_neighborhood='{stitch_neighborhood}' is not a "
+                    f"valid 'R<N>' specifier (e.g. 'R2', 'R3')."
+                ) from exc
+            if R < 1:
+                raise ValueError(
+                    f"stitch_neighborhood='R{R}' must have R>=1; use '0' "
+                    f"for same-bin-only."
+                )
+            _half = []
+            for dy in range(-R, R + 1):
+                for dx in range(-R, R + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    if dy > 0 or (dy == 0 and dx > 0):
+                        _half.append((dx, dy))
+            xy_half_offsets = tuple(_half)
+        else:
+            raise ValueError(
+                f"stitch_neighborhood must be one of '0', '4', '8', or "
+                f"'R<N>' (got {stitch_neighborhood!r})."
+            )
 
         # z-offsets for the candidate-enumeration window. We use a half-
         # window in z to avoid enumerating each unordered (bin_a, bin_b)
@@ -1359,11 +1428,30 @@ def stitch_entities_hierarchical(
         # filter only needs the SUM of bin_to_comp_counts[bin][comp] over
         # unique witness bins per pair — computable in a single merge +
         # groupby pair (no Python iteration).
+        #
+        # Single shared dedup at the (entity-pair, A-bin, B-bin) level
+        # before each side's per-bin dedup. By construction `all_records`
+        # is already unique at this level (each offset emits each
+        # unordered bin pair at most once), so this is mostly an
+        # idempotent enforcement — but it makes both per-side dedups
+        # run against the minimal adjacency-row table rather than re-
+        # scanning the full offset-iteration log twice. Each per-side
+        # dedup remains essential: an A-bin paired with multiple B-bins
+        # for the same (lo, hi) must contribute its A-tx count ONCE.
+        #
+        # A streaming per-pair walk with early exit (terminate once both
+        # sides cross their effective thresholds) would be a stronger
+        # win for healthy pairs, but trades vectorisation for Python
+        # iteration; deferred until profiling shows this phase is hot.
         pair_n_lo: dict[tuple[int, int], int] = {}
         pair_n_hi: dict[tuple[int, int], int] = {}
         if track_local and records:
-            lo_unique = (
-                all_records[["lo", "hi", "blxy", "blz"]]
+            ar_u = all_records[
+                ["lo", "hi", "blxy", "blz", "bhxy", "bhz"]
+            ].drop_duplicates()
+
+            lo_merged = (
+                ar_u[["lo", "hi", "blxy", "blz"]]
                 .drop_duplicates()
                 .merge(
                     bc_grouped,
@@ -1372,9 +1460,9 @@ def stitch_entities_hierarchical(
                     how="left",
                 )
             )
-            lo_unique["n_tx"] = lo_unique["n_tx"].fillna(0).astype(np.int64)
+            lo_merged["n_tx"] = lo_merged["n_tx"].fillna(0).astype(np.int64)
             lo_summed = (
-                lo_unique.groupby(["lo", "hi"], sort=False, as_index=False)
+                lo_merged.groupby(["lo", "hi"], sort=False, as_index=False)
                 ["n_tx"].sum()
             )
             pair_n_lo = {
@@ -1385,8 +1473,9 @@ def stitch_entities_hierarchical(
                     lo_summed["n_tx"].to_numpy(),
                 )
             }
-            hi_unique = (
-                all_records[["lo", "hi", "bhxy", "bhz"]]
+
+            hi_merged = (
+                ar_u[["lo", "hi", "bhxy", "bhz"]]
                 .drop_duplicates()
                 .merge(
                     bc_grouped,
@@ -1395,9 +1484,9 @@ def stitch_entities_hierarchical(
                     how="left",
                 )
             )
-            hi_unique["n_tx"] = hi_unique["n_tx"].fillna(0).astype(np.int64)
+            hi_merged["n_tx"] = hi_merged["n_tx"].fillna(0).astype(np.int64)
             hi_summed = (
-                hi_unique.groupby(["lo", "hi"], sort=False, as_index=False)
+                hi_merged.groupby(["lo", "hi"], sort=False, as_index=False)
                 ["n_tx"].sum()
             )
             pair_n_hi = {
@@ -1439,9 +1528,17 @@ def stitch_entities_hierarchical(
             # Python set iteration. Same semantics as the prior code:
             # for each pair, require ≥mlt UNIQUE tx of EACH side across
             # all bins where the pair co-occurs.
+            #
+            # Effective threshold is capped at each entity's TOTAL tx
+            # count: a 2-tx entity cannot produce 3 witnesses, so the
+            # raw mlt threshold unfairly blocks every merge involving
+            # any below-threshold entity. Cap: eff_mlt(E) = min(mlt, n_E).
             kept_local = {
                 p for p in candidate_pairs
-                if pair_n_lo.get(p, 0) >= mlt and pair_n_hi.get(p, 0) >= mlt
+                if (pair_n_lo.get(p, 0)
+                        >= min(mlt, entity_tx_total.get(p[0], mlt))
+                    and pair_n_hi.get(p, 0)
+                        >= min(mlt, entity_tx_total.get(p[1], mlt)))
             }
             candidate_pairs = kept_local
 
@@ -1505,6 +1602,16 @@ def stitch_entities_hierarchical(
     # track whether a cluster contains a real cell (constraint)
     has_cell = np.array([t == "cell" for t in etypes], dtype=bool)
 
+    # Per-root merger-tree depth: 0 for pre-stitch entities, updated on
+    # union as `depth[rnew] = max(depth[ra], depth[rb]) + 1`. Used by
+    # the optional `max_merger_depth` cap to block over-deep mergers.
+    # Balanced merges of N entities cost log2(N) depth; left-deep chains
+    # cost N-1. So the cap intrinsically rewards balanced consolidations
+    # (similar-ΔC partner sizes) and penalises chain-style growth (one
+    # big component repeatedly absorbing small partners — the failure
+    # mode that produces multi-cell stromal-compartment blobs).
+    merger_depth = np.zeros(N, dtype=np.int32)
+
     # For label preference
     # store lists of member entity_ids by type at roots (kept as python sets for simplicity)
     cell_ids = [set([entity_ids[i]]) if etypes[i] == "cell" else set() for i in range(N)]
@@ -1564,8 +1671,16 @@ def stitch_entities_hierarchical(
     root_centroid: np.ndarray | None = None  # [N, n_dim]
     root_bbox_min: np.ndarray | None = None  # [N, n_dim]  K=1 only
     root_bbox_max: np.ndarray | None = None  # [N, n_dim]  K=1 only
-    root_n_tx: np.ndarray | None = None      # [N]
     root_tx_coords: list | None = None        # [N] list of (n_tx, n_dim) arrays — K≥2 only
+
+    # Per-root tx count — always populated (used by spatial gate AND
+    # the size-gated c_union_bypass). Falls back to 1 per entity if the
+    # summary_df was built without an n_tx column (legacy callers).
+    if "n_tx" in summary_df.columns:
+        root_n_tx: np.ndarray = summary_df["n_tx"].to_numpy(dtype=np.int64).copy()
+    else:
+        root_n_tx = np.ones(N, dtype=np.int64)
+
     if spatial_centroid_gate:
         coord_keys = ["x", "y", "z"] if use_3d else ["x", "y"]
         try:
@@ -1574,10 +1689,6 @@ def stitch_entities_hierarchical(
             max_keys = [f"{c}_max" for c in coord_keys]
             root_bbox_min = summary_df[min_keys].to_numpy(dtype=np.float64).copy()
             root_bbox_max = summary_df[max_keys].to_numpy(dtype=np.float64).copy()
-            if "n_tx" in summary_df.columns:
-                root_n_tx = summary_df["n_tx"].to_numpy(dtype=np.int64).copy()
-            else:
-                root_n_tx = np.ones(N, dtype=np.int64)
             if spatial_centroid_k >= 2:
                 if entity_tx_coords is None:
                     # Need per-entity tx coords for K≥2 → fall back to K=1
@@ -1591,8 +1702,9 @@ def stitch_entities_hierarchical(
                     ]
         except KeyError:
             spatial_centroid_gate = False
-            root_centroid = root_bbox_min = root_bbox_max = root_n_tx = None
+            root_centroid = root_bbox_min = root_bbox_max = None
             root_tx_coords = None
+            # root_n_tx kept — it's used by c_union_bypass_max_n_tx too.
 
     def _spatial_overlap(ra: int, rb: int) -> bool:
         """Default rule: smaller's centroid inside larger's tx cloud.
@@ -1667,6 +1779,16 @@ def stitch_entities_hierarchical(
         # never merge two clusters that both contain a cell
         if has_cell[ra] and has_cell[rb]:
             return False
+        # Optional merger-tree depth cap. Stops a component from
+        # growing beyond a fixed merger-tree height — protects against
+        # chain-style "big-blob-keeps-absorbing-neighbours" growth that
+        # produces multi-cell over-merges. Block if EITHER side has
+        # already reached the cap (so the union, which would be at
+        # max+1, would exceed it).
+        if max_merger_depth is not None:
+            if (int(merger_depth[ra]) >= int(max_merger_depth)
+                    or int(merger_depth[rb]) >= int(max_merger_depth)):
+                return False
         return True
 
     # ----------------------------------------------------------------
@@ -1755,6 +1877,10 @@ def stitch_entities_hierarchical(
     _SPATIAL_OVERLAP_DC = 1e9
 
     # compute deltaC between current roots
+    # Returns (dC, C_union). C_union is the raw post-merge coherence
+    # before any size-bias penalty, used by the optional bypass gate.
+    # For the spatial-bypass shortcut, C_union is set to 1.0 (sentinel
+    # mirrors the dC sentinel: pair is a guaranteed merge regardless).
     def compute_deltaC_roots(ra, rb):
         # Spatial bypass (Tier 1): in mode="pre", if the smaller
         # entity's centroid is inside the larger entity's bbox, treat
@@ -1765,7 +1891,7 @@ def stitch_entities_hierarchical(
         if (spatial_centroid_gate and spatial_gate_mode == "pre"
                 and root_centroid is not None
                 and _spatial_overlap(ra, rb)):
-            return _SPATIAL_OVERLAP_DC
+            return _SPATIAL_OVERLAP_DC, 1.0
 
         # Decomposable-primitive fast path: derive C(union) from the
         # roots' running primitive sums + on-the-fly cross primitives,
@@ -1780,12 +1906,12 @@ def stitch_entities_hierarchical(
             else:
                 Cunion = (na_u - nb_u) / nf_u
             if not penalize_simplicity:
-                return float(Cunion - max(Cu, Cv))
+                return float(Cunion - max(Cu, Cv)), float(Cunion)
             nu = max(int(root_genes[ra].size), 1)
             nv = max(int(root_genes[rb].size), 1)
             n_union = nu + nv
             C_sep = max(Cu - 1.0 / nu, Cv - 1.0 / nv)
-            return float(Cunion - (1.0 / n_union) - C_sep)
+            return float(Cunion - (1.0 / n_union) - C_sep), float(Cunion)
 
         # Eager path (default): compute C(union) directly via coherence.
         Cu, _, _ = C_of_root(ra)
@@ -1795,12 +1921,36 @@ def stitch_entities_hierarchical(
             union, npmi_mat, mode=mode, threshold=threshold, metric=metric,
         )
         if not penalize_simplicity:
-            return float(Cunion - max(Cu, Cv))
+            return float(Cunion - max(Cu, Cv)), float(Cunion)
         nu = max(int(root_genes[ra].size), 1)
         nv = max(int(root_genes[rb].size), 1)
         n_union = nu + nv
         C_sep = max(Cu - 1.0 / nu, Cv - 1.0 / nv)
-        return float(Cunion - (1.0 / n_union) - C_sep)
+        return float(Cunion - (1.0 / n_union) - C_sep), float(Cunion)
+
+    def _pair_passes_gate(dc, c_union, ra, rb):
+        """Acceptance gate: ΔC ≥ deltaC_min OR (bypass set and C_union ≥ bypass).
+        Spatial bypass already yields dc=sentinel which always passes.
+
+        When `c_union_bypass_max_n_tx` is set, the C(union) bypass only
+        applies if the merged entity's total tx count would stay at or
+        below the threshold. Small mergers (typically within-cell
+        fragment consolidation) admit; large mergers (typically cross-
+        cell partial bridging) require the strong ΔC signal.
+        """
+        if not np.isfinite(dc):
+            return False
+        if dc >= deltaC_min:
+            return True
+        if (c_union_bypass is not None
+                and np.isfinite(c_union)
+                and c_union >= c_union_bypass):
+            if c_union_bypass_max_n_tx is None:
+                return True
+            n_union = int(root_n_tx[ra]) + int(root_n_tx[rb])
+            if n_union <= c_union_bypass_max_n_tx:
+                return True
+        return False
 
     # max-heap of candidate edges by deltaC (lazy updates)
     def _heap_item(dc, a, b):
@@ -1861,8 +2011,8 @@ def stitch_entities_hierarchical(
         if (not is_spatial) and gate_keep_mask is not None and not gate_keep_mask[ei]:
             continue
         # Tier 3 (full ΔC eval; sentinel 1e9 only in "pre" mode)
-        di = compute_deltaC_roots(i, j)
-        if np.isfinite(di) and di >= deltaC_min:
+        di, ci = compute_deltaC_roots(i, j)
+        if _pair_passes_gate(di, ci, i, j):
             heapq.heappush(heap, _heap_item(di, i, j))
         elif (is_spatial and spatial_gate_mode == "post"
               and np.isfinite(di)):
@@ -1885,9 +2035,9 @@ def stitch_entities_hierarchical(
             continue
 
         # recompute deltaC for current clusters (because a,b may have merged)
-        dc_now = compute_deltaC_roots(ra, rb)
+        dc_now, cu_now = compute_deltaC_roots(ra, rb)
         post_override = False
-        if not (np.isfinite(dc_now) and dc_now >= deltaC_min):
+        if not _pair_passes_gate(dc_now, cu_now, ra, rb):
             # ΔC says reject. In "post" mode, give the spatial gate
             # one chance: if the (current-root) centroid test still
             # matches, force the merge anyway. This is the only way
@@ -1903,6 +2053,9 @@ def stitch_entities_hierarchical(
         rnew = dsu.union(ra, rb)
         rold = rb if rnew == ra else ra
         _LAST_GATE_STATS["merges_total"] += 1
+        # Update merger-tree depth: new root carries 1 + max of children.
+        merger_depth[rnew] = max(int(merger_depth[ra]),
+                                  int(merger_depth[rb])) + 1
         # Track which gate drove the merge:
         #   pre-mode bypass → dc_now == 1e9 sentinel
         #   post-mode override → ΔC failed but spatial said merge
@@ -1917,20 +2070,22 @@ def stitch_entities_hierarchical(
         partial_ids[rnew] |= partial_ids[rold]
         comp_ids[rnew] |= comp_ids[rold]
 
+        # n_tx accumulation — always updated (used by size-gated
+        # c_union_bypass even when the spatial gate is off).
+        n_new = int(root_n_tx[rnew])
+        n_old = int(root_n_tx[rold])
+        n_total = n_new + n_old
+        root_n_tx[rnew] = n_total
+        root_n_tx[rold] = 0
+
         # Spatial state update on union (when gate is active).
-        if (spatial_centroid_gate and root_centroid is not None
-                and root_n_tx is not None):
-            n_new = root_n_tx[rnew]
-            n_old = root_n_tx[rold]
-            n_total = n_new + n_old
+        if (spatial_centroid_gate and root_centroid is not None):
             if n_total > 0:
                 root_centroid[rnew] = (
                     (root_centroid[rnew] * n_new + root_centroid[rold] * n_old) / n_total
                 )
             root_bbox_min[rnew] = np.minimum(root_bbox_min[rnew], root_bbox_min[rold])
             root_bbox_max[rnew] = np.maximum(root_bbox_max[rnew], root_bbox_max[rold])
-            root_n_tx[rnew] = n_total
-            root_n_tx[rold] = 0
             # K≥2 path: maintain concatenated tx-coord arrays per root.
             if root_tx_coords is not None:
                 if root_tx_coords[rnew].size == 0:
@@ -1983,8 +2138,8 @@ def stitch_entities_hierarchical(
                     continue
                 if not can_merge(rr, rn):
                     continue
-                dtry = compute_deltaC_roots(rr, rn)
-                if np.isfinite(dtry) and dtry >= deltaC_min:
+                dtry, ctry = compute_deltaC_roots(rr, rn)
+                if _pair_passes_gate(dtry, ctry, rr, rn):
                     heapq.heappush(heap, _heap_item(dtry, rr, rn))
         else:  # candidate_source == "grid"
             # No explicit boundary expansion needed: in grid mode, the
@@ -2313,6 +2468,12 @@ def apply_stitching_to_transcripts_memory_efficient(
     metric: str = "npmi",
     penalize_simplicity: bool = True,
     deltaC_min: float = 0.0,
+    # See `stitch_entities_hierarchical` docstring. None = off (legacy).
+    c_union_bypass: float | None = None,
+    # See `stitch_entities_hierarchical` docstring. None = no size cap.
+    c_union_bypass_max_n_tx: int | None = None,
+    # See `stitch_entities_hierarchical` docstring. None = off (legacy).
+    max_merger_depth: int | None = None,
     use_3d: bool = True,
     dist_threshold: float | None = 15.0,
     out_col: str = "tracer_id",
@@ -2510,6 +2671,9 @@ def apply_stitching_to_transcripts_memory_efficient(
         metric=metric,
         penalize_simplicity=penalize_simplicity,
         deltaC_min=deltaC_min,
+        c_union_bypass=c_union_bypass,
+        c_union_bypass_max_n_tx=c_union_bypass_max_n_tx,
+        max_merger_depth=max_merger_depth,
         use_3d=use_3d,
         dist_threshold=dist_threshold,
         candidate_source=candidate_source,
