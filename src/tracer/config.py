@@ -295,6 +295,13 @@ class GroupConfig:
 # typed configs prematurely would create a drift trap. They will be
 # added when those stages freeze. Until then, their knobs live as
 # kwargs at the call site.
+#
+# Stitch acceptance gate (2026-05-13): an optional
+# `c_union_bypass: float | None` kwarg accepts pairs that fail
+# ΔC ≥ deltaC_min when C(union) ≥ bypass. Recovers same-program
+# fragment absorptions where both parents are already at C ≈ 1.0
+# and ΔC has no headroom. Spatial-witness and candidate-source
+# gates still apply. Recommended 0.9; None = off (legacy gate).
 
 
 @dataclass(frozen=True)

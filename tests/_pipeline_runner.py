@@ -1027,6 +1027,32 @@ RESCUE_MEAN_ADMIT = 0.5     # aggregate must be solidly positive
 STITCH_MIN_LOCAL_TX: int = 3
 STITCH_GZ_UM: float | None = 1.0
 
+# Stitch acceptance-bypass: when set, a pair that fails ΔC ≥ deltaC_min
+# is still accepted if the raw post-merge coherence C(union) ≥ this
+# value. Recovers same-program fragment absorptions where both parents
+# are already at C ≈ 1.0 and ΔC has no headroom. Spatial-witness and
+# candidate-source gates still apply. None = off (legacy ΔC-only gate).
+STITCH_C_UNION_BYPASS: float | None = 0.9
+
+# Size cap on the C(union) bypass path. The bypass is only allowed
+# when the merger's resulting tx count is at or below this threshold.
+# Trusts gene-fit alone for small within-cell fragment consolidations
+# (where ΔC has no headroom because both parents are at C ≈ 1.0) while
+# requiring strong ΔC signal for any larger merger. Calibrated against
+# the natural per-cell tx-count distribution in PDAC (50 tx ≈ between
+# the 75th and 90th percentiles of natural cell sizes). None = no size
+# cap on the bypass.
+STITCH_C_UNION_BYPASS_MAX_N_TX: int | None = 50
+
+# Stitch merger-tree depth cap. Per-component counter: each pre-stitch
+# entity starts at depth 0; on union, the new root's depth becomes
+# `max(child_depths) + 1`. A merger is blocked if either side has
+# already reached the cap. Balanced N-entity merges cost log2(N) depth;
+# chain merges cost N-1 — so the cap rewards balanced consolidations
+# and penalises chain growth (one component repeatedly absorbing
+# neighbours, the over-merge failure mode). None = off. Recommended 3.
+STITCH_MAX_MERGER_DEPTH: int | None = 3
+
 # Mid-pipeline QC (after Group, before Stitch). Two opt-in controls;
 # both default off so current production behavior is unchanged.
 #
@@ -1492,6 +1518,9 @@ def run_segmented_pipeline(df: pd.DataFrame,
         coord_cols=("x", "y", "z"),
         mode="count", threshold=PMI_THR, metric="pmi",
         penalize_simplicity=True, deltaC_min=0.03,
+        c_union_bypass=STITCH_C_UNION_BYPASS,
+        c_union_bypass_max_n_tx=STITCH_C_UNION_BYPASS_MAX_N_TX,
+        max_merger_depth=STITCH_MAX_MERGER_DEPTH,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
         G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else auto_Gz),
@@ -1646,6 +1675,9 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         coord_cols=("x", "y", "z"),
         mode="count", threshold=PMI_THR, metric="pmi",
         penalize_simplicity=True, deltaC_min=0.03,
+        c_union_bypass=STITCH_C_UNION_BYPASS,
+        c_union_bypass_max_n_tx=STITCH_C_UNION_BYPASS_MAX_N_TX,
+        max_merger_depth=STITCH_MAX_MERGER_DEPTH,
         dist_threshold=5.0, out_col="stitched", show_progress=False,
         candidate_source="grid", G=2.0, stitch_neighborhood="8",
         G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else 1.0),
