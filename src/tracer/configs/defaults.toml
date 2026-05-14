@@ -144,6 +144,28 @@ aggregator_percentile = 25.0
 # Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
 real_signal_threshold = 0.05
 
+# Rank policy — how a non-vetoed candidate is chosen among the entities
+# in the 9-bin × z-bound neighborhood of an orphan tx.
+#   "distance" : nearest-tx distance wins (legacy production behavior).
+#   "witness"  : count of supporting tx (capped) wins; tie broken by
+#                witness_tiebreak. Inspired by Stitch's witness gate.
+# Default "distance" preserves bit-exact legacy behavior. The
+# `witness_*` knobs below are ignored under "distance".
+rank_policy = "distance"
+
+# Witness-mode parameters (used only when rank_policy = "witness"):
+# Minimum (capped) witness count required to admit an orphan tx.
+witness_min_admit = 3
+# Per-entity hard cap on witness contribution.
+witness_cap = 3
+# Small-component damper: an entity contributes at most
+# ceil(entity_size / witness_small_component_cap_divisor) witnesses.
+witness_small_component_cap_divisor = 2
+# Tie-breaker among candidates with equal (capped) witness count:
+#   "distance" : nearest-tx wins.
+#   "gene_fit" : highest mean PMI(orphan gene, entity seed) wins.
+witness_tiebreak = "gene_fit"
+
 
 # ---------------------------------------------------------------------
 # Group — entity grouping. Two backends, selected per-pipeline by

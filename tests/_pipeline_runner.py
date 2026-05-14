@@ -1514,6 +1514,11 @@ def run_segmented_pipeline(df: pd.DataFrame,
             small_entity_guard_n=cfg.rescue.small_entity_guard_n,
             real_signal_threshold=cfg.rescue.real_signal_threshold,
             aggregator_percentile=cfg.rescue.aggregator_percentile,
+            rank_policy=cfg.rescue.rank_policy,
+            witness_min_admit=cfg.rescue.witness_min_admit,
+            witness_cap=cfg.rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.rescue.witness_tiebreak,
         )
         n_rescued += n_pass_rescued
         if n_pass_rescued == 0:
@@ -1584,6 +1589,11 @@ def run_segmented_pipeline(df: pd.DataFrame,
                 small_entity_guard_n=cfg.rescue.small_entity_guard_n,
                 real_signal_threshold=cfg.rescue.real_signal_threshold,
                 aggregator_percentile=cfg.rescue.aggregator_percentile,
+                rank_policy=cfg.rescue.rank_policy,
+                witness_min_admit=cfg.rescue.witness_min_admit,
+                witness_cap=cfg.rescue.witness_cap,
+                witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+                witness_tiebreak=cfg.rescue.witness_tiebreak,
             )
             if n_pass_rescued == 0:
                 break
@@ -1640,6 +1650,11 @@ def run_segmented_pipeline(df: pd.DataFrame,
         small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
         real_signal_threshold=cfg.final_rescue.real_signal_threshold,
         aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+        rank_policy=cfg.final_rescue.rank_policy,
+        witness_min_admit=cfg.final_rescue.witness_min_admit,
+        witness_cap=cfg.final_rescue.witness_cap,
+        witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+        witness_tiebreak=cfg.final_rescue.witness_tiebreak,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
@@ -1765,6 +1780,11 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
                 small_entity_guard_n=cfg.rescue.small_entity_guard_n,
                 real_signal_threshold=cfg.rescue.real_signal_threshold,
                 aggregator_percentile=cfg.rescue.aggregator_percentile,
+                rank_policy=cfg.rescue.rank_policy,
+                witness_min_admit=cfg.rescue.witness_min_admit,
+                witness_cap=cfg.rescue.witness_cap,
+                witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+                witness_tiebreak=cfg.rescue.witness_tiebreak,
             )
             if n_pass_rescued == 0:
                 break
@@ -1815,6 +1835,11 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
         small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
         real_signal_threshold=cfg.final_rescue.real_signal_threshold,
         aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+        rank_policy=cfg.final_rescue.rank_policy,
+        witness_min_admit=cfg.final_rescue.witness_min_admit,
+        witness_cap=cfg.final_rescue.witness_cap,
+        witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+        witness_tiebreak=cfg.final_rescue.witness_tiebreak,
     )
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 

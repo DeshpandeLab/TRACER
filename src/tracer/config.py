@@ -181,6 +181,33 @@ class RescueConfig:
     # Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
     real_signal_threshold: float = 0.05
 
+    # ------------------------------------------------------------------
+    # Rank policy — how a non-vetoed candidate is chosen among the
+    # entities in the 9-bin × z-bound neighborhood of an orphan tx.
+    # ------------------------------------------------------------------
+    # "distance" : nearest-tx distance wins (legacy production behavior).
+    # "witness"  : count of supporting tx (capped) wins; tie broken by
+    #              `witness_tiebreak`. Inspired by Stitch's witness gate
+    #              — see docs/superpowers/specs/2026-05-14-rescue-witness-
+    #              rank-design.md (forthcoming).
+    rank_policy: Literal["distance", "witness"] = "distance"
+
+    # The following knobs are meaningful only when ``rank_policy ==
+    # "witness"``; they are ignored under "distance". Defaults reflect
+    # the 50 µm-ROI bench-derived starting point (MIN_ADMIT=3, CAP=3,
+    # gene-fit tiebreak, small-component damper).
+    witness_min_admit: int = 3
+    witness_cap: int = 3
+    # Small-component witness damper. An entity contributes at most
+    # ``ceil(entity_size / witness_small_component_cap_divisor)``
+    # witnesses, capped further by ``witness_cap``. Damps the influence
+    # of small entities without making them ineligible.
+    witness_small_component_cap_divisor: int = 2
+    # Tie-breaker when multiple candidates have the same (capped)
+    # witness count: "distance" (nearest-tx) or "gene_fit" (highest
+    # mean PMI of the orphan gene against the candidate's seed gene set).
+    witness_tiebreak: Literal["distance", "gene_fit"] = "gene_fit"
+
     def __post_init__(self) -> None:
         if self.veto_mode not in ("min", "mean", "hybrid"):
             raise ValueError(
@@ -203,6 +230,30 @@ class RescueConfig:
             raise ValueError(
                 f"rescue.real_signal_threshold must be >= 0; "
                 f"got {self.real_signal_threshold}"
+            )
+        if self.rank_policy not in ("distance", "witness"):
+            raise ValueError(
+                f"rescue.rank_policy must be 'distance' or 'witness'; "
+                f"got {self.rank_policy!r}"
+            )
+        if self.witness_min_admit < 1:
+            raise ValueError(
+                f"rescue.witness_min_admit must be >= 1; "
+                f"got {self.witness_min_admit}"
+            )
+        if self.witness_cap < 1:
+            raise ValueError(
+                f"rescue.witness_cap must be >= 1; got {self.witness_cap}"
+            )
+        if self.witness_small_component_cap_divisor < 1:
+            raise ValueError(
+                f"rescue.witness_small_component_cap_divisor must be >= 1; "
+                f"got {self.witness_small_component_cap_divisor}"
+            )
+        if self.witness_tiebreak not in ("distance", "gene_fit"):
+            raise ValueError(
+                f"rescue.witness_tiebreak must be 'distance' or 'gene_fit'; "
+                f"got {self.witness_tiebreak!r}"
             )
 
 

@@ -485,3 +485,42 @@ def test_noseg_pipeline_cfg_none_matches_load_config(synthetic_inputs):
         f"NOSEG cfg=None vs cfg=load_config(): {n_diff}/{len(a)} tx "
         "labels differ — Phase-B wiring drift detected."
     )
+
+
+def test_seg_pipeline_witness_rank_policy_engages(synthetic_inputs):
+    """Smoke test: ``rescue.rank_policy = "witness"`` actually changes
+    per-tx labels relative to ``"distance"`` on the FullVolume fixture.
+
+    This is a *liveness* check — it guards against the witness branch
+    silently degrading to a no-op (e.g., due to a refactor that misroutes
+    the rank dispatch). It does NOT make a claim about which policy is
+    better; that's the bench's job.
+    """
+    from dataclasses import replace as dc_replace
+
+    from tracer.config import load_config
+
+    df, panel, _gt = synthetic_inputs
+    cfg_dist = load_config()
+    cfg_witness = dc_replace(
+        cfg_dist,
+        rescue=dc_replace(cfg_dist.rescue, rank_policy="witness"),
+        final_rescue=dc_replace(cfg_dist.final_rescue, rank_policy="witness"),
+    )
+    assert cfg_witness.rescue.rank_policy == "witness"
+
+    df_a, _ = run_segmented_pipeline(df.copy(), panel, cfg=cfg_dist)
+    df_b, _ = run_segmented_pipeline(df.copy(), panel, cfg=cfg_witness)
+    a = df_a["stitched"].astype(str).reset_index(drop=True)
+    b = df_b["stitched"].astype(str).reset_index(drop=True)
+    n_diff = int((a != b).sum())
+    # Witness branch must take effect on at least one tx — on this
+    # dense fixture it changes ~9% in practice. The lower bound is set
+    # at 1 so the test catches the worst regression (witness = noop)
+    # without overfitting to a specific synthetic.
+    assert n_diff >= 1, (
+        "rescue.rank_policy='witness' produced identical labels to "
+        "'distance' — the witness branch is not being exercised. "
+        "Check `reassign_unassigned_grid_pool`'s rank-policy dispatch "
+        "and `_resolve_pipeline_cfg`/call-site plumbing."
+    )
