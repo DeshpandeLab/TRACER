@@ -134,6 +134,16 @@ cluster_guard_n = 3
 # entity. 0 disables (pure mean / hybrid). Main Rescue uses 0 here.
 small_entity_guard_n = 0
 
+# Hybrid/mean mode: percentile of real-signal PMIs used as the gate.
+# 50 = median; lower = stricter (more pairs must be positive).
+# 2026-05-13: lowered 50 → 25 (stricter; mean over bottom quartile).
+aggregator_percentile = 25.0
+
+# Real-players gate (cross-cutting, but Rescue-overridable). Pairs
+# with |PMI| ≤ this contribute neither to mean nor to count gates.
+# Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
+real_signal_threshold = 0.05
+
 
 # ---------------------------------------------------------------------
 # Group — entity grouping. Two backends, selected per-pipeline by

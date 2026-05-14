@@ -437,3 +437,51 @@ def test_rerank_composes_with_reassign_1c(monkeypatch, synthetic_inputs):
     idx_rerank = stage_names.index("Phase1-Rerank")
     idx_qc = stage_names.index("Phase1-QC")
     assert idx_prune < idx_reassign < idx_split < idx_rerank < idx_qc
+
+
+# ============================================================================
+# Phase B equivalence: cfg=None  ≡  cfg=load_config()
+# ============================================================================
+#
+# When ``cfg is None`` (the legacy call path), ``_resolve_pipeline_cfg``
+# builds a ``PipelineConfig`` from the current module-global constants.
+# With the TOML defaults in lock-step with the dataclass defaults
+# (verified by ``test_config.py``), ``cfg=load_config()`` must produce
+# bit-identical per-tx labels. These tests are the Phase-A → Phase-B
+# safety net: any future wiring change that breaks this equivalence
+# will fail here.
+
+
+def test_seg_pipeline_cfg_none_matches_load_config(synthetic_inputs):
+    """SEG runner: ``cfg=None`` and ``cfg=load_config()`` produce
+    bit-identical per-tx labels on the FullVolume fixture."""
+    from tracer.config import load_config
+
+    df, panel, _gt = synthetic_inputs
+    df_a, _ = run_segmented_pipeline(df.copy(), panel)
+    df_b, _ = run_segmented_pipeline(df.copy(), panel, cfg=load_config())
+    a = df_a["stitched"].astype(str).reset_index(drop=True)
+    b = df_b["stitched"].astype(str).reset_index(drop=True)
+    n_diff = int((a != b).sum())
+    assert n_diff == 0, (
+        f"SEG cfg=None vs cfg=load_config(): {n_diff}/{len(a)} tx labels "
+        "differ — Phase-B wiring is no longer bit-exact with the "
+        "module-global fallback. Inspect `_resolve_pipeline_cfg` and "
+        "the call sites for drift."
+    )
+
+
+def test_noseg_pipeline_cfg_none_matches_load_config(synthetic_inputs):
+    """NOSEG runner: same equivalence guarantee as SEG."""
+    from tracer.config import load_config
+
+    df, panel, _gt = synthetic_inputs
+    df_a, _ = run_noseg_pipeline(df.copy(), panel)
+    df_b, _ = run_noseg_pipeline(df.copy(), panel, cfg=load_config())
+    a = df_a["stitched"].astype(str).reset_index(drop=True)
+    b = df_b["stitched"].astype(str).reset_index(drop=True)
+    n_diff = int((a != b).sum())
+    assert n_diff == 0, (
+        f"NOSEG cfg=None vs cfg=load_config(): {n_diff}/{len(a)} tx "
+        "labels differ — Phase-B wiring drift detected."
+    )

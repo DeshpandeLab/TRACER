@@ -173,6 +173,13 @@ class RescueConfig:
     z_bound_um: float | None = None       # None → G * sqrt(2)
     cluster_guard_n: int = 3
     small_entity_guard_n: int = 0
+    # 2026-05-13: aggregator_percentile lowered 50 → 25 (stricter; mean
+    # is computed over the bottom-quartile of real-signal pairs).
+    aggregator_percentile: float = 25.0
+    # Real-players gate (cross-cutting, but Rescue-overridable). Pairs
+    # with |PMI| ≤ this contribute neither to mean nor to count gates.
+    # Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
+    real_signal_threshold: float = 0.05
 
     def __post_init__(self) -> None:
         if self.veto_mode not in ("min", "mean", "hybrid"):
@@ -186,6 +193,16 @@ class RescueConfig:
         if self.bin_size_um <= 0:
             raise ValueError(
                 f"rescue.bin_size_um must be > 0; got {self.bin_size_um}"
+            )
+        if not (0.0 <= self.aggregator_percentile <= 100.0):
+            raise ValueError(
+                f"rescue.aggregator_percentile must be in [0, 100]; "
+                f"got {self.aggregator_percentile}"
+            )
+        if self.real_signal_threshold < 0.0:
+            raise ValueError(
+                f"rescue.real_signal_threshold must be >= 0; "
+                f"got {self.real_signal_threshold}"
             )
 
 
