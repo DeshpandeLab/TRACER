@@ -192,6 +192,56 @@ legacy_npmi_threshold = -0.1         # post-prune negative cutoff
 # tests/_pipeline_runner.py until they freeze.
 #
 # ---------------------------------------------------------------------
+# Stitch — Phase 4 hierarchical entity merge. Mirrors the production
+# call in `tests/_pipeline_runner.py::run_segmented_pipeline` (and the
+# symmetric NOSEG path) at the time of typing (2026-05-14).
+#
+# Acceptance pipeline:
+#   Candidate pair → witness gate (min_local_tx_per_entity)
+#     → ΔC ≥ deltaC_min ?
+#        YES → accept
+#        NO  → C(union) ≥ c_union_bypass AND merged n_tx ≤ bypass_max_n_tx ?
+#               YES → bypass-accept   NO → reject
+#   Plus: post-acceptance merger-tree depth ≤ max_merger_depth.
+# ---------------------------------------------------------------------
+[stitch]
+# Coherence-metric knobs.
+mode = "count"
+metric = "pmi"
+penalize_simplicity = true
+
+# Primary acceptance gate. 2026-05-09: raised 0.0 → 0.03 to prevent
+# NOSEG supercell formation; SEG insensitive.
+deltaC_min = 0.03
+
+# C(union) bypass for ΔC-failing pairs. 0.9 is the recommended setting
+# from the 2026-05-14 stitch-dist-threshold-fix bench. Use null to
+# disable the bypass entirely (reverts to ΔC-only gate).
+c_union_bypass = 0.9
+
+# Size cap on the bypass: only fires when the merged entity stays at
+# ≤ N tx. Keeps the bypass targeted at within-cell fragment
+# consolidation rather than cross-compartment bridging.
+c_union_bypass_max_n_tx = 50
+
+# Post-acceptance merger-tree depth cap. Blocks chain-style growth.
+# Set to null to disable.
+max_merger_depth = 3
+
+# Spatial gate — candidate pair enumeration.
+candidate_source = "grid"
+bin_size_um = 2.0
+g_z_um = 1.0
+z_neighbor_depth = 1
+neighborhood = "8"
+dist_threshold_um = 5.0
+
+# Per-entity witness floor in the shared bin neighborhood (capped at
+# min(threshold, entity n_tx) internally — landed 2026-05-14).
+min_local_tx_per_entity = 3
+
+
+# ---------------------------------------------------------------------
 # Final Rescue — single-pass rescue of post-Demote unassigned tx.
 # Inherits all keys from [rescue] then applies the deltas below.
 # ---------------------------------------------------------------------

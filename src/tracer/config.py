@@ -288,20 +288,103 @@ class GroupConfig:
             )
 
 
-# Stitch and Demote are deliberately NOT represented as dataclasses
-# here yet. Their parameters are still being tuned (e.g.
-# `deltaC_min` was just raised from 0.0 to 0.03 on 2026-05-09; the
-# Stitch decomposable-coherence + DSU + heap path is planned). Adding
-# typed configs prematurely would create a drift trap. They will be
-# added when those stages freeze. Until then, their knobs live as
-# kwargs at the call site.
-#
-# Stitch acceptance gate (2026-05-13): an optional
-# `c_union_bypass: float | None` kwarg accepts pairs that fail
-# ΔC ≥ deltaC_min when C(union) ≥ bypass. Recovers same-program
-# fragment absorptions where both parents are already at C ≈ 1.0
-# and ΔC has no headroom. Spatial-witness and candidate-source
-# gates still apply. Recommended 0.9; None = off (legacy gate).
+@dataclass(frozen=True)
+class StitchConfig:
+    """Phase 4 — hierarchical entity stitching.
+
+    Mirrors the production call in
+    ``tests/_pipeline_runner.py::run_segmented_pipeline`` (and the
+    symmetric NOSEG path) at the time of typing (2026-05-14). All
+    values are the production defaults active after the
+    `bugfix/stitch-dist-threshold` merge:
+
+      * ``deltaC_min=0.03`` (raised 0.0 → 0.03 on 2026-05-09 to prevent
+        NOSEG supercell formation; SEG insensitive).
+      * ``c_union_bypass=0.9`` + ``c_union_bypass_max_n_tx=50``: admit
+        ΔC-failing pairs when C(union) ≥ 0.9 AND merged n_tx ≤ 50.
+        Recovers within-cell fragment consolidations where both parents
+        are at C ≈ 1.0 and ΔC has no headroom; size cap keeps the
+        bypass targeted at within-cell, not cross-compartment.
+      * ``max_merger_depth=3``: post-acceptance merger-tree depth cap.
+        Blocks chain-style growth.
+      * ``min_local_tx_per_entity=3``: per-entity witness floor in the
+        shared bin neighborhood. Capped at min(threshold, entity n_tx)
+        internally.
+
+    Decomposable-coherence + DSU + heap fast path (``use_decomposable_
+    stitch=True`` in ``stitching.py``) is ⚪ PLANNED as opt-in — not
+    represented here yet.
+    """
+    # Coherence metric
+    mode: Literal["count", "primitives"] = "count"
+    metric: Literal["pmi", "npmi"] = "pmi"
+    penalize_simplicity: bool = True
+    deltaC_min: float = 0.03
+
+    # C(union) bypass for ΔC-failing pairs
+    c_union_bypass: float | None = 0.9
+    c_union_bypass_max_n_tx: int | None = 50
+
+    # Merger-tree depth cap
+    max_merger_depth: int | None = 3
+
+    # Spatial gate
+    candidate_source: Literal["grid", "delaunay"] = "grid"
+    bin_size_um: float = 2.0                    # xy bin (G)
+    g_z_um: float | None = 1.0                  # z bin; None → auto_Gz from estimator
+    z_neighbor_depth: int = 1                   # ±depth z bins
+    neighborhood: Literal["4", "8"] = "8"       # xy Moore reach
+    dist_threshold_um: float = 5.0              # max 3D distance for candidate pairs
+
+    # Witness floor (per-entity tx count in shared bin neighborhood)
+    min_local_tx_per_entity: int = 3
+
+    def __post_init__(self) -> None:
+        if not (-1.0 <= self.deltaC_min <= 1.0):
+            raise ValueError(
+                f"stitch.deltaC_min out of range: {self.deltaC_min}"
+            )
+        if self.c_union_bypass is not None and not (0.0 <= self.c_union_bypass <= 1.0):
+            raise ValueError(
+                f"stitch.c_union_bypass out of range: {self.c_union_bypass}"
+            )
+        if (self.c_union_bypass_max_n_tx is not None
+                and self.c_union_bypass_max_n_tx < 1):
+            raise ValueError(
+                f"stitch.c_union_bypass_max_n_tx must be >= 1; "
+                f"got {self.c_union_bypass_max_n_tx}"
+            )
+        if self.max_merger_depth is not None and self.max_merger_depth < 1:
+            raise ValueError(
+                f"stitch.max_merger_depth must be >= 1; got {self.max_merger_depth}"
+            )
+        if self.bin_size_um <= 0:
+            raise ValueError(
+                f"stitch.bin_size_um must be > 0; got {self.bin_size_um}"
+            )
+        if self.g_z_um is not None and self.g_z_um <= 0:
+            raise ValueError(
+                f"stitch.g_z_um must be > 0 (or None for auto); got {self.g_z_um}"
+            )
+        if self.z_neighbor_depth < 0:
+            raise ValueError(
+                f"stitch.z_neighbor_depth must be >= 0; got {self.z_neighbor_depth}"
+            )
+        if self.dist_threshold_um <= 0:
+            raise ValueError(
+                f"stitch.dist_threshold_um must be > 0; got {self.dist_threshold_um}"
+            )
+        if self.min_local_tx_per_entity < 0:
+            raise ValueError(
+                f"stitch.min_local_tx_per_entity must be >= 0; "
+                f"got {self.min_local_tx_per_entity}"
+            )
+
+
+# Mid-QC and Post-Group Rescue remain untyped for now. Mid-QC's
+# coherence-floor knob is still being tuned per-platform; Post-Group
+# Rescue shares `RescueConfig` (just runs the same call site with the
+# same knobs). Both will be promoted as their scope settles.
 
 
 @dataclass(frozen=True)
@@ -416,6 +499,7 @@ class PipelineConfig:
     phase1_reassign: Phase1ReassignConfig = field(default_factory=Phase1ReassignConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     group: GroupConfig = field(default_factory=GroupConfig)
+    stitch: StitchConfig = field(default_factory=StitchConfig)
     demote: DemoteConfig = field(default_factory=DemoteConfig)
     final_rescue: RescueConfig = field(
         default_factory=lambda: RescueConfig(small_entity_guard_n=0)
@@ -439,6 +523,7 @@ _SECTION_TO_CLS: dict[str, type] = {
     "phase1_reassign": Phase1ReassignConfig,
     "rescue": RescueConfig,
     "group": GroupConfig,
+    "stitch": StitchConfig,
     "demote": DemoteConfig,
     "final_rescue": RescueConfig,
     "bootstrap": BootstrapConfig,
