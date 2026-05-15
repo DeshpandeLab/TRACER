@@ -190,7 +190,13 @@ class RescueConfig:
     #              `witness_tiebreak`. Inspired by Stitch's witness gate
     #              — see docs/superpowers/specs/2026-05-14-rescue-witness-
     #              rank-design.md (forthcoming).
-    rank_policy: Literal["distance", "witness"] = "distance"
+    # 2026-05-15: promoted "distance" → "witness" after Cython port
+    # (`_cy_prune.rescue_per_tx_batch` gained witness branch) and 2×2
+    # PDAC ROI bench. Witness improves small-cell ARI in NOSEG
+    # (0.496 → 0.581 on <20-tx cells) with ~11% wall overhead vs
+    # distance Cython. SEG ARI cost is 0.047 — accepted in exchange
+    # for coherence and small-cell wins.
+    rank_policy: Literal["distance", "witness"] = "witness"
 
     # The following knobs are meaningful only when ``rank_policy ==
     # "witness"``; they are ignored under "distance". Defaults reflect

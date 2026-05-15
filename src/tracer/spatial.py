@@ -1763,9 +1763,9 @@ def reassign_unassigned_grid_pool(
         not W_is_sparse
         and len(coord_cols) >= 2
         and veto_mode in ("min", "mean", "hybrid")
-        # Cython batch only implements distance rank; witness mode
-        # forces the Python fallback.
-        and rank_policy == "distance"
+        # Cython batch supports both distance and witness rank policies
+        # (witness branch landed 2026-05-15 in _cy_prune.pyx). No
+        # rank_policy gate here.
     )
 
     # For witness mode we need entity sizes (total assigned-tx count
@@ -1855,6 +1855,16 @@ def reassign_unassigned_grid_pool(
             else 1 if veto_mode == "mean"
             else 2  # hybrid
         )
+        # Pre-compute per-entity tx counts for witness-mode small-
+        # component cap. Cheap (single bincount) and the kernel ignores
+        # this array when rank_policy=="distance".
+        ent_size_arr = np.bincount(
+            ass_ent_id, minlength=len(unique_ents)
+        ).astype(np.int32, copy=False)
+
+        rank_policy_int = 1 if rank_policy == "witness" else 0
+        witness_tiebreak_int = 1 if witness_tiebreak == "gene_fit" else 0
+
         best_ent_arr, best_dist_arr, reason_arr, sef_arr = (
             _cy_prune.rescue_per_tx_batch(
                 una_coords_c, una_g_idx, nb_bins_arr,
@@ -1870,6 +1880,12 @@ def reassign_unassigned_grid_pool(
                 float(min_admit_threshold),
                 float(real_signal_threshold),
                 float(aggregator_percentile),
+                rank_policy_int,
+                int(witness_min_admit),
+                int(witness_cap),
+                int(witness_small_component_cap_divisor),
+                witness_tiebreak_int,
+                ent_size_arr,
             )
         )
 

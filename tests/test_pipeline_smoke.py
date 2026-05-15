@@ -501,13 +501,16 @@ def test_seg_pipeline_witness_rank_policy_engages(synthetic_inputs):
     from tracer.config import load_config
 
     df, panel, _gt = synthetic_inputs
-    cfg_dist = load_config()
-    cfg_witness = dc_replace(
-        cfg_dist,
-        rescue=dc_replace(cfg_dist.rescue, rank_policy="witness"),
-        final_rescue=dc_replace(cfg_dist.final_rescue, rank_policy="witness"),
+    # Build the distance-policy config explicitly via dc_replace —
+    # the default config has rank_policy="witness" since 2026-05-15.
+    cfg_witness = load_config()
+    cfg_dist = dc_replace(
+        cfg_witness,
+        rescue=dc_replace(cfg_witness.rescue, rank_policy="distance"),
+        final_rescue=dc_replace(cfg_witness.final_rescue, rank_policy="distance"),
     )
     assert cfg_witness.rescue.rank_policy == "witness"
+    assert cfg_dist.rescue.rank_policy == "distance"
 
     df_a, _ = run_segmented_pipeline(df.copy(), panel, cfg=cfg_dist)
     df_b, _ = run_segmented_pipeline(df.copy(), panel, cfg=cfg_witness)

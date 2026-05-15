@@ -908,6 +908,37 @@ cdef inline void _insertion_sort_floats(float *buf, int n) noexcept nogil:
         buf[j + 1] = tmp
 
 
+cdef inline double _compute_gene_fit(
+    int g_idx,
+    int e_off_lo, int e_off_hi,
+    cnp.int32_t[:] ent_g_mv,
+    cnp.float32_t[:, :] W_mv,
+) noexcept nogil:
+    """Mean PMI of orphan gene `g_idx` against entity's seed gene set,
+    excluding the self-pair if present. NaN entries are skipped.
+
+    Returns -1e9 when no finite PMI pairs exist — used as a sentinel
+    by witness-mode tiebreak (caller treats lower-than-anything as
+    "no info"). Matches the Python branch's gene_fit calculation in
+    spatial.py:reassign_unassigned_grid_pool.
+    """
+    cdef double pmi_sum = 0.0
+    cdef int n_finite = 0
+    cdef int ig, eg
+    cdef double v
+    for ig in range(e_off_lo, e_off_hi):
+        eg = ent_g_mv[ig]
+        if eg == g_idx:
+            continue
+        v = W_mv[g_idx, eg]
+        if v == v:  # not NaN
+            pmi_sum += v
+            n_finite += 1
+    if n_finite == 0:
+        return -1e9
+    return pmi_sum / n_finite
+
+
 cdef inline double _percentile_sorted(float *sorted_buf, int n, double p) noexcept nogil:
     """Linear-interpolated percentile of an ascending-sorted buffer.
     Matches numpy.percentile(..., interpolation='linear') semantics.
@@ -936,6 +967,10 @@ cdef void _rescue_one_tx(
     float *pmi_buf,                # per-thread slice (caller already offsets)
     cnp.int8_t[:, :] cache_mv,     # (n_threads, n_ent)
     cnp.int32_t[:, :] gen_mv,      # (n_threads, n_ent)
+    cnp.int32_t[:, :] witness_count_mv,  # (n_threads, n_ent), valid iff gen==current_gen
+    cnp.float32_t[:, :] min_dist_mv,     # (n_threads, n_ent), valid iff gen==current_gen
+    cnp.int32_t[:, :] touched_ents_mv,   # (n_threads, max_touched) — witness-touched ents
+    int max_touched,
     int n_ent,
     int max_bin_key_plus_one,
     int has_z,
@@ -948,6 +983,12 @@ cdef void _rescue_one_tx(
     int small_entity_guard_n,
     double neg_npmi_threshold,
     double min_admit_threshold,
+    int rank_policy,                # 0 = distance, 1 = witness
+    int witness_min_admit,
+    int witness_cap,
+    int witness_div,                 # small-component cap divisor
+    int witness_tiebreak,            # 0 = distance, 1 = gene_fit
+    cnp.int32_t[:] ent_size_mv,      # n_tx per entity (caller pre-computed)
     cnp.float32_t[:, :] una_c_mv,
     cnp.int64_t[:] una_g_mv,
     cnp.int64_t[:, :] nb_bins_mv,
@@ -979,6 +1020,13 @@ cdef void _rescue_one_tx(
     cdef float v_f, av_f, min_signal_f
     cdef double dx, dy, dz, d, best_d, pmi_sum, pmi_val, mean_p, min_pmi
     cdef double p_aggregate
+
+    # Witness-mode scratch
+    cdef int n_touched = 0
+    cdef int t_idx, best_w_ent, raw_w, w_eff, small_cap, ent_size
+    cdef int best_w_eff
+    cdef double best_tb, tb, best_w_d2, this_d2
+    cdef double ent_min_d_sq
 
     g_idx = <int> una_g_mv[i]
     if g_idx < 0:
@@ -1143,9 +1191,76 @@ cdef void _rescue_one_tx(
             if has_z:
                 dz = ass_c_mv[ass_li, 2] - una_c_mv[i, 2]
                 d += dz * dz
+
+            # Witness-mode accumulation. cache_mv == 2 means "OK and
+            # not yet witness-initialized"; we promote to 3 on first
+            # contribution. Subsequent visits of the same entity
+            # increment the count and update min-distance.
+            if rank_policy == 1:
+                if cache_mv[tid, ent] == 2:
+                    cache_mv[tid, ent] = 3
+                    witness_count_mv[tid, ent] = 0
+                    min_dist_mv[tid, ent] = <cnp.float32_t> 1e30
+                    if n_touched < max_touched:
+                        touched_ents_mv[tid, n_touched] = ent
+                        n_touched += 1
+                witness_count_mv[tid, ent] += 1
+                if <cnp.float32_t> d < min_dist_mv[tid, ent]:
+                    min_dist_mv[tid, ent] = <cnp.float32_t> d
+
+            # Distance branch: greedy nearest tracker (unchanged).
             if d < best_d:
                 best_d = d
                 best_ent_mv[i] = ent
+
+    # Post-loop rank-policy dispatch.
+    if rank_policy == 1:
+        # Witness mode: re-rank using the per-entity capped witness
+        # count, breaking ties by gene-fit or distance. Overrides the
+        # greedy `best_ent_mv[i]` selected during the inner loop.
+        best_w_eff = 0
+        best_tb = -1e300
+        best_w_ent = -1
+        best_w_d2 = 1e300
+        for t_idx in range(n_touched):
+            ent = touched_ents_mv[tid, t_idx]
+            raw_w = witness_count_mv[tid, ent]
+            ent_size = ent_size_mv[ent]
+            # ceil(ent_size / witness_div)
+            small_cap = (ent_size + witness_div - 1) // witness_div
+            w_eff = raw_w
+            if w_eff > witness_cap:
+                w_eff = witness_cap
+            if w_eff > small_cap:
+                w_eff = small_cap
+            if w_eff < witness_min_admit:
+                continue
+            if witness_tiebreak == 1:  # gene_fit
+                e_off_lo = ent_off_mv[ent]
+                e_off_hi = ent_off_mv[ent + 1]
+                if e_off_hi == e_off_lo:
+                    tb = -1e9
+                else:
+                    tb = _compute_gene_fit(
+                        g_idx, e_off_lo, e_off_hi, ent_g_mv, W_mv,
+                    )
+            else:                       # distance (negated so higher = nearer)
+                tb = -min_dist_mv[tid, ent]
+            # Lex pick: (w_eff desc, tb desc, entity_id asc).
+            this_d2 = min_dist_mv[tid, ent] * min_dist_mv[tid, ent]
+            if (best_w_ent < 0
+                    or w_eff > best_w_eff
+                    or (w_eff == best_w_eff and tb > best_tb)
+                    or (w_eff == best_w_eff and tb == best_tb
+                        and ent < best_w_ent)):
+                best_w_eff = w_eff
+                best_tb = tb
+                best_w_ent = ent
+                best_w_d2 = this_d2
+        # Overwrite distance-greedy pick with witness pick.
+        best_ent_mv[i] = best_w_ent
+        if best_w_ent >= 0:
+            best_d = best_w_d2
 
     if best_ent_mv[i] == -1:
         reason_mv[i] = 2 if any_vetoed else 1
@@ -1173,6 +1288,13 @@ def rescue_per_tx_batch(
     double min_admit_threshold = 0.0,                     # hybrid: min-PMI fast-pass cutoff
     double real_signal_threshold = 0.0,                   # noise floor; >0 enables real-players gate
     double aggregator_percentile = 50.0,                  # percentile of real-signal pmis (real-players gate)
+    # Rank-policy parameters (witness-mode opt-in).
+    int rank_policy = 0,                                  # 0=distance, 1=witness
+    int witness_min_admit = 3,
+    int witness_cap = 3,
+    int witness_small_component_cap_divisor = 2,
+    int witness_tiebreak = 1,                             # 0=distance, 1=gene_fit
+    cnp.ndarray[cnp.int32_t, ndim=1] ent_size = None,     # entity tx counts; required when rank_policy=1
 ):
     """Per-unassigned-tx Rescue batch.
 
@@ -1268,24 +1390,63 @@ def rescue_per_tx_batch(
     if pmi_buf == NULL:
         raise MemoryError("rescue_per_tx_batch: failed to allocate pmi_buf")
 
+    # Witness-mode per-thread buffers. Allocated unconditionally so the
+    # nogil body can index them without branching on rank_policy at the
+    # outer level; the body itself gates witness work on rank_policy.
+    # touched_ents bound: typical 9-bin × z-bound neighborhood has
+    # at most a few hundred unique entities — 256 is a safe ceiling.
+    cdef int max_touched = 256
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] witness_count_arr = np.zeros(
+        (n_threads, n_ent), dtype=np.int32,
+    )
+    cdef cnp.int32_t[:, :] witness_count_mv = witness_count_arr
+    cdef cnp.ndarray[cnp.float32_t, ndim=2] min_dist_arr = np.zeros(
+        (n_threads, n_ent), dtype=np.float32,
+    )
+    cdef cnp.float32_t[:, :] min_dist_mv = min_dist_arr
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] touched_ents_arr = np.zeros(
+        (n_threads, max_touched), dtype=np.int32,
+    )
+    cdef cnp.int32_t[:, :] touched_ents_mv = touched_ents_arr
+
+    # Entity-size view. Witness mode requires it; distance mode
+    # ignores it but we still bind a memview so the call signature
+    # is uniform.
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] ent_size_local
+    if ent_size is None:
+        ent_size_local = np.zeros(n_ent, dtype=np.int32)
+    else:
+        if ent_size.shape[0] != n_ent:
+            raise ValueError(
+                f"ent_size length {ent_size.shape[0]} != n_ent {n_ent}"
+            )
+        ent_size_local = ent_size
+    cdef cnp.int32_t[:] ent_size_mv = ent_size_local
+
     cdef int i
     cdef int tid_loop
 
     try:
         # Per-tx work runs in parallel via prange. Per-thread state
-        # (pmi_buf slice + cache row + gen row) is passed into the
-        # helper through tid indexing; helper is nogil-safe.
+        # (pmi_buf slice + cache row + gen row + witness buffers) is
+        # passed into the helper through tid indexing; helper is
+        # nogil-safe.
         for i in prange(n_una, nogil=True, schedule="dynamic"):
             tid_loop = openmp.omp_get_thread_num()
             _rescue_one_tx(
                 i, tid_loop, i + 1,
                 pmi_buf + tid_loop * pmi_buf_per_thread,
                 cache_mv, gen_mv,
+                witness_count_mv, min_dist_mv, touched_ents_mv,
+                max_touched,
                 n_ent, max_bin_key_plus_one,
                 has_z, z_bound, veto_mode,
                 rs_active, rs_thr, agg_p,
                 mean_threshold, small_entity_guard_n,
                 neg_npmi_threshold, min_admit_threshold,
+                rank_policy, witness_min_admit, witness_cap,
+                witness_small_component_cap_divisor, witness_tiebreak,
+                ent_size_mv,
                 una_c_mv, una_g_mv, nb_bins_mv,
                 ass_c_mv, ass_ent_mv, bin_off_mv, bin_data_mv,
                 ent_off_mv, ent_g_mv, W_mv,

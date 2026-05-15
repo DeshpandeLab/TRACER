@@ -146,12 +146,13 @@ real_signal_threshold = 0.05
 
 # Rank policy — how a non-vetoed candidate is chosen among the entities
 # in the 9-bin × z-bound neighborhood of an orphan tx.
-#   "distance" : nearest-tx distance wins (legacy production behavior).
+#   "distance" : nearest-tx distance wins (legacy).
 #   "witness"  : count of supporting tx (capped) wins; tie broken by
 #                witness_tiebreak. Inspired by Stitch's witness gate.
-# Default "distance" preserves bit-exact legacy behavior. The
-# `witness_*` knobs below are ignored under "distance".
-rank_policy = "distance"
+# 2026-05-15: promoted "distance" → "witness" after Cython port.
+# Witness improves small-cell ARI in NOSEG and lifts SEG cell-level
+# coherence p10/p25, at ~11% wall overhead vs distance Cython.
+rank_policy = "witness"
 
 # Witness-mode parameters (used only when rank_policy = "witness"):
 # Minimum (capped) witness count required to admit an orphan tx.
