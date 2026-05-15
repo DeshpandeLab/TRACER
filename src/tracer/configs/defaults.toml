@@ -134,6 +134,52 @@ cluster_guard_n = 3
 # entity. 0 disables (pure mean / hybrid). Main Rescue uses 0 here.
 small_entity_guard_n = 0
 
+# Hybrid/mean mode: percentile of real-signal PMIs used as the gate.
+# 50 = median; lower = stricter (more pairs must be positive).
+# 2026-05-13: lowered 50 → 25 (stricter; mean over bottom quartile).
+aggregator_percentile = 25.0
+
+# Real-players gate (cross-cutting, but Rescue-overridable). Pairs
+# with |PMI| ≤ this contribute neither to mean nor to count gates.
+# Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
+real_signal_threshold = 0.05
+
+# Rank policy — how a non-vetoed candidate is chosen among the entities
+# in the 9-bin × z-bound neighborhood of an orphan tx.
+#   "distance" : nearest-tx distance wins (legacy production behavior).
+#   "witness"  : count of supporting tx (capped) wins; tie broken by
+#                witness_tiebreak. Inspired by Stitch's witness gate.
+# Default "distance" preserves bit-exact legacy behavior. The
+# `witness_*` knobs below are ignored under "distance".
+rank_policy = "distance"
+
+# Witness-mode parameters (used only when rank_policy = "witness"):
+# Minimum (capped) witness count required to admit an orphan tx.
+witness_min_admit = 3
+# Per-entity hard cap on witness contribution.
+witness_cap = 3
+# Small-component damper: an entity contributes at most
+# ceil(entity_size / witness_small_component_cap_divisor) witnesses.
+witness_small_component_cap_divisor = 2
+# Tie-breaker among candidates with equal (capped) witness count:
+#   "distance" : nearest-tx wins.
+#   "gene_fit" : highest mean PMI(orphan gene, entity seed) wins.
+witness_tiebreak = "gene_fit"
+
+# Convergence-aware early exit. After each rescue pass, the loop
+# compares n_reassigned to the pre-pass unassigned-pool size; if the
+# ratio falls below this threshold, break before the next pass.
+# 0.0 = disabled (legacy: only break on zero admits). Set > 0 for a
+# defensive guard against high-max_passes misconfigs; otherwise leave
+# at 0.0 and use max_passes as the explicit cap.
+early_exit_admit_ratio = 0.0
+
+# Post-Group Rescue passes. SEG default 3. NOSEG platform preset
+# raises to 5 — NOSEG enters Post-Group with a much larger orphan pool
+# (no Xenium prior anchored Phase-1). Each pass is bounded by zero-
+# admit exit anyway. Set 0 to disable the Post-Group stage entirely.
+post_group_passes = 3
+
 
 # ---------------------------------------------------------------------
 # Group — entity grouping. Two backends, selected per-pipeline by
@@ -192,7 +238,57 @@ legacy_npmi_threshold = -0.1         # post-prune negative cutoff
 # tests/_pipeline_runner.py until they freeze.
 #
 # ---------------------------------------------------------------------
-# Final Rescue — single-pass rescue of post-Demote unassigned tx.
+# Stitch — Phase 4 hierarchical entity merge. Mirrors the production
+# call in `tests/_pipeline_runner.py::run_segmented_pipeline` (and the
+# symmetric NOSEG path) at the time of typing (2026-05-14).
+#
+# Acceptance pipeline:
+#   Candidate pair → witness gate (min_local_tx_per_entity)
+#     → ΔC ≥ deltaC_min ?
+#        YES → accept
+#        NO  → C(union) ≥ c_union_bypass AND merged n_tx ≤ bypass_max_n_tx ?
+#               YES → bypass-accept   NO → reject
+#   Plus: post-acceptance merger-tree depth ≤ max_merger_depth.
+# ---------------------------------------------------------------------
+[stitch]
+# Coherence-metric knobs.
+mode = "count"
+metric = "pmi"
+penalize_simplicity = true
+
+# Primary acceptance gate. 2026-05-09: raised 0.0 → 0.03 to prevent
+# NOSEG supercell formation; SEG insensitive.
+deltaC_min = 0.03
+
+# C(union) bypass for ΔC-failing pairs. 0.9 is the recommended setting
+# from the 2026-05-14 stitch-dist-threshold-fix bench. Use null to
+# disable the bypass entirely (reverts to ΔC-only gate).
+c_union_bypass = 0.9
+
+# Size cap on the bypass: only fires when the merged entity stays at
+# ≤ N tx. Keeps the bypass targeted at within-cell fragment
+# consolidation rather than cross-compartment bridging.
+c_union_bypass_max_n_tx = 50
+
+# Post-acceptance merger-tree depth cap. Blocks chain-style growth.
+# Set to null to disable.
+max_merger_depth = 3
+
+# Spatial gate — candidate pair enumeration.
+candidate_source = "grid"
+bin_size_um = 2.0
+g_z_um = 1.0
+z_neighbor_depth = 1
+neighborhood = "8"
+dist_threshold_um = 5.0
+
+# Per-entity witness floor in the shared bin neighborhood (capped at
+# min(threshold, entity n_tx) internally — landed 2026-05-14).
+min_local_tx_per_entity = 3
+
+
+# ---------------------------------------------------------------------
+# Final Rescue — post-Demote pass over remaining "-1" tx.
 # Inherits all keys from [rescue] then applies the deltas below.
 # ---------------------------------------------------------------------
 [final_rescue]
@@ -201,6 +297,13 @@ inherit = "rescue"
 # Stricter than main Rescue: no fallback-to-min for small entities.
 # (Already 0 in [rescue], explicit here for documentation.)
 small_entity_guard_n = 0
+
+# 2026-05-15: SEG-friendly default — 3 passes, no gate. NOSEG users
+# should load via `load_config(platform="noseg")` which overrides to
+# 5 passes (NOSEG has a much larger residual orphan pool after
+# Stitch+Demote). See 2×2 PDAC ROI bench in
+# analysis/rescue-upgrades/rank_policy_2x2_snapshots/.
+max_passes = 3
 
 
 # ---------------------------------------------------------------------

@@ -173,6 +173,61 @@ class RescueConfig:
     z_bound_um: float | None = None       # None → G * sqrt(2)
     cluster_guard_n: int = 3
     small_entity_guard_n: int = 0
+    # 2026-05-13: aggregator_percentile lowered 50 → 25 (stricter; mean
+    # is computed over the bottom-quartile of real-signal pairs).
+    aggregator_percentile: float = 25.0
+    # Real-players gate (cross-cutting, but Rescue-overridable). Pairs
+    # with |PMI| ≤ this contribute neither to mean nor to count gates.
+    # Default 0.05 matches the cross-cutting REAL_SIGNAL_THRESHOLD.
+    real_signal_threshold: float = 0.05
+
+    # ------------------------------------------------------------------
+    # Rank policy — how a non-vetoed candidate is chosen among the
+    # entities in the 9-bin × z-bound neighborhood of an orphan tx.
+    # ------------------------------------------------------------------
+    # "distance" : nearest-tx distance wins (legacy production behavior).
+    # "witness"  : count of supporting tx (capped) wins; tie broken by
+    #              `witness_tiebreak`. Inspired by Stitch's witness gate
+    #              — see docs/superpowers/specs/2026-05-14-rescue-witness-
+    #              rank-design.md (forthcoming).
+    rank_policy: Literal["distance", "witness"] = "distance"
+
+    # The following knobs are meaningful only when ``rank_policy ==
+    # "witness"``; they are ignored under "distance". Defaults reflect
+    # the 50 µm-ROI bench-derived starting point (MIN_ADMIT=3, CAP=3,
+    # gene-fit tiebreak, small-component damper).
+    witness_min_admit: int = 3
+    witness_cap: int = 3
+    # Small-component witness damper. An entity contributes at most
+    # ``ceil(entity_size / witness_small_component_cap_divisor)``
+    # witnesses, capped further by ``witness_cap``. Damps the influence
+    # of small entities without making them ineligible.
+    witness_small_component_cap_divisor: int = 2
+    # Tie-breaker when multiple candidates have the same (capped)
+    # witness count: "distance" (nearest-tx) or "gene_fit" (highest
+    # mean PMI of the orphan gene against the candidate's seed gene set).
+    witness_tiebreak: Literal["distance", "gene_fit"] = "gene_fit"
+
+    # ------------------------------------------------------------------
+    # Convergence-aware early exit. After each Rescue pass, compare the
+    # number admitted to the pre-pass unassigned-pool size. If the
+    # ratio falls below this threshold, break the loop. Diminishing-
+    # returns guard — saves wall on the asymptotic tail of large pools
+    # (NOSEG) while letting fast-converging runs (SEG) exit naturally.
+    #   0.0 = disabled (legacy: break only on zero admits)
+    #   0.01 = 1 % gate (recommended for Final Rescue per 2x2 bench)
+    # Applied independently to each rescue invocation (main Rescue,
+    # Post-Group Rescue, Final Rescue).
+    # ------------------------------------------------------------------
+    early_exit_admit_ratio: float = 0.0
+
+    # Post-Group Rescue pass count (the second Rescue stage in both
+    # pipelines, after Group/cascade). Pulled out of the module-global
+    # ``RESCUE_POST_GROUP_PASSES`` 2026-05-15. SEG default 3; NOSEG
+    # platform preset raises to 5 — NOSEG enters Post-Group Rescue
+    # with a much larger orphan pool, so the asymptotic admit-tail
+    # extends further.
+    post_group_passes: int = 3
 
     def __post_init__(self) -> None:
         if self.veto_mode not in ("min", "mean", "hybrid"):
@@ -186,6 +241,50 @@ class RescueConfig:
         if self.bin_size_um <= 0:
             raise ValueError(
                 f"rescue.bin_size_um must be > 0; got {self.bin_size_um}"
+            )
+        if not (0.0 <= self.aggregator_percentile <= 100.0):
+            raise ValueError(
+                f"rescue.aggregator_percentile must be in [0, 100]; "
+                f"got {self.aggregator_percentile}"
+            )
+        if self.real_signal_threshold < 0.0:
+            raise ValueError(
+                f"rescue.real_signal_threshold must be >= 0; "
+                f"got {self.real_signal_threshold}"
+            )
+        if self.rank_policy not in ("distance", "witness"):
+            raise ValueError(
+                f"rescue.rank_policy must be 'distance' or 'witness'; "
+                f"got {self.rank_policy!r}"
+            )
+        if self.witness_min_admit < 1:
+            raise ValueError(
+                f"rescue.witness_min_admit must be >= 1; "
+                f"got {self.witness_min_admit}"
+            )
+        if self.witness_cap < 1:
+            raise ValueError(
+                f"rescue.witness_cap must be >= 1; got {self.witness_cap}"
+            )
+        if self.witness_small_component_cap_divisor < 1:
+            raise ValueError(
+                f"rescue.witness_small_component_cap_divisor must be >= 1; "
+                f"got {self.witness_small_component_cap_divisor}"
+            )
+        if self.witness_tiebreak not in ("distance", "gene_fit"):
+            raise ValueError(
+                f"rescue.witness_tiebreak must be 'distance' or 'gene_fit'; "
+                f"got {self.witness_tiebreak!r}"
+            )
+        if not (0.0 <= self.early_exit_admit_ratio <= 1.0):
+            raise ValueError(
+                f"rescue.early_exit_admit_ratio must be in [0.0, 1.0]; "
+                f"got {self.early_exit_admit_ratio}"
+            )
+        if self.post_group_passes < 0:
+            raise ValueError(
+                f"rescue.post_group_passes must be >= 0; "
+                f"got {self.post_group_passes}"
             )
 
 
@@ -288,20 +387,103 @@ class GroupConfig:
             )
 
 
-# Stitch and Demote are deliberately NOT represented as dataclasses
-# here yet. Their parameters are still being tuned (e.g.
-# `deltaC_min` was just raised from 0.0 to 0.03 on 2026-05-09; the
-# Stitch decomposable-coherence + DSU + heap path is planned). Adding
-# typed configs prematurely would create a drift trap. They will be
-# added when those stages freeze. Until then, their knobs live as
-# kwargs at the call site.
-#
-# Stitch acceptance gate (2026-05-13): an optional
-# `c_union_bypass: float | None` kwarg accepts pairs that fail
-# ΔC ≥ deltaC_min when C(union) ≥ bypass. Recovers same-program
-# fragment absorptions where both parents are already at C ≈ 1.0
-# and ΔC has no headroom. Spatial-witness and candidate-source
-# gates still apply. Recommended 0.9; None = off (legacy gate).
+@dataclass(frozen=True)
+class StitchConfig:
+    """Phase 4 — hierarchical entity stitching.
+
+    Mirrors the production call in
+    ``tests/_pipeline_runner.py::run_segmented_pipeline`` (and the
+    symmetric NOSEG path) at the time of typing (2026-05-14). All
+    values are the production defaults active after the
+    `bugfix/stitch-dist-threshold` merge:
+
+      * ``deltaC_min=0.03`` (raised 0.0 → 0.03 on 2026-05-09 to prevent
+        NOSEG supercell formation; SEG insensitive).
+      * ``c_union_bypass=0.9`` + ``c_union_bypass_max_n_tx=50``: admit
+        ΔC-failing pairs when C(union) ≥ 0.9 AND merged n_tx ≤ 50.
+        Recovers within-cell fragment consolidations where both parents
+        are at C ≈ 1.0 and ΔC has no headroom; size cap keeps the
+        bypass targeted at within-cell, not cross-compartment.
+      * ``max_merger_depth=3``: post-acceptance merger-tree depth cap.
+        Blocks chain-style growth.
+      * ``min_local_tx_per_entity=3``: per-entity witness floor in the
+        shared bin neighborhood. Capped at min(threshold, entity n_tx)
+        internally.
+
+    Decomposable-coherence + DSU + heap fast path (``use_decomposable_
+    stitch=True`` in ``stitching.py``) is ⚪ PLANNED as opt-in — not
+    represented here yet.
+    """
+    # Coherence metric
+    mode: Literal["count", "primitives"] = "count"
+    metric: Literal["pmi", "npmi"] = "pmi"
+    penalize_simplicity: bool = True
+    deltaC_min: float = 0.03
+
+    # C(union) bypass for ΔC-failing pairs
+    c_union_bypass: float | None = 0.9
+    c_union_bypass_max_n_tx: int | None = 50
+
+    # Merger-tree depth cap
+    max_merger_depth: int | None = 3
+
+    # Spatial gate
+    candidate_source: Literal["grid", "delaunay"] = "grid"
+    bin_size_um: float = 2.0                    # xy bin (G)
+    g_z_um: float | None = 1.0                  # z bin; None → auto_Gz from estimator
+    z_neighbor_depth: int = 1                   # ±depth z bins
+    neighborhood: Literal["4", "8"] = "8"       # xy Moore reach
+    dist_threshold_um: float = 5.0              # max 3D distance for candidate pairs
+
+    # Witness floor (per-entity tx count in shared bin neighborhood)
+    min_local_tx_per_entity: int = 3
+
+    def __post_init__(self) -> None:
+        if not (-1.0 <= self.deltaC_min <= 1.0):
+            raise ValueError(
+                f"stitch.deltaC_min out of range: {self.deltaC_min}"
+            )
+        if self.c_union_bypass is not None and not (0.0 <= self.c_union_bypass <= 1.0):
+            raise ValueError(
+                f"stitch.c_union_bypass out of range: {self.c_union_bypass}"
+            )
+        if (self.c_union_bypass_max_n_tx is not None
+                and self.c_union_bypass_max_n_tx < 1):
+            raise ValueError(
+                f"stitch.c_union_bypass_max_n_tx must be >= 1; "
+                f"got {self.c_union_bypass_max_n_tx}"
+            )
+        if self.max_merger_depth is not None and self.max_merger_depth < 1:
+            raise ValueError(
+                f"stitch.max_merger_depth must be >= 1; got {self.max_merger_depth}"
+            )
+        if self.bin_size_um <= 0:
+            raise ValueError(
+                f"stitch.bin_size_um must be > 0; got {self.bin_size_um}"
+            )
+        if self.g_z_um is not None and self.g_z_um <= 0:
+            raise ValueError(
+                f"stitch.g_z_um must be > 0 (or None for auto); got {self.g_z_um}"
+            )
+        if self.z_neighbor_depth < 0:
+            raise ValueError(
+                f"stitch.z_neighbor_depth must be >= 0; got {self.z_neighbor_depth}"
+            )
+        if self.dist_threshold_um <= 0:
+            raise ValueError(
+                f"stitch.dist_threshold_um must be > 0; got {self.dist_threshold_um}"
+            )
+        if self.min_local_tx_per_entity < 0:
+            raise ValueError(
+                f"stitch.min_local_tx_per_entity must be >= 0; "
+                f"got {self.min_local_tx_per_entity}"
+            )
+
+
+# Mid-QC and Post-Group Rescue remain untyped for now. Mid-QC's
+# coherence-floor knob is still being tuned per-platform; Post-Group
+# Rescue shares `RescueConfig` (just runs the same call site with the
+# same knobs). Both will be promoted as their scope settles.
 
 
 @dataclass(frozen=True)
@@ -416,9 +598,17 @@ class PipelineConfig:
     phase1_reassign: Phase1ReassignConfig = field(default_factory=Phase1ReassignConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     group: GroupConfig = field(default_factory=GroupConfig)
+    stitch: StitchConfig = field(default_factory=StitchConfig)
     demote: DemoteConfig = field(default_factory=DemoteConfig)
     final_rescue: RescueConfig = field(
-        default_factory=lambda: RescueConfig(small_entity_guard_n=0)
+        default_factory=lambda: RescueConfig(
+            small_entity_guard_n=0,
+            # 2026-05-15: SEG-friendly default — 3 passes, no gate.
+            # Validated against 2×2 PDAC ROI: SEG FR pass 3 admits ~0.3%
+            # of pool (asymptote). NOSEG benefits from more passes; use
+            # `load_config(platform="noseg")` to get max_passes=5.
+            max_passes=3,
+        )
     )
     bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
 
@@ -439,6 +629,7 @@ _SECTION_TO_CLS: dict[str, type] = {
     "phase1_reassign": Phase1ReassignConfig,
     "rescue": RescueConfig,
     "group": GroupConfig,
+    "stitch": StitchConfig,
     "demote": DemoteConfig,
     "final_rescue": RescueConfig,
     "bootstrap": BootstrapConfig,

@@ -1543,6 +1543,14 @@ def reassign_unassigned_grid_pool(
     real_signal_threshold: float = 0.05,   # noise floor for "real player" PMI
     aggregator_percentile: float = 50.0,   # percentile of real-signal PMIs to gate on
                                             #   <50 = stricter, 50 = median, >50 = liberal
+    # Rank policy (default "distance" = legacy bit-exact). "witness" =
+    # capped-witness-count rank with gene-fit / distance tiebreak. See
+    # RescueConfig.rank_policy in tracer.config for full docs.
+    rank_policy: str = "distance",
+    witness_min_admit: int = 3,
+    witness_cap: int = 3,
+    witness_small_component_cap_divisor: int = 2,
+    witness_tiebreak: str = "gene_fit",
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, dict]:
     """Grid-bin rescue: distance-priority with NPMI as a negative veto.
@@ -1755,7 +1763,19 @@ def reassign_unassigned_grid_pool(
         not W_is_sparse
         and len(coord_cols) >= 2
         and veto_mode in ("min", "mean", "hybrid")
+        # Cython batch only implements distance rank; witness mode
+        # forces the Python fallback.
+        and rank_policy == "distance"
     )
+
+    # For witness mode we need entity sizes (total assigned-tx count
+    # per entity) to compute the small-component witness cap. Compute
+    # once; distance mode skips this work.
+    if rank_policy == "witness":
+        from collections import Counter as _Counter
+        entity_sizes = _Counter(assigned_entities.tolist())
+    else:
+        entity_sizes = None
     if use_cython_batch:
         from . import _cy_prune
         # Build entity-id integer codes (alphabetical ordering for determinism).
@@ -1921,6 +1941,11 @@ def reassign_unassigned_grid_pool(
         best_dist: float = float("inf")
         any_vetoed = False
         ent_decision_cache: dict[str, bool] = {}  # True = veto, False = OK
+        # Witness-mode accumulators (populated unconditionally — used
+        # only when ``rank_policy == "witness"``; the bookkeeping cost
+        # is negligible).
+        ent_to_witness: dict[str, int] = {}
+        ent_to_min_d: dict[str, float] = {}
         for li_local, d in zip(local_li.tolist(), dists.tolist()):
             ent = assigned_entities[li_local]
             ent_set = entity_genes_lookup.get(ent, frozenset())
@@ -2013,9 +2038,74 @@ def reassign_unassigned_grid_pool(
             if vetoed:
                 any_vetoed = True
                 continue
+            # Witness-mode bookkeeping (no-op for distance branch
+            # consumers — distance mode never reads these dicts).
+            ent_to_witness[ent] = ent_to_witness.get(ent, 0) + 1
+            if ent not in ent_to_min_d or d < ent_to_min_d[ent]:
+                ent_to_min_d[ent] = float(d)
+            # Distance branch: greedy nearest tracker (unchanged).
             if d < best_dist:
                 best_dist = float(d)
                 best_ent = ent
+
+        # Post-loop rank policy dispatch.
+        if rank_policy == "witness":
+            # Re-rank using accumulated witness stats. Overrides the
+            # greedy `best_ent`/`best_dist` set above.
+            best_ent = None
+            best_dist = float("inf")
+            best_w = 0
+            best_tb = float("-inf")  # higher = better tiebreak
+            for ent, raw_w in ent_to_witness.items():
+                ent_size = entity_sizes.get(ent, raw_w) if entity_sizes else raw_w
+                small_cap = math.ceil(
+                    ent_size / max(1, witness_small_component_cap_divisor)
+                )
+                w_eff = min(raw_w, witness_cap, small_cap)
+                if w_eff < witness_min_admit:
+                    continue
+                # Tiebreaker
+                if witness_tiebreak == "gene_fit":
+                    ent_set = entity_genes_lookup.get(ent, frozenset())
+                    if not ent_set:
+                        tb = -1e9
+                    else:
+                        # Lazily fetch row_g if veto path didn't already
+                        if row_g is None:
+                            if W_is_sparse:
+                                row_g = np.asarray(
+                                    W.getrow(int(g_idx)).todense()
+                                ).ravel()
+                            else:
+                                row_g = np.asarray(W[int(g_idx)])
+                        ent_arr = np.asarray(sorted(ent_set), dtype=np.int64)
+                        # Drop self-pair if present
+                        if int(g_idx) in ent_set:
+                            ent_arr = ent_arr[ent_arr != int(g_idx)]
+                        if ent_arr.size == 0:
+                            tb = -1e9
+                        else:
+                            pmis = row_g[ent_arr]
+                            finite_pmis = pmis[np.isfinite(pmis)]
+                            tb = (float(finite_pmis.mean())
+                                  if finite_pmis.size else -1e9)
+                else:  # "distance"
+                    tb = -ent_to_min_d[ent]   # negate so higher = nearer
+                # Lex pick: w_eff desc, tb desc, entity_id asc (for
+                # deterministic tie-breaking on exact ties).
+                pick = (
+                    best_ent is None
+                    or w_eff > best_w
+                    or (w_eff == best_w and tb > best_tb)
+                    or (w_eff == best_w and tb == best_tb
+                        and ent < best_ent)
+                )
+                if pick:
+                    best_w = w_eff
+                    best_tb = tb
+                    best_ent = ent
+                    best_dist = ent_to_min_d[ent]
+
         if best_ent is None:
             if any_vetoed:
                 n_blocked_by_neg_veto += 1
@@ -2108,6 +2198,12 @@ def pre_stage2_rescue(
     real_signal_threshold: float = 0.05,   # noise floor for "real player" PMI
     aggregator_percentile: float = 50.0,   # percentile of real-signal PMIs to gate on
                                             #   <50 = stricter, 50 = median, >50 = liberal
+    # Rank policy passthrough — see `reassign_unassigned_grid_pool`.
+    rank_policy: str = "distance",
+    witness_min_admit: int = 3,
+    witness_cap: int = 3,
+    witness_small_component_cap_divisor: int = 2,
+    witness_tiebreak: str = "gene_fit",
     pos_npmi_threshold=None,  # deprecated; ignored. Kept for back-compat.
 ) -> tuple[pd.DataFrame, int, int, dict]:
     """Pre-Stage-2 rescue: tight-scale NPMI-categorical reassignment of
@@ -2199,6 +2295,11 @@ def pre_stage2_rescue(
         min_admit_threshold=min_admit_threshold,
         real_signal_threshold=real_signal_threshold,
         aggregator_percentile=aggregator_percentile,
+        rank_policy=rank_policy,
+        witness_min_admit=witness_min_admit,
+        witness_cap=witness_cap,
+        witness_small_component_cap_divisor=witness_small_component_cap_divisor,
+        witness_tiebreak=witness_tiebreak,
     )
 
     # Restore: any tx still holding SHIELD_LABEL after rescue → reset to

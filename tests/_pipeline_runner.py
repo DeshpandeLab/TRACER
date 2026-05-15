@@ -1278,16 +1278,104 @@ def _grid_self_graph_fn(df_in, *, k=None, dist_threshold=None,
     )
 
 
+def _resolve_pipeline_cfg(cfg):
+    """Resolve a `PipelineConfig` for the runner — Phase B of config
+    migration.
+
+    When ``cfg`` is provided, it is returned as-is. When ``cfg is None``
+    (the legacy call path), a `PipelineConfig` is **built from the
+    current module-global constants** so that every cfg consumer below
+    sees today's production values bit-for-bit. The module globals are
+    read at call time so test monkey-patches still take effect.
+
+    Determinism guarantee (verified by the determinism bench in
+    ``benchmarks/bench_pdac_roi_seed_determinism.py``):
+    ``run_*_pipeline(df, panel, cfg=None)`` produces a partition
+    bit-identical to ``run_*_pipeline(df, panel, cfg=load_config())``.
+    Knobs not yet represented in `PipelineConfig` (Phase-1 prune,
+    Group, post-group-pass-count, Mid-QC) remain read from the module
+    globals at their call sites — wire them in subsequent Phase-B
+    increments.
+    """
+    if cfg is not None:
+        return cfg
+    from tracer.config import (
+        DemoteConfig,
+        PipelineConfig,
+        RescueConfig,
+        StitchConfig,
+    )
+    rescue_kwargs = dict(
+        veto_mode=RESCUE_VETO_MODE,
+        min_admit_threshold=RESCUE_MIN_ADMIT,
+        mean_admit_threshold=RESCUE_MEAN_ADMIT,
+        neg_threshold=RESCUE_NEG_THR,
+        max_passes=RESCUE_MAX_PASSES,
+        bin_size_um=2.0,
+        z_bound_um=None,
+        cluster_guard_n=3,
+        small_entity_guard_n=0,
+        aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
+        real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+        post_group_passes=RESCUE_POST_GROUP_PASSES,
+    )
+    rescue_cfg = RescueConfig(**rescue_kwargs)
+    # Final Rescue: SEG-friendly default of 3 passes (matches the
+    # promoted 2026-05-15 setting). NOSEG users load via
+    # `load_config(platform="noseg")` to get 5 passes instead.
+    final_rescue_kwargs = {
+        **rescue_kwargs,
+        "max_passes": 3,
+    }
+    final_rescue_cfg = RescueConfig(**final_rescue_kwargs)
+    stitch_cfg = StitchConfig(
+        mode="count", metric="pmi", penalize_simplicity=True,
+        deltaC_min=0.03,
+        c_union_bypass=STITCH_C_UNION_BYPASS,
+        c_union_bypass_max_n_tx=STITCH_C_UNION_BYPASS_MAX_N_TX,
+        max_merger_depth=STITCH_MAX_MERGER_DEPTH,
+        candidate_source="grid",
+        bin_size_um=2.0,
+        g_z_um=STITCH_GZ_UM,
+        z_neighbor_depth=1,
+        neighborhood="8",
+        dist_threshold_um=5.0,
+        min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
+    )
+    demote_cfg = DemoteConfig(min_size=5)
+    return PipelineConfig(
+        rescue=rescue_cfg,
+        stitch=stitch_cfg,
+        demote=demote_cfg,
+        final_rescue=final_rescue_cfg,
+    )
+
+
 def run_segmented_pipeline(df: pd.DataFrame,
-                           npmi_panel: pd.DataFrame
+                           npmi_panel: pd.DataFrame,
+                           cfg=None,
                            ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Run the segmented workflow on ``df`` (must have ``cell_id`` set).
+
+    Parameters
+    ----------
+    df, npmi_panel
+        Input transcripts (with ``cell_id``) and bootstrap PMI panel.
+    cfg : PipelineConfig | None, optional
+        Phase-B config. When ``None`` (default), a `PipelineConfig` is
+        built from the current module-global constants so today's
+        production behavior is preserved bit-exactly (see
+        `_resolve_pipeline_cfg`). When provided, drives the Rescue,
+        Stitch, Demote, and Final Rescue call sites. Knobs not yet in
+        `PipelineConfig` (Phase-1 prune, Group, post-group-pass-count)
+        continue to read from module globals.
 
     Returns
     -------
     df_final : DataFrame with ``stitched`` column carrying the final per-tx label.
     stage_progression : list of state dicts, one per stage.
     """
+    cfg = _resolve_pipeline_cfg(cfg)
     progression: list[dict[str, Any]] = []
     _record_stage(progression, "input", df.assign(_lbl=df["cell_id"].astype(str)), "_lbl")
 
@@ -1417,19 +1505,26 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # residual into orphan UNASSIGNED_* components.
     df_rescued = df_pruned
     n_rescued = 0
-    for _pass in range(RESCUE_MAX_PASSES):
+    for _pass in range(cfg.rescue.max_passes):
         df_rescued, n_pass_rescued, _, _ = pre_stage2_rescue(
             df_rescued, aux=aux,
             entity_col="tracer_id", gene_col="feature_name",
             coord_cols=("x", "y", "z"), out_col="tracer_id",
-            G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
-            cluster_guard_n=3,
-            veto_mode=RESCUE_VETO_MODE,
-            mean_threshold=RESCUE_MEAN_ADMIT,
-            min_admit_threshold=RESCUE_MIN_ADMIT,
-            small_entity_guard_n=0,
-            real_signal_threshold=REAL_SIGNAL_THRESHOLD,
-            aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
+            G=cfg.rescue.bin_size_um,
+            pos_npmi_threshold=PMI_THR,
+            neg_npmi_threshold=cfg.rescue.neg_threshold,
+            cluster_guard_n=cfg.rescue.cluster_guard_n,
+            veto_mode=cfg.rescue.veto_mode,
+            mean_threshold=cfg.rescue.mean_admit_threshold,
+            min_admit_threshold=cfg.rescue.min_admit_threshold,
+            small_entity_guard_n=cfg.rescue.small_entity_guard_n,
+            real_signal_threshold=cfg.rescue.real_signal_threshold,
+            aggregator_percentile=cfg.rescue.aggregator_percentile,
+            rank_policy=cfg.rescue.rank_policy,
+            witness_min_admit=cfg.rescue.witness_min_admit,
+            witness_cap=cfg.rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.rescue.witness_tiebreak,
         )
         n_rescued += n_pass_rescued
         if n_pass_rescued == 0:
@@ -1484,21 +1579,27 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # Post-Group Rescue (opt-in). Admits any remaining "-1" tx to
     # Phase-1 entities AND Group components — closing the gap where
     # Group's UNASSIGNED_* couldn't be Rescue targets in the main pass.
-    if RESCUE_POST_GROUP_PASSES > 0:
-        for _pass in range(RESCUE_POST_GROUP_PASSES):
+    if cfg.rescue.post_group_passes > 0:
+        for _pass in range(cfg.rescue.post_group_passes):
             df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
                 df_grouped, aux=aux,
                 entity_col="tracer_id", gene_col="feature_name",
                 coord_cols=("x", "y", "z"), out_col="tracer_id",
-                G=2.0, pos_npmi_threshold=PMI_THR,
-                neg_npmi_threshold=RESCUE_NEG_THR,
-                cluster_guard_n=3,
-                veto_mode=RESCUE_VETO_MODE,
-                mean_threshold=RESCUE_MEAN_ADMIT,
-                min_admit_threshold=RESCUE_MIN_ADMIT,
-                small_entity_guard_n=0,
-                real_signal_threshold=REAL_SIGNAL_THRESHOLD,
-                aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
+                G=cfg.rescue.bin_size_um,
+                pos_npmi_threshold=PMI_THR,
+                neg_npmi_threshold=cfg.rescue.neg_threshold,
+                cluster_guard_n=cfg.rescue.cluster_guard_n,
+                veto_mode=cfg.rescue.veto_mode,
+                mean_threshold=cfg.rescue.mean_admit_threshold,
+                min_admit_threshold=cfg.rescue.min_admit_threshold,
+                small_entity_guard_n=cfg.rescue.small_entity_guard_n,
+                real_signal_threshold=cfg.rescue.real_signal_threshold,
+                aggregator_percentile=cfg.rescue.aggregator_percentile,
+                rank_policy=cfg.rescue.rank_policy,
+                witness_min_admit=cfg.rescue.witness_min_admit,
+                witness_cap=cfg.rescue.witness_cap,
+                witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+                witness_tiebreak=cfg.rescue.witness_tiebreak,
             )
             if n_pass_rescued == 0:
                 break
@@ -1516,40 +1617,64 @@ def run_segmented_pipeline(df: pd.DataFrame,
         df_final=df_grouped, aux=aux,
         entity_col="tracer_id", gene_col="feature_name",
         coord_cols=("x", "y", "z"),
-        mode="count", threshold=PMI_THR, metric="pmi",
-        penalize_simplicity=True, deltaC_min=0.03,
-        c_union_bypass=STITCH_C_UNION_BYPASS,
-        c_union_bypass_max_n_tx=STITCH_C_UNION_BYPASS_MAX_N_TX,
-        max_merger_depth=STITCH_MAX_MERGER_DEPTH,
-        dist_threshold=5.0, out_col="stitched", show_progress=False,
-        candidate_source="grid", G=2.0, stitch_neighborhood="8",
-        G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else auto_Gz),
-        z_neighbor_depth=1,
-        min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
+        mode=cfg.stitch.mode, threshold=PMI_THR, metric=cfg.stitch.metric,
+        penalize_simplicity=cfg.stitch.penalize_simplicity,
+        deltaC_min=cfg.stitch.deltaC_min,
+        c_union_bypass=cfg.stitch.c_union_bypass,
+        c_union_bypass_max_n_tx=cfg.stitch.c_union_bypass_max_n_tx,
+        max_merger_depth=cfg.stitch.max_merger_depth,
+        dist_threshold=cfg.stitch.dist_threshold_um,
+        out_col="stitched", show_progress=False,
+        candidate_source=cfg.stitch.candidate_source,
+        G=cfg.stitch.bin_size_um,
+        stitch_neighborhood=cfg.stitch.neighborhood,
+        G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else auto_Gz),
+        z_neighbor_depth=cfg.stitch.z_neighbor_depth,
+        min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
     # Demote
     df_stitched, n_demoted = demote_small_entities(
         df_stitched, entity_col="stitched", out_col="stitched",
-        min_size=5, unassigned_label="-1",
+        min_size=cfg.demote.min_size, unassigned_label="-1",
     )
     _record_stage(progression, "Demote", df_stitched, "stitched")
 
-    # Final Rescue
-    df_stitched, n_reassigned, _ = reassign_unassigned_grid_pool(
-        df_stitched, aux=aux,
-        entity_col="stitched", gene_col="feature_name",
-        coord_cols=("x", "y", "z"), out_col="stitched",
-        G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
-        only_partial_component=False,
-        veto_mode=RESCUE_VETO_MODE,
-        mean_threshold=RESCUE_MEAN_ADMIT,
-        min_admit_threshold=RESCUE_MIN_ADMIT,
-        small_entity_guard_n=0,
-        real_signal_threshold=REAL_SIGNAL_THRESHOLD,
-        aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
-    )
+    # Final Rescue — iterative with two exit conditions:
+    #   (a) hard ceiling at cfg.final_rescue.max_passes
+    #   (b) convergence gate at early_exit_admit_ratio (if > 0): break
+    #       when a pass admits fewer than ratio * pre-pass-pool tx.
+    for _pass in range(cfg.final_rescue.max_passes):
+        df_stitched, n_reassigned, stats = reassign_unassigned_grid_pool(
+            df_stitched, aux=aux,
+            entity_col="stitched", gene_col="feature_name",
+            coord_cols=("x", "y", "z"), out_col="stitched",
+            G=cfg.final_rescue.bin_size_um,
+            pos_npmi_threshold=PMI_THR,
+            neg_npmi_threshold=cfg.final_rescue.neg_threshold,
+            only_partial_component=False,
+            veto_mode=cfg.final_rescue.veto_mode,
+            mean_threshold=cfg.final_rescue.mean_admit_threshold,
+            min_admit_threshold=cfg.final_rescue.min_admit_threshold,
+            small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
+            real_signal_threshold=cfg.final_rescue.real_signal_threshold,
+            aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+            rank_policy=cfg.final_rescue.rank_policy,
+            witness_min_admit=cfg.final_rescue.witness_min_admit,
+            witness_cap=cfg.final_rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.final_rescue.witness_tiebreak,
+        )
+        if n_reassigned == 0:
+            break
+        # Convergence gate (no-op when early_exit_admit_ratio == 0.0).
+        n_un_before = int(stats.get("total_unassigned", 0))
+        if (cfg.final_rescue.early_exit_admit_ratio > 0.0
+                and n_un_before > 0
+                and (n_reassigned / n_un_before
+                     < cfg.final_rescue.early_exit_admit_ratio)):
+            break
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
     # Finalize: collapse all stage-rejected / sentinel labels in the
@@ -1566,7 +1691,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
     return df_stitched, progression
 
 
-def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
+def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
+                       cfg=None,
                        ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Run the no-segmentation workflow on ``df``.
 
@@ -1580,7 +1706,17 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
     unchanged. With z constant, ``z_neighborhood_depth`` is a no-op —
     every transcript lands in the same z-bin and any depth ≥ 0 admits
     every candidate pair.
+
+    Parameters
+    ----------
+    df, npmi_panel
+        Input transcripts and bootstrap PMI panel.
+    cfg : PipelineConfig | None, optional
+        Phase-B config. See `run_segmented_pipeline` for semantics —
+        when ``None`` (default) a config is built from module globals
+        to preserve today's behavior bit-exactly.
     """
+    cfg = _resolve_pipeline_cfg(cfg)
     df = df.copy()
     if "z" not in df.columns:
         df["z"] = 0.0
@@ -1647,21 +1783,27 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
 
     # Post-Group Rescue (opt-in) — see segmented runner for rationale.
-    if RESCUE_POST_GROUP_PASSES > 0:
-        for _pass in range(RESCUE_POST_GROUP_PASSES):
+    if cfg.rescue.post_group_passes > 0:
+        for _pass in range(cfg.rescue.post_group_passes):
             df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
                 df_grouped, aux=aux,
                 entity_col="tracer_id", gene_col="feature_name",
                 coord_cols=("x", "y", "z"), out_col="tracer_id",
-                G=2.0, pos_npmi_threshold=PMI_THR,
-                neg_npmi_threshold=RESCUE_NEG_THR,
-                cluster_guard_n=3,
-                veto_mode=RESCUE_VETO_MODE,
-                mean_threshold=RESCUE_MEAN_ADMIT,
-                min_admit_threshold=RESCUE_MIN_ADMIT,
-                small_entity_guard_n=0,
-                real_signal_threshold=REAL_SIGNAL_THRESHOLD,
-                aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
+                G=cfg.rescue.bin_size_um,
+                pos_npmi_threshold=PMI_THR,
+                neg_npmi_threshold=cfg.rescue.neg_threshold,
+                cluster_guard_n=cfg.rescue.cluster_guard_n,
+                veto_mode=cfg.rescue.veto_mode,
+                mean_threshold=cfg.rescue.mean_admit_threshold,
+                min_admit_threshold=cfg.rescue.min_admit_threshold,
+                small_entity_guard_n=cfg.rescue.small_entity_guard_n,
+                real_signal_threshold=cfg.rescue.real_signal_threshold,
+                aggregator_percentile=cfg.rescue.aggregator_percentile,
+                rank_policy=cfg.rescue.rank_policy,
+                witness_min_admit=cfg.rescue.witness_min_admit,
+                witness_cap=cfg.rescue.witness_cap,
+                witness_small_component_cap_divisor=cfg.rescue.witness_small_component_cap_divisor,
+                witness_tiebreak=cfg.rescue.witness_tiebreak,
             )
             if n_pass_rescued == 0:
                 break
@@ -1673,40 +1815,64 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame
         df_final=df_grouped, aux=aux,
         entity_col="tracer_id", gene_col="feature_name",
         coord_cols=("x", "y", "z"),
-        mode="count", threshold=PMI_THR, metric="pmi",
-        penalize_simplicity=True, deltaC_min=0.03,
-        c_union_bypass=STITCH_C_UNION_BYPASS,
-        c_union_bypass_max_n_tx=STITCH_C_UNION_BYPASS_MAX_N_TX,
-        max_merger_depth=STITCH_MAX_MERGER_DEPTH,
-        dist_threshold=5.0, out_col="stitched", show_progress=False,
-        candidate_source="grid", G=2.0, stitch_neighborhood="8",
-        G_z=(STITCH_GZ_UM if STITCH_GZ_UM is not None else 1.0),
-        z_neighbor_depth=1,
-        min_local_tx_per_entity=STITCH_MIN_LOCAL_TX,
+        mode=cfg.stitch.mode, threshold=PMI_THR, metric=cfg.stitch.metric,
+        penalize_simplicity=cfg.stitch.penalize_simplicity,
+        deltaC_min=cfg.stitch.deltaC_min,
+        c_union_bypass=cfg.stitch.c_union_bypass,
+        c_union_bypass_max_n_tx=cfg.stitch.c_union_bypass_max_n_tx,
+        max_merger_depth=cfg.stitch.max_merger_depth,
+        dist_threshold=cfg.stitch.dist_threshold_um,
+        out_col="stitched", show_progress=False,
+        candidate_source=cfg.stitch.candidate_source,
+        G=cfg.stitch.bin_size_um,
+        stitch_neighborhood=cfg.stitch.neighborhood,
+        G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else 1.0),
+        z_neighbor_depth=cfg.stitch.z_neighbor_depth,
+        min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
     # Demote
     df_stitched, n_demoted = demote_small_entities(
         df_stitched, entity_col="stitched", out_col="stitched",
-        min_size=5, unassigned_label="-1",
+        min_size=cfg.demote.min_size, unassigned_label="-1",
     )
     _record_stage(progression, "Demote", df_stitched, "stitched")
 
-    # Final Rescue
-    df_stitched, n_reassigned, _ = reassign_unassigned_grid_pool(
-        df_stitched, aux=aux,
-        entity_col="stitched", gene_col="feature_name",
-        coord_cols=("x", "y", "z"), out_col="stitched",
-        G=2.0, pos_npmi_threshold=PMI_THR, neg_npmi_threshold=RESCUE_NEG_THR,
-        only_partial_component=False,
-        veto_mode=RESCUE_VETO_MODE,
-        mean_threshold=RESCUE_MEAN_ADMIT,
-        min_admit_threshold=RESCUE_MIN_ADMIT,
-        small_entity_guard_n=0,
-        real_signal_threshold=REAL_SIGNAL_THRESHOLD,
-        aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
-    )
+    # Final Rescue — iterative with two exit conditions:
+    #   (a) hard ceiling at cfg.final_rescue.max_passes
+    #   (b) convergence gate at early_exit_admit_ratio (if > 0): break
+    #       when a pass admits fewer than ratio * pre-pass-pool tx.
+    for _pass in range(cfg.final_rescue.max_passes):
+        df_stitched, n_reassigned, stats = reassign_unassigned_grid_pool(
+            df_stitched, aux=aux,
+            entity_col="stitched", gene_col="feature_name",
+            coord_cols=("x", "y", "z"), out_col="stitched",
+            G=cfg.final_rescue.bin_size_um,
+            pos_npmi_threshold=PMI_THR,
+            neg_npmi_threshold=cfg.final_rescue.neg_threshold,
+            only_partial_component=False,
+            veto_mode=cfg.final_rescue.veto_mode,
+            mean_threshold=cfg.final_rescue.mean_admit_threshold,
+            min_admit_threshold=cfg.final_rescue.min_admit_threshold,
+            small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
+            real_signal_threshold=cfg.final_rescue.real_signal_threshold,
+            aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+            rank_policy=cfg.final_rescue.rank_policy,
+            witness_min_admit=cfg.final_rescue.witness_min_admit,
+            witness_cap=cfg.final_rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.final_rescue.witness_tiebreak,
+        )
+        if n_reassigned == 0:
+            break
+        # Convergence gate (no-op when early_exit_admit_ratio == 0.0).
+        n_un_before = int(stats.get("total_unassigned", 0))
+        if (cfg.final_rescue.early_exit_admit_ratio > 0.0
+                and n_un_before > 0
+                and (n_reassigned / n_un_before
+                     < cfg.final_rescue.early_exit_admit_ratio)):
+            break
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
     # Finalize unassigned-class labels → "DROP" (see segmented runner
