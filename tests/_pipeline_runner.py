@@ -1317,11 +1317,17 @@ def _resolve_pipeline_cfg(cfg):
         small_entity_guard_n=0,
         aggregator_percentile=RESCUE_AGGREGATOR_PERCENTILE,
         real_signal_threshold=REAL_SIGNAL_THRESHOLD,
+        post_group_passes=RESCUE_POST_GROUP_PASSES,
     )
     rescue_cfg = RescueConfig(**rescue_kwargs)
-    # Final Rescue is a single-pass invocation in the runner (no loop);
-    # the `max_passes` field is ignored at that call site.
-    final_rescue_cfg = RescueConfig(**rescue_kwargs)
+    # Final Rescue: SEG-friendly default of 3 passes (matches the
+    # promoted 2026-05-15 setting). NOSEG users load via
+    # `load_config(platform="noseg")` to get 5 passes instead.
+    final_rescue_kwargs = {
+        **rescue_kwargs,
+        "max_passes": 3,
+    }
+    final_rescue_cfg = RescueConfig(**final_rescue_kwargs)
     stitch_cfg = StitchConfig(
         mode="count", metric="pmi", penalize_simplicity=True,
         deltaC_min=0.03,
@@ -1573,8 +1579,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # Post-Group Rescue (opt-in). Admits any remaining "-1" tx to
     # Phase-1 entities AND Group components — closing the gap where
     # Group's UNASSIGNED_* couldn't be Rescue targets in the main pass.
-    if RESCUE_POST_GROUP_PASSES > 0:
-        for _pass in range(RESCUE_POST_GROUP_PASSES):
+    if cfg.rescue.post_group_passes > 0:
+        for _pass in range(cfg.rescue.post_group_passes):
             df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
                 df_grouped, aux=aux,
                 entity_col="tracer_id", gene_col="feature_name",
@@ -1635,27 +1641,40 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Demote", df_stitched, "stitched")
 
-    # Final Rescue
-    df_stitched, n_reassigned, _ = reassign_unassigned_grid_pool(
-        df_stitched, aux=aux,
-        entity_col="stitched", gene_col="feature_name",
-        coord_cols=("x", "y", "z"), out_col="stitched",
-        G=cfg.final_rescue.bin_size_um,
-        pos_npmi_threshold=PMI_THR,
-        neg_npmi_threshold=cfg.final_rescue.neg_threshold,
-        only_partial_component=False,
-        veto_mode=cfg.final_rescue.veto_mode,
-        mean_threshold=cfg.final_rescue.mean_admit_threshold,
-        min_admit_threshold=cfg.final_rescue.min_admit_threshold,
-        small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
-        real_signal_threshold=cfg.final_rescue.real_signal_threshold,
-        aggregator_percentile=cfg.final_rescue.aggregator_percentile,
-        rank_policy=cfg.final_rescue.rank_policy,
-        witness_min_admit=cfg.final_rescue.witness_min_admit,
-        witness_cap=cfg.final_rescue.witness_cap,
-        witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
-        witness_tiebreak=cfg.final_rescue.witness_tiebreak,
-    )
+    # Final Rescue — iterative with two exit conditions:
+    #   (a) hard ceiling at cfg.final_rescue.max_passes
+    #   (b) convergence gate at early_exit_admit_ratio (if > 0): break
+    #       when a pass admits fewer than ratio * pre-pass-pool tx.
+    for _pass in range(cfg.final_rescue.max_passes):
+        df_stitched, n_reassigned, stats = reassign_unassigned_grid_pool(
+            df_stitched, aux=aux,
+            entity_col="stitched", gene_col="feature_name",
+            coord_cols=("x", "y", "z"), out_col="stitched",
+            G=cfg.final_rescue.bin_size_um,
+            pos_npmi_threshold=PMI_THR,
+            neg_npmi_threshold=cfg.final_rescue.neg_threshold,
+            only_partial_component=False,
+            veto_mode=cfg.final_rescue.veto_mode,
+            mean_threshold=cfg.final_rescue.mean_admit_threshold,
+            min_admit_threshold=cfg.final_rescue.min_admit_threshold,
+            small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
+            real_signal_threshold=cfg.final_rescue.real_signal_threshold,
+            aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+            rank_policy=cfg.final_rescue.rank_policy,
+            witness_min_admit=cfg.final_rescue.witness_min_admit,
+            witness_cap=cfg.final_rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.final_rescue.witness_tiebreak,
+        )
+        if n_reassigned == 0:
+            break
+        # Convergence gate (no-op when early_exit_admit_ratio == 0.0).
+        n_un_before = int(stats.get("total_unassigned", 0))
+        if (cfg.final_rescue.early_exit_admit_ratio > 0.0
+                and n_un_before > 0
+                and (n_reassigned / n_un_before
+                     < cfg.final_rescue.early_exit_admit_ratio)):
+            break
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
     # Finalize: collapse all stage-rejected / sentinel labels in the
@@ -1764,8 +1783,8 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
         _record_stage(progression, "Mid-QC", df_grouped, "tracer_id")
 
     # Post-Group Rescue (opt-in) — see segmented runner for rationale.
-    if RESCUE_POST_GROUP_PASSES > 0:
-        for _pass in range(RESCUE_POST_GROUP_PASSES):
+    if cfg.rescue.post_group_passes > 0:
+        for _pass in range(cfg.rescue.post_group_passes):
             df_grouped, n_pass_rescued, _, _ = pre_stage2_rescue(
                 df_grouped, aux=aux,
                 entity_col="tracer_id", gene_col="feature_name",
@@ -1820,27 +1839,40 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
     )
     _record_stage(progression, "Demote", df_stitched, "stitched")
 
-    # Final Rescue
-    df_stitched, n_reassigned, _ = reassign_unassigned_grid_pool(
-        df_stitched, aux=aux,
-        entity_col="stitched", gene_col="feature_name",
-        coord_cols=("x", "y", "z"), out_col="stitched",
-        G=cfg.final_rescue.bin_size_um,
-        pos_npmi_threshold=PMI_THR,
-        neg_npmi_threshold=cfg.final_rescue.neg_threshold,
-        only_partial_component=False,
-        veto_mode=cfg.final_rescue.veto_mode,
-        mean_threshold=cfg.final_rescue.mean_admit_threshold,
-        min_admit_threshold=cfg.final_rescue.min_admit_threshold,
-        small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
-        real_signal_threshold=cfg.final_rescue.real_signal_threshold,
-        aggregator_percentile=cfg.final_rescue.aggregator_percentile,
-        rank_policy=cfg.final_rescue.rank_policy,
-        witness_min_admit=cfg.final_rescue.witness_min_admit,
-        witness_cap=cfg.final_rescue.witness_cap,
-        witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
-        witness_tiebreak=cfg.final_rescue.witness_tiebreak,
-    )
+    # Final Rescue — iterative with two exit conditions:
+    #   (a) hard ceiling at cfg.final_rescue.max_passes
+    #   (b) convergence gate at early_exit_admit_ratio (if > 0): break
+    #       when a pass admits fewer than ratio * pre-pass-pool tx.
+    for _pass in range(cfg.final_rescue.max_passes):
+        df_stitched, n_reassigned, stats = reassign_unassigned_grid_pool(
+            df_stitched, aux=aux,
+            entity_col="stitched", gene_col="feature_name",
+            coord_cols=("x", "y", "z"), out_col="stitched",
+            G=cfg.final_rescue.bin_size_um,
+            pos_npmi_threshold=PMI_THR,
+            neg_npmi_threshold=cfg.final_rescue.neg_threshold,
+            only_partial_component=False,
+            veto_mode=cfg.final_rescue.veto_mode,
+            mean_threshold=cfg.final_rescue.mean_admit_threshold,
+            min_admit_threshold=cfg.final_rescue.min_admit_threshold,
+            small_entity_guard_n=cfg.final_rescue.small_entity_guard_n,
+            real_signal_threshold=cfg.final_rescue.real_signal_threshold,
+            aggregator_percentile=cfg.final_rescue.aggregator_percentile,
+            rank_policy=cfg.final_rescue.rank_policy,
+            witness_min_admit=cfg.final_rescue.witness_min_admit,
+            witness_cap=cfg.final_rescue.witness_cap,
+            witness_small_component_cap_divisor=cfg.final_rescue.witness_small_component_cap_divisor,
+            witness_tiebreak=cfg.final_rescue.witness_tiebreak,
+        )
+        if n_reassigned == 0:
+            break
+        # Convergence gate (no-op when early_exit_admit_ratio == 0.0).
+        n_un_before = int(stats.get("total_unassigned", 0))
+        if (cfg.final_rescue.early_exit_admit_ratio > 0.0
+                and n_un_before > 0
+                and (n_reassigned / n_un_before
+                     < cfg.final_rescue.early_exit_admit_ratio)):
+            break
     _record_stage(progression, "Final Rescue", df_stitched, "stitched")
 
     # Finalize unassigned-class labels → "DROP" (see segmented runner

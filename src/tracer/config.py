@@ -208,6 +208,27 @@ class RescueConfig:
     # mean PMI of the orphan gene against the candidate's seed gene set).
     witness_tiebreak: Literal["distance", "gene_fit"] = "gene_fit"
 
+    # ------------------------------------------------------------------
+    # Convergence-aware early exit. After each Rescue pass, compare the
+    # number admitted to the pre-pass unassigned-pool size. If the
+    # ratio falls below this threshold, break the loop. Diminishing-
+    # returns guard — saves wall on the asymptotic tail of large pools
+    # (NOSEG) while letting fast-converging runs (SEG) exit naturally.
+    #   0.0 = disabled (legacy: break only on zero admits)
+    #   0.01 = 1 % gate (recommended for Final Rescue per 2x2 bench)
+    # Applied independently to each rescue invocation (main Rescue,
+    # Post-Group Rescue, Final Rescue).
+    # ------------------------------------------------------------------
+    early_exit_admit_ratio: float = 0.0
+
+    # Post-Group Rescue pass count (the second Rescue stage in both
+    # pipelines, after Group/cascade). Pulled out of the module-global
+    # ``RESCUE_POST_GROUP_PASSES`` 2026-05-15. SEG default 3; NOSEG
+    # platform preset raises to 5 — NOSEG enters Post-Group Rescue
+    # with a much larger orphan pool, so the asymptotic admit-tail
+    # extends further.
+    post_group_passes: int = 3
+
     def __post_init__(self) -> None:
         if self.veto_mode not in ("min", "mean", "hybrid"):
             raise ValueError(
@@ -254,6 +275,16 @@ class RescueConfig:
             raise ValueError(
                 f"rescue.witness_tiebreak must be 'distance' or 'gene_fit'; "
                 f"got {self.witness_tiebreak!r}"
+            )
+        if not (0.0 <= self.early_exit_admit_ratio <= 1.0):
+            raise ValueError(
+                f"rescue.early_exit_admit_ratio must be in [0.0, 1.0]; "
+                f"got {self.early_exit_admit_ratio}"
+            )
+        if self.post_group_passes < 0:
+            raise ValueError(
+                f"rescue.post_group_passes must be >= 0; "
+                f"got {self.post_group_passes}"
             )
 
 
@@ -570,7 +601,14 @@ class PipelineConfig:
     stitch: StitchConfig = field(default_factory=StitchConfig)
     demote: DemoteConfig = field(default_factory=DemoteConfig)
     final_rescue: RescueConfig = field(
-        default_factory=lambda: RescueConfig(small_entity_guard_n=0)
+        default_factory=lambda: RescueConfig(
+            small_entity_guard_n=0,
+            # 2026-05-15: SEG-friendly default — 3 passes, no gate.
+            # Validated against 2×2 PDAC ROI: SEG FR pass 3 admits ~0.3%
+            # of pool (asymptote). NOSEG benefits from more passes; use
+            # `load_config(platform="noseg")` to get max_passes=5.
+            max_passes=3,
+        )
     )
     bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
 

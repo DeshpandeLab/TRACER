@@ -166,6 +166,20 @@ witness_small_component_cap_divisor = 2
 #   "gene_fit" : highest mean PMI(orphan gene, entity seed) wins.
 witness_tiebreak = "gene_fit"
 
+# Convergence-aware early exit. After each rescue pass, the loop
+# compares n_reassigned to the pre-pass unassigned-pool size; if the
+# ratio falls below this threshold, break before the next pass.
+# 0.0 = disabled (legacy: only break on zero admits). Set > 0 for a
+# defensive guard against high-max_passes misconfigs; otherwise leave
+# at 0.0 and use max_passes as the explicit cap.
+early_exit_admit_ratio = 0.0
+
+# Post-Group Rescue passes. SEG default 3. NOSEG platform preset
+# raises to 5 — NOSEG enters Post-Group with a much larger orphan pool
+# (no Xenium prior anchored Phase-1). Each pass is bounded by zero-
+# admit exit anyway. Set 0 to disable the Post-Group stage entirely.
+post_group_passes = 3
+
 
 # ---------------------------------------------------------------------
 # Group — entity grouping. Two backends, selected per-pipeline by
@@ -274,7 +288,7 @@ min_local_tx_per_entity = 3
 
 
 # ---------------------------------------------------------------------
-# Final Rescue — single-pass rescue of post-Demote unassigned tx.
+# Final Rescue — post-Demote pass over remaining "-1" tx.
 # Inherits all keys from [rescue] then applies the deltas below.
 # ---------------------------------------------------------------------
 [final_rescue]
@@ -283,6 +297,13 @@ inherit = "rescue"
 # Stricter than main Rescue: no fallback-to-min for small entities.
 # (Already 0 in [rescue], explicit here for documentation.)
 small_entity_guard_n = 0
+
+# 2026-05-15: SEG-friendly default — 3 passes, no gate. NOSEG users
+# should load via `load_config(platform="noseg")` which overrides to
+# 5 passes (NOSEG has a much larger residual orphan pool after
+# Stitch+Demote). See 2×2 PDAC ROI bench in
+# analysis/rescue-upgrades/rank_policy_2x2_snapshots/.
+max_passes = 3
 
 
 # ---------------------------------------------------------------------
