@@ -1,2 +1,13 @@
-- name: fork-sync-all-branches
-  uses: imlong4real/TRACER
+name: Sync Fork
+
+on:
+  workflow_dispatch: # on button click
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: anatawa12/fork-sync-all-branches@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
