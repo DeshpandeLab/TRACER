@@ -1,0 +1,2 @@
+- name: fork-sync-all-branches
+  uses: imlong4real/TRACER
