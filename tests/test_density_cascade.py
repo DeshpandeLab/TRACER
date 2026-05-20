@@ -134,14 +134,25 @@ class TestCascadeIntegration:
             reason="benchmarks/data_loader.py unavailable (not on sys.path)",
         )
         from data_loader import load_roi_df, DEFAULT_PROJECT_DIR
-        df = load_roi_df(half_side_um=250.0,
-                          roi_center_xy=(1818.7, 2186.8)).reset_index(drop=True)
+        # The lung-cancer ROI parquet + NPMI panel are large data files
+        # not committed to the repo (DEFAULT_PROJECT_DIR points at a
+        # developer-local tutorials/ tree). On CI — and any checkout
+        # without those files — the loads raise FileNotFoundError; skip
+        # rather than error. importorskip above only catches "module
+        # missing", not "data missing".
+        try:
+            df = load_roi_df(half_side_um=250.0,
+                              roi_center_xy=(1818.7, 2186.8)).reset_index(drop=True)
+            panel = pd.read_csv(
+                DEFAULT_PROJECT_DIR / "data" / "lung_cancer_npmi.csv"
+            )
+        except FileNotFoundError as e:
+            pytest.skip(
+                f"lung_cancer integration data unavailable: {e}"
+            )
         for c in ("transcript_id", "cell_id", "feature_name"):
             df[c] = df[c].astype(str)
         df["overlaps_nucleus"] = df["overlaps_nucleus"].astype(bool)
-        panel = pd.read_csv(
-            DEFAULT_PROJECT_DIR / "data" / "lung_cancer_npmi.csv"
-        )
         genes = set(df["feature_name"].unique())
         panel = panel[panel["gene_i"].isin(genes)
                        & panel["gene_j"].isin(genes)]

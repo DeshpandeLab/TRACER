@@ -1,11 +1,11 @@
 {
-  "ami_vs_truth": 0.8645,
-  "ari_vs_truth": 0.8335,
-  "coverage_pct": 91.0,
+  "ami_vs_truth": 0.9871,
+  "ari_vs_truth": 0.9859,
+  "coverage_pct": 82.0,
   "n_cells": 8,
   "n_components": 0,
-  "n_partials": 2,
-  "n_unassigned_tx": 18,
+  "n_partials": 0,
+  "n_unassigned_tx": 36,
   "stage_progression": [
     {
       "n_cells": 8,
@@ -46,56 +46,56 @@
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 8,
-      "n_unassigned_tx": 6,
+      "n_unassigned_tx": 18,
       "stage": "Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 0,
       "n_partials": 8,
-      "n_unassigned_tx": 6,
+      "n_unassigned_tx": 18,
       "stage": "Group"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 7,
-      "n_unassigned_tx": 7,
+      "n_partials": 5,
+      "n_unassigned_tx": 21,
       "stage": "Mid-QC"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 7,
-      "n_unassigned_tx": 7,
+      "n_partials": 5,
+      "n_unassigned_tx": 21,
       "stage": "Post-Group Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 7,
-      "n_unassigned_tx": 7,
+      "n_partials": 5,
+      "n_unassigned_tx": 21,
       "stage": "Stitch"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 2,
-      "n_unassigned_tx": 21,
+      "n_partials": 0,
+      "n_unassigned_tx": 36,
       "stage": "Demote"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 2,
-      "n_unassigned_tx": 18,
+      "n_partials": 0,
+      "n_unassigned_tx": 36,
       "stage": "Final Rescue"
     },
     {
       "n_cells": 8,
       "n_components": 0,
-      "n_partials": 2,
-      "n_unassigned_tx": 18,
+      "n_partials": 0,
+      "n_unassigned_tx": 36,
       "stage": "Finalize"
     }
   ]
