@@ -17,12 +17,29 @@ omp_extra_lib_dirs: list[str] = []
 if platform.system() == "Darwin":
     omp_compile_args = ["-Xpreprocessor", "-fopenmp"]
     omp_link_args = ["-lomp"]
-    # brew libomp on Apple Silicon
-    _brew_libomp = "/opt/homebrew/opt/libomp"
+    # Locate libomp. Prefer `brew --prefix libomp` (works on both
+    # Apple Silicon /opt/homebrew and Intel /usr/local, and on CI
+    # runners where the prefix isn't the default), then fall back to
+    # the well-known Homebrew locations. Without the include path the
+    # build fails with "fatal error: 'omp.h' file not found".
     import os.path as _osp
-    if _osp.isdir(_brew_libomp):
-        omp_extra_includes.append(f"{_brew_libomp}/include")
-        omp_extra_lib_dirs.append(f"{_brew_libomp}/lib")
+    import subprocess as _sp
+    _libomp_prefix = None
+    try:
+        _libomp_prefix = _sp.check_output(
+            ["brew", "--prefix", "libomp"],
+            text=True, stderr=_sp.DEVNULL,
+        ).strip()
+    except (OSError, _sp.CalledProcessError):
+        _libomp_prefix = None
+    if not _libomp_prefix or not _osp.isdir(_libomp_prefix):
+        for _cand in ("/opt/homebrew/opt/libomp", "/usr/local/opt/libomp"):
+            if _osp.isdir(_cand):
+                _libomp_prefix = _cand
+                break
+    if _libomp_prefix and _osp.isdir(_libomp_prefix):
+        omp_extra_includes.append(f"{_libomp_prefix}/include")
+        omp_extra_lib_dirs.append(f"{_libomp_prefix}/lib")
 else:
     omp_compile_args = ["-fopenmp"]
     omp_link_args = ["-fopenmp"]
