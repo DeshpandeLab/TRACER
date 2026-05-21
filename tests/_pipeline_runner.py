@@ -481,11 +481,43 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
 
     gene_to_idx = aux["gene_to_idx"]
     W = aux["W"]
-    if not isinstance(W, np.ndarray):
-        W = np.asarray(W.todense() if hasattr(W, "todense") else W,
-                       dtype=np.float32)
-    if W.dtype != np.float32:
-        W = W.astype(np.float32)
+    # Two gene-fit backends:
+    #   - dense  (G,G) float32: the legacy path, NaN marks unobserved
+    #     pairs and `_mean_pmi_excl_self` skips them.
+    #   - sparse CSR upper-triangle (the bootstrap's `W_sparse`): scales
+    #     to whole-transcriptome panels where a dense (G,G) is ~1.6 GB.
+    #     Structurally-absent pairs are skipped (NOT filled with 0 — that
+    #     is the coherence convention and the wrong one here). We do NOT
+    #     densify, since `.todense()` turns absent→0 and re-introduces the
+    #     NaN-vs-0 gene-fit bug.
+    import scipy.sparse as _sp
+    W_is_sparse = _sp.issparse(W)
+    if W_is_sparse:
+        # Symmetrize the upper-triangle CSR via COO-stacking. NOT `W + W.T`:
+        # scipy's sparse add eliminates explicit zeros, which would drop an
+        # observed PMI of exactly 0.0. Never call eliminate_zeros() here for
+        # the same reason.
+        Wu = W.tocoo()
+        Wsym = _sp.csr_matrix(
+            (
+                np.concatenate([Wu.data, Wu.data]).astype(np.float32),
+                (
+                    np.concatenate([Wu.row, Wu.col]),
+                    np.concatenate([Wu.col, Wu.row]),
+                ),
+            ),
+            shape=W.shape,
+            dtype=np.float32,
+        )
+        Wsym.sort_indices()
+        W_sp_indptr = Wsym.indptr.astype(np.int32)
+        W_sp_indices = Wsym.indices.astype(np.int32)
+        W_sp_data = Wsym.data.astype(np.float32)
+    else:
+        if not isinstance(W, np.ndarray):
+            W = np.asarray(W, dtype=np.float32)
+        if W.dtype != np.float32:
+            W = W.astype(np.float32)
 
     is_nuclear = df_out[nuclear_col].to_numpy(dtype=bool)
     nuc_genes = df_out[gene_col].astype(str).to_numpy()
@@ -712,23 +744,41 @@ def _reassign_nuclear_post_1c_etype(df_in: pd.DataFrame, *,
         if partial_genes_flat_chunks else np.zeros(0, dtype=np.int32)
     )
 
-    # Ensure W is C-contiguous float32 (kernel requirement).
-    if not (W.flags["C_CONTIGUOUS"] and W.dtype == np.float32):
-        W = np.ascontiguousarray(W, dtype=np.float32)
-
-    # Call the kernel — per-candidate local-partial-index decision.
-    from tracer._cy_reassign import reassign_nuclear_post_1c_kernel
-    out_partial_local_idx = reassign_nuclear_post_1c_kernel(
-        W,
-        cand_offsets,
-        cand_gene_arr,
-        main_offsets,
-        main_genes_arr,
-        partial_offsets,
-        partial_gene_offsets_arr,
-        partial_genes_arr,
-        float(margin),
-    )
+    # Call the kernel — per-candidate local-partial-index decision. The
+    # sparse and dense kernels share identical offset-loop / margin logic
+    # and agree bit-for-bit on a fully-dense panel; they differ only in how
+    # the per-seed mean PMI is gathered (CSR binary-search vs direct index).
+    if W_is_sparse:
+        from tracer._cy_reassign import reassign_nuclear_post_1c_kernel_sparse
+        out_partial_local_idx = reassign_nuclear_post_1c_kernel_sparse(
+            W_sp_indptr,
+            W_sp_indices,
+            W_sp_data,
+            cand_offsets,
+            cand_gene_arr,
+            main_offsets,
+            main_genes_arr,
+            partial_offsets,
+            partial_gene_offsets_arr,
+            partial_genes_arr,
+            float(margin),
+        )
+    else:
+        # Ensure W is C-contiguous float32 (kernel requirement).
+        if not (W.flags["C_CONTIGUOUS"] and W.dtype == np.float32):
+            W = np.ascontiguousarray(W, dtype=np.float32)
+        from tracer._cy_reassign import reassign_nuclear_post_1c_kernel
+        out_partial_local_idx = reassign_nuclear_post_1c_kernel(
+            W,
+            cand_offsets,
+            cand_gene_arr,
+            main_offsets,
+            main_genes_arr,
+            partial_offsets,
+            partial_gene_offsets_arr,
+            partial_genes_arr,
+            float(margin),
+        )
 
     # Apply moves: for each candidate with out>=0, relabel its tx to the
     # corresponding partial.

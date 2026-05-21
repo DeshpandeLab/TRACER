@@ -125,15 +125,71 @@ def prune_single(cnp.ndarray[cnp.int32_t, ndim=1] g_local, cnp.ndarray[cnp.float
     return removed
 
 
+cdef inline bint _wget(
+    cnp.float32_t[:, :] W,
+    const int[::1] W_indptr,
+    const int[::1] W_indices,
+    const float[::1] W_data,
+    int use_sparse,
+    int row,
+    int col,
+    float *out,
+) nogil:
+    """Unified PMI accessor for the nuclear-seed prune. Returns True and
+    writes ``W[row, col]`` to ``out`` when the pair is OBSERVED; returns
+    False when it should be SKIPPED.
+
+    Two backends, identical "skip the unobserved" semantics:
+      * dense  (``use_sparse == 0``): observed == not-NaN. ``W`` is the
+        dense float32 PMI matrix with NaN for unobserved pairs.
+      * sparse (``use_sparse == 1``): observed == structurally stored in
+        the symmetric CSR. A pair the bootstrap never stored (below the
+        evidence threshold) is absent and skipped — NOT treated as 0
+        (that is the coherence convention and the wrong one for seed
+        coherence / gene-fit). ``neg_one`` mutual-exclusion sentinels are
+        stored negatives, so they are found and count as anti-evidence.
+        ``W_indices`` must be column-sorted within each row.
+
+    On a fully-observed (dense) panel the two backends return the same
+    value for every pair, so the kernel's results match bit-for-bit.
+    """
+    cdef int lo, hi, row_end, mid
+    cdef float v
+    if use_sparse:
+        lo = W_indptr[row]
+        row_end = W_indptr[row + 1]
+        hi = row_end
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if W_indices[mid] < col:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < row_end and W_indices[lo] == col:
+            out[0] = W_data[lo]
+            return True
+        return False
+    else:
+        v = W[row, col]
+        if v == v:  # not NaN
+            out[0] = v
+            return True
+        return False
+
+
 cdef inline double _mean_internal_pmi(
     cnp.int32_t[:] genes,
     int n_genes,
     cnp.float32_t[:, :] W,
+    const int[::1] W_indptr,
+    const int[::1] W_indices,
+    const float[::1] W_data,
+    int use_sparse,
 ) nogil:
     """Mean PMI over off-diagonal pairs within a gene set. Returns
     +inf when the set has <2 genes (caller treats as "trivially
-    coherent": no pairs means no internal incoherence). NaN entries
-    in W are skipped."""
+    coherent": no pairs means no internal incoherence). Unobserved
+    pairs are skipped (see :func:`_wget`)."""
     cdef int i, j
     cdef double total = 0.0
     cdef int count = 0
@@ -142,8 +198,8 @@ cdef inline double _mean_internal_pmi(
         return 1e30
     for i in range(n_genes):
         for j in range(i + 1, n_genes):
-            v = W[genes[i], genes[j]]
-            if v == v:  # NaN check
+            if _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                     genes[i], genes[j], &v):
                 total += v
                 count += 1
     if count == 0:
@@ -156,10 +212,14 @@ cdef inline int _mean_pmi_test(
     cnp.int32_t[:] seed,
     int seed_len,
     cnp.float32_t[:, :] W,
+    const int[::1] W_indptr,
+    const int[::1] W_indices,
+    const float[::1] W_data,
+    int use_sparse,
     double threshold,
 ) nogil:
-    """Returns 1 if mean PMI(gene_idx, seed) >= threshold (NaN-skipped),
-    else 0. Returns 0 if all NaN or empty seed."""
+    """Returns 1 if mean PMI(gene_idx, seed) >= threshold (unobserved
+    pairs skipped), else 0. Returns 0 if no observed pair or empty seed."""
     cdef int j
     cdef double total = 0.0
     cdef int count = 0
@@ -167,8 +227,8 @@ cdef inline int _mean_pmi_test(
     if seed_len == 0:
         return 0
     for j in range(seed_len):
-        v = W[gene_idx, seed[j]]
-        if v == v:  # NaN check (NaN != NaN)
+        if _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                 gene_idx, seed[j], &v):
             total += v
             count += 1
     if count == 0:
@@ -182,6 +242,10 @@ cdef cnp.ndarray _greedy_prune_to_retained(
     cnp.int32_t[:] g_local,
     cnp.int32_t[:] tx_counts,
     cnp.float32_t[:, :] W,
+    const int[::1] W_indptr,
+    const int[::1] W_indices,
+    const float[::1] W_data,
+    int use_sparse,
     double threshold,
 ):
     """Greedy bad-edge prune with TX-WEIGHTED conflict scoring.
@@ -191,6 +255,9 @@ cdef cnp.ndarray _greedy_prune_to_retained(
     max score. Safeguard: a gene with own tx count > score is
     PROTECTED from being stripped (its own evidence majority-outweighs
     its conflicts). Returns retained gene indices as int32 ndarray.
+
+    Unobserved gene pairs are skipped (never marked bad), via
+    :func:`_wget` — same semantics under the dense and sparse backends.
     """
     cdef int k = g_local.shape[0]
     if k <= 1:
@@ -210,8 +277,8 @@ cdef cnp.ndarray _greedy_prune_to_retained(
             if i == j:
                 continue
             gj = int(g_local[j])
-            val = W[gi, gj]
-            if val != val:
+            if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                         gi, gj, &val):
                 continue
             if val < threshold:
                 bad_mv[i, j] = 1
@@ -256,66 +323,36 @@ cdef cnp.ndarray _greedy_prune_to_retained(
     return kept
 
 
-def prune_cells_nuclear_seed(
+cdef cnp.ndarray _prune_cells_nuclear_seed_core(
     list cell_tx_idx_lists,
-    cnp.ndarray[cnp.int32_t, ndim=1] tx_gene_idx,
-    cnp.ndarray[cnp.uint8_t, ndim=1] tx_is_nuclear,
-    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    cnp.int32_t[:] tx_gene_mv,
+    cnp.uint8_t[:] tx_nuc_mv,
+    cnp.float32_t[:, :] W_mv,
+    const int[::1] W_indptr,
+    const int[::1] W_indices,
+    const float[::1] W_data,
+    int use_sparse,
+    int n_tx,
     double threshold,
     int min_nuclear_genes,
     int skip_phase_1c,
-    double seed_coherence_floor=-1e30,
-    int nuclear_only_admit=0,
-    int tx_weighted=1,
+    double seed_coherence_floor,
+    int nuclear_only_admit,
+    int tx_weighted,
 ):
-    """Batch nuclear-seed prune over many cells.
+    """Shared orchestration for the dense and sparse nuclear-seed prune.
 
-    Parameters
-    ----------
-    cell_tx_idx_lists : list of np.int32 1D arrays
-        Per-cell row-index arrays (positions in tx_gene_idx / tx_is_nuclear).
-    tx_gene_idx : int32 ndarray
-        Per-tx gene-vocabulary index. -1 indicates "no gene index" (skip).
-    tx_is_nuclear : uint8 ndarray
-        Per-tx nuclear flag (0/1).
-    W : float32 2D ndarray
-        PMI matrix.
-    threshold : float
-        Admission threshold for mean PMI to seed (also bad-edge threshold
-        for the greedy prune).
-    min_nuclear_genes : int
-        Skip Phase 1a / 1c if a cell has fewer than this many unique nuclear genes.
-    skip_phase_1c : int
-        If non-zero, skip Phase 1c (rejected tx → unassigned directly).
-    seed_coherence_floor : float
-        Minimum mean internal PMI required for a seed (1a) or sub-seed
-        (1c) to be accepted. Seeds below this floor are rejected:
-        for the primary seed, all that cell's tx → unassigned; for the
-        sub-seed, all rest-pile tx → unassigned (no partial formed).
-        Default -1e30 disables the check (back-compat).
-    nuclear_only_admit : int
-        If non-zero, restrict 1b admission and 1c re-test to NUCLEAR
-        tx only — cytoplasmic tx leave Phase 1 as unassigned (code 2)
-        regardless of gene-fit. Group/Rescue/Stitch then route them
-        downstream by spatial+gene proximity. Establishes per-cell
-        identity exclusively from spatially-trusted nuclear tx.
-        Default 0 disables (back-compat: cyto admitted by gene-fit).
-
-    Returns
-    -------
-    np.int8 ndarray
-        Per-tx assignment code: 0 = main (parent cell), 1 = partial,
-        2 = unassigned, 3 = fallback-needed (cell had insufficient
-        nuclear genes; caller should fall back to whole-cell prune).
+    All PMI access goes through :func:`_wget`, which encodes the same
+    "skip the unobserved pair" semantics for both backends, so the dense
+    and sparse paths produce identical per-tx codes on a fully-observed
+    panel (bit-for-bit) and differ only when the sparse panel genuinely
+    omits pairs (then sparse SKIPS, matching dense-with-NaN). See the
+    public :func:`prune_cells_nuclear_seed` /
+    :func:`prune_cells_nuclear_seed_sparse` wrappers.
     """
-    cdef int n_tx = tx_gene_idx.shape[0]
     cdef int n_cells = len(cell_tx_idx_lists)
     cdef cnp.ndarray[cnp.int8_t, ndim=1] out = np.full(n_tx, 2, dtype=np.int8)
     cdef cnp.int8_t[:] out_mv = out
-
-    cdef cnp.int32_t[:] tx_gene_mv = tx_gene_idx
-    cdef cnp.uint8_t[:] tx_nuc_mv = tx_is_nuclear
-    cdef cnp.float32_t[:, :] W_mv = W
 
     cdef Py_ssize_t cidx
     cdef cnp.ndarray[cnp.int32_t, ndim=1] tx_inds_arr
@@ -377,7 +414,9 @@ def prune_cells_nuclear_seed(
                 tx_counts_all[ti] = int(np.sum(uniq_all_arr == uniq_all[ti]))
             if not tx_weighted:
                 tx_counts_all = np.ones(n_unique_all, dtype=np.int32)
-            seed = _greedy_prune_to_retained(uniq_all, tx_counts_all, W_mv, threshold)
+            seed = _greedy_prune_to_retained(
+                uniq_all, tx_counts_all, W_mv,
+                W_indptr, W_indices, W_data, use_sparse, threshold)
         else:
             # ---- Phase 1a: nuclear seed (tx-weighted) ----
             # Per-gene nuclear tx counts for the tx-weighted greedy.
@@ -387,7 +426,9 @@ def prune_cells_nuclear_seed(
                 tx_counts_nuc[ti] = int(np.sum(nuc_arr == uniq_nuc[ti]))
             if not tx_weighted:
                 tx_counts_nuc = np.ones(n_unique_nuc, dtype=np.int32)
-            seed = _greedy_prune_to_retained(uniq_nuc, tx_counts_nuc, W_mv, threshold)
+            seed = _greedy_prune_to_retained(
+                uniq_nuc, tx_counts_nuc, W_mv,
+                W_indptr, W_indices, W_data, use_sparse, threshold)
         seed_mv = seed
         seed_len = seed.shape[0]
         if seed_len == 0:
@@ -397,7 +438,9 @@ def prune_cells_nuclear_seed(
         # Coherence floor on primary seed: reject seeds whose internal
         # mean PMI is below the floor (avoids accepting a clique that
         # is merely "non-conflicting" but biologically degenerate).
-        if _mean_internal_pmi(seed_mv, seed_len, W_mv) < seed_coherence_floor:
+        if _mean_internal_pmi(
+                seed_mv, seed_len, W_mv,
+                W_indptr, W_indices, W_data, use_sparse) < seed_coherence_floor:
             continue
 
         # ---- Phase 1b: per-tx admit by mean PMI to seed ----
@@ -424,7 +467,9 @@ def prune_cells_nuclear_seed(
                     fitted = 1
                     break
             if fitted == 0:
-                fitted = _mean_pmi_test(g, seed_mv, seed_len, W_mv, threshold)
+                fitted = _mean_pmi_test(
+                    g, seed_mv, seed_len, W_mv,
+                    W_indptr, W_indices, W_data, use_sparse, threshold)
             if fitted:
                 out_mv[tx_row] = 0  # main
             else:
@@ -454,7 +499,9 @@ def prune_cells_nuclear_seed(
             tx_counts_rej[ti] = int(np.sum(rej_nuc_arr == uniq_rej_nuc[ti]))
         if not tx_weighted:
             tx_counts_rej = np.ones(n_uniq_rej, dtype=np.int32)
-        sub_seed = _greedy_prune_to_retained(uniq_rej_nuc, tx_counts_rej, W_mv, threshold)
+        sub_seed = _greedy_prune_to_retained(
+            uniq_rej_nuc, tx_counts_rej, W_mv,
+            W_indptr, W_indices, W_data, use_sparse, threshold)
         sub_seed_mv = sub_seed
         sub_seed_len = sub_seed.shape[0]
         if sub_seed_len == 0:
@@ -465,7 +512,9 @@ def prune_cells_nuclear_seed(
         # clique" sub-seeds from forming spurious partials. Rest-pile
         # tx stay unassigned (code 2, already default) for downstream
         # Rescue to route based on neighbour gene composition.
-        if _mean_internal_pmi(sub_seed_mv, sub_seed_len, W_mv) < seed_coherence_floor:
+        if _mean_internal_pmi(
+                sub_seed_mv, sub_seed_len, W_mv,
+                W_indptr, W_indices, W_data, use_sparse) < seed_coherence_floor:
             continue
 
         # Re-test rejected tx against sub-seed. When nuclear_only_admit
@@ -483,12 +532,122 @@ def prune_cells_nuclear_seed(
                     fitted = 1
                     break
             if fitted == 0:
-                fitted = _mean_pmi_test(g, sub_seed_mv, sub_seed_len, W_mv, threshold)
+                fitted = _mean_pmi_test(
+                    g, sub_seed_mv, sub_seed_len, W_mv,
+                    W_indptr, W_indices, W_data, use_sparse, threshold)
             if fitted:
                 out_mv[tx_row] = 1  # partial
             # else: stays 2 (unassigned) — already default
 
     return out
+
+
+def prune_cells_nuclear_seed(
+    list cell_tx_idx_lists,
+    cnp.ndarray[cnp.int32_t, ndim=1] tx_gene_idx,
+    cnp.ndarray[cnp.uint8_t, ndim=1] tx_is_nuclear,
+    cnp.ndarray[cnp.float32_t, ndim=2] W,
+    double threshold,
+    int min_nuclear_genes,
+    int skip_phase_1c,
+    double seed_coherence_floor=-1e30,
+    int nuclear_only_admit=0,
+    int tx_weighted=1,
+):
+    """Batch nuclear-seed prune over many cells — DENSE PMI backend.
+
+    Parameters
+    ----------
+    cell_tx_idx_lists : list of np.int32 1D arrays
+        Per-cell row-index arrays (positions in tx_gene_idx / tx_is_nuclear).
+    tx_gene_idx : int32 ndarray
+        Per-tx gene-vocabulary index. -1 indicates "no gene index" (skip).
+    tx_is_nuclear : uint8 ndarray
+        Per-tx nuclear flag (0/1).
+    W : float32 2D ndarray
+        Dense PMI matrix. Unobserved pairs are NaN and skipped (note: the
+        ``prune_transcripts_nuclear_seed`` wrapper historically fills NaN
+        with 0 via ``nan_fill``; pass ``nan_fill=None`` for NaN-skip
+        parity with the sparse backend).
+    threshold : float
+        Admission threshold for mean PMI to seed (also bad-edge threshold
+        for the greedy prune).
+    min_nuclear_genes : int
+        Skip Phase 1a / 1c if a cell has fewer than this many unique nuclear genes.
+    skip_phase_1c : int
+        If non-zero, skip Phase 1c (rejected tx → unassigned directly).
+    seed_coherence_floor : float
+        Minimum mean internal PMI required for a seed (1a) or sub-seed
+        (1c) to be accepted. Seeds below this floor are rejected:
+        for the primary seed, all that cell's tx → unassigned; for the
+        sub-seed, all rest-pile tx → unassigned (no partial formed).
+        Default -1e30 disables the check (back-compat).
+    nuclear_only_admit : int
+        If non-zero, restrict 1b admission and 1c re-test to NUCLEAR
+        tx only — cytoplasmic tx leave Phase 1 as unassigned (code 2)
+        regardless of gene-fit. Group/Rescue/Stitch then route them
+        downstream by spatial+gene proximity. Establishes per-cell
+        identity exclusively from spatially-trusted nuclear tx.
+        Default 0 disables (back-compat: cyto admitted by gene-fit).
+
+    Returns
+    -------
+    np.int8 ndarray
+        Per-tx assignment code: 0 = main (parent cell), 1 = partial,
+        2 = unassigned, 3 = fallback-needed (cell had insufficient
+        nuclear genes; caller should fall back to whole-cell prune).
+    """
+    # Dummy CSR arrays (never indexed when use_sparse == 0).
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] _ip = np.zeros(1, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] _ix = np.zeros(1, dtype=np.int32)
+    cdef cnp.ndarray[cnp.float32_t, ndim=1] _dt = np.zeros(1, dtype=np.float32)
+    return _prune_cells_nuclear_seed_core(
+        cell_tx_idx_lists, tx_gene_idx, tx_is_nuclear, W,
+        _ip, _ix, _dt, 0,
+        tx_gene_idx.shape[0],
+        threshold, min_nuclear_genes, skip_phase_1c,
+        seed_coherence_floor, nuclear_only_admit, tx_weighted,
+    )
+
+
+def prune_cells_nuclear_seed_sparse(
+    list cell_tx_idx_lists,
+    cnp.ndarray[cnp.int32_t, ndim=1] tx_gene_idx,
+    cnp.ndarray[cnp.uint8_t, ndim=1] tx_is_nuclear,
+    cnp.ndarray[cnp.int32_t, ndim=1] W_indptr,
+    cnp.ndarray[cnp.int32_t, ndim=1] W_indices,
+    cnp.ndarray[cnp.float32_t, ndim=1] W_data,
+    double threshold,
+    int min_nuclear_genes,
+    int skip_phase_1c,
+    double seed_coherence_floor=-1e30,
+    int nuclear_only_admit=0,
+    int tx_weighted=1,
+):
+    """Batch nuclear-seed prune over many cells — SPARSE CSR PMI backend.
+
+    Same algorithm and per-tx output codes as
+    :func:`prune_cells_nuclear_seed`, but the PMI panel is a symmetric
+    sparse CSR (built from the bootstrap's upper-triangle ``W_sparse``)
+    instead of a dense ``(G, G)`` matrix — the float32 dense matrix is
+    ~1.6 GB at 20k genes and OOMs the prune around 15k. This unblocks
+    whole-transcriptome panels.
+
+    Structurally-absent pairs are SKIPPED (not counted as 0). Build the
+    CSR by COO-stacking the upper triangle (``W + W.T`` is unsafe: scipy's
+    sparse add eliminates explicit zeros, dropping observed PMI == 0.0),
+    ``sort_indices()``, and never ``eliminate_zeros()``. ``W_indices``
+    must be column-sorted within each row.
+    """
+    # Dummy dense matrix (never indexed when use_sparse == 1).
+    cdef cnp.ndarray[cnp.float32_t, ndim=2] _W = np.zeros((1, 1), dtype=np.float32)
+    return _prune_cells_nuclear_seed_core(
+        cell_tx_idx_lists, tx_gene_idx, tx_is_nuclear, _W,
+        W_indptr, W_indices, W_data, 1,
+        tx_gene_idx.shape[0],
+        threshold, min_nuclear_genes, skip_phase_1c,
+        seed_coherence_floor, nuclear_only_admit, tx_weighted,
+    )
 
 
 def top_k_positive_clique_per_entity(

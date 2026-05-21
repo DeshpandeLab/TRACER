@@ -78,6 +78,44 @@ def build_sparse_npmi_matrix(result):
     return genes, gene_to_idx, W
 
 
+def _is_bootstrap_result(obj) -> bool:
+    """True for a :class:`tracer.metrics.NpmiBootstrapResult` (or any
+    duck-typed object carrying ``W_sparse`` + ``genes``)."""
+    return hasattr(obj, "W_sparse") and hasattr(obj, "genes")
+
+
+def _symmetric_csr_arrays(W_upper):
+    """Symmetrize an upper-triangle CSR PMI panel for the sparse prune /
+    reassign kernels and return ``(indptr, indices, data)`` as int32/
+    float32 with columns sorted within each row.
+
+    Uses COO-stacking, NOT ``W + W.T``: scipy's sparse add eliminates
+    explicit zeros, which would silently drop an observed PMI of exactly
+    0.0. ``eliminate_zeros()`` is likewise never called — an observed 0.0
+    must remain a stored, counted entry. Structurally-absent pairs stay
+    absent so the kernel skips them (the gene-fit / seed-coherence
+    convention; the opposite of coherence's absent-as-0).
+    """
+    Wu = W_upper.tocoo()
+    Wsym = sp.csr_matrix(
+        (
+            np.concatenate([Wu.data, Wu.data]).astype(np.float32),
+            (
+                np.concatenate([Wu.row, Wu.col]),
+                np.concatenate([Wu.col, Wu.row]),
+            ),
+        ),
+        shape=W_upper.shape,
+        dtype=np.float32,
+    )
+    Wsym.sort_indices()
+    return (
+        Wsym.indptr.astype(np.int32),
+        Wsym.indices.astype(np.int32),
+        Wsym.data.astype(np.float32),
+    )
+
+
 def prune_genes_by_npmi_greedy(
     gene_ids: np.ndarray,
     W: np.ndarray,
@@ -275,6 +313,16 @@ def prune_transcripts_fast(
     else:
         df["_cell_str"] = df[cell_id_col]
 
+    if _is_bootstrap_result(npmi_df) or sp.issparse(npmi_df):
+        # The two-pass whole-cell prune (prune_cells / prune_single) is
+        # still dense-only. The sparse CSR backend currently lives on the
+        # nuclear-seed path (prune_transcripts_nuclear_seed); sparsifying
+        # this path is tracked as a follow-up.
+        raise NotImplementedError(
+            "prune_transcripts_fast does not yet accept a sparse / "
+            "NpmiBootstrapResult panel; use prune_transcripts_nuclear_seed "
+            "for whole-transcriptome sparse panels."
+        )
     genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df, npmi_col=metric_col)
     if nan_fill is not None:
         np.nan_to_num(W, copy=False, nan=float(nan_fill))
@@ -571,9 +619,27 @@ def prune_transcripts_nuclear_seed(
     df["_cell_str"] = df[cell_id_col].astype(str)
     df["_is_nuc"] = df[nuclear_col].astype(bool)
 
-    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df, npmi_col=metric_col)
-    if nan_fill is not None:
-        np.nan_to_num(W, copy=False, nan=float(nan_fill))
+    # Two PMI backends:
+    #   - dense (G,G) float32: legacy path. Unobserved pairs are NaN, then
+    #     filled per `nan_fill` (default 0.0 — counts absent as 0).
+    #   - sparse symmetric CSR from a NpmiBootstrapResult: scales to
+    #     whole-transcriptome panels (dense (G,G) is ~1.6 GB at 20k genes
+    #     and OOMs the prune ~15k). Structurally-absent pairs are SKIPPED
+    #     (NOT counted as 0); never materializes the dense matrix.
+    use_sparse_panel = _is_bootstrap_result(npmi_df) or sp.issparse(npmi_df)
+    if use_sparse_panel:
+        if sp.issparse(npmi_df):
+            raise TypeError(
+                "Pass a NpmiBootstrapResult (carries gene names) for the "
+                "sparse prune, not a bare scipy matrix."
+            )
+        genes, gene_to_idx, W = build_sparse_npmi_matrix(npmi_df)
+        W_sp_indptr, W_sp_indices, W_sp_data = _symmetric_csr_arrays(W)
+    else:
+        genes, gene_to_idx, W = build_dense_npmi_matrix(
+            npmi_df, npmi_col=metric_col)
+        if nan_fill is not None:
+            np.nan_to_num(W, copy=False, nan=float(nan_fill))
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
 
     df[out_col] = df["_cell_str"].copy()
@@ -610,18 +676,34 @@ def prune_transcripts_nuclear_seed(
                     .astype(np.int32).to_numpy())
     is_nuc_int = df["_is_nuc"].to_numpy().astype(np.uint8)
 
-    codes = _cy_prune.prune_cells_nuclear_seed(
-        cell_tx_idx_lists,
-        gene_idx_int,
-        is_nuc_int,
-        W if W.dtype == np.float32 else W.astype(np.float32),
-        float(threshold),
-        int(min_nuclear_genes),
-        1 if skip_phase_1c else 0,
-        float(seed_coherence_floor),
-        1 if nuclear_only_admit else 0,
-        1 if tx_weighted else 0,
-    )
+    if use_sparse_panel:
+        codes = _cy_prune.prune_cells_nuclear_seed_sparse(
+            cell_tx_idx_lists,
+            gene_idx_int,
+            is_nuc_int,
+            W_sp_indptr,
+            W_sp_indices,
+            W_sp_data,
+            float(threshold),
+            int(min_nuclear_genes),
+            1 if skip_phase_1c else 0,
+            float(seed_coherence_floor),
+            1 if nuclear_only_admit else 0,
+            1 if tx_weighted else 0,
+        )
+    else:
+        codes = _cy_prune.prune_cells_nuclear_seed(
+            cell_tx_idx_lists,
+            gene_idx_int,
+            is_nuc_int,
+            W if W.dtype == np.float32 else W.astype(np.float32),
+            float(threshold),
+            int(min_nuclear_genes),
+            1 if skip_phase_1c else 0,
+            float(seed_coherence_floor),
+            1 if nuclear_only_admit else 0,
+            1 if tx_weighted else 0,
+        )
 
     # Apply codes to out_col. Default state of out_col is the cell_id
     # string already (set above as df[out_col] = df["_cell_str"].copy()),
