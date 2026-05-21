@@ -301,24 +301,27 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
     df_out[entity_col] = df_out[entity_col].astype(str)
     coords_arr = df_out[list(coord_cols)].to_numpy(dtype=np.float64)
 
-    # Pre-compute next-suffix-counter per (cell, depth1) namespace so
-    # split-emitted labels don't collide with existing partials.
-    #   "37962"     in_partials → next_suffix["37962"] = 1 + max(d1)
-    #   "37962-1"   exists      → next_subsuffix["37962-1"] = 1 + max(d2)
-    next_suffix: dict[str, int] = {}
-    next_subsuffix: dict[str, int] = {}
+    # Prefer the `_etype` column for cell/partial classification — it is set
+    # upstream from kernel codes (see pruning.etype_from_codes), so it stays
+    # correct on alphanumeric cell_ids (e.g. "jikammne-1") where the input
+    # cell_id natively contains dashes and label parsing is ambiguous. Falls
+    # back to the legacy numeric-label regex when the column is absent.
+    has_etype = "_etype" in df_out.columns
+
+    # Pre-compute the next collision-free child suffix per parent label, so
+    # split-emitted labels don't collide with existing children. A child is
+    # any label of the form "{parent}-{int}"; we split on the *last* dash so
+    # that dash-containing cell_ids and arbitrary depths are handled
+    # uniformly:
+    #   "37962-1"        → next_child["37962"]   = max(...,1)
+    #   "37962-1-2"      → next_child["37962-1"] = max(...,2)
+    #   "jikammne-1-1"   → next_child["jikammne-1"] = max(...,1)
+    next_child: dict[str, int] = {}
     for lab in df_out[entity_col].unique():
-        m = _re.match(r"^(\d+)-(\d+)(?:-(\d+))?$", str(lab))
-        if not m:
-            continue
-        cell, d1 = m.group(1), int(m.group(2))
-        d2 = int(m.group(3)) if m.group(3) else 0
-        next_suffix[cell] = max(next_suffix.get(cell, 0), d1) + 1 if cell in next_suffix or d1 >= next_suffix.get(cell, 0) else next_suffix.get(cell, 1)
-        # simpler: just track max d1, max d2 per (cell, d1)
-        next_suffix[cell] = max(next_suffix.get(cell, 0), d1)
-        if d2:
-            key = f"{cell}-{d1}"
-            next_subsuffix[key] = max(next_subsuffix.get(key, 0), d2)
+        m = _re.match(r"^(.*)-(\d+)$", str(lab))
+        if m:
+            prefix, k = m.group(1), int(m.group(2))
+            next_child[prefix] = max(next_child.get(prefix, 0), k)
 
     out_labels = df_out[entity_col].to_numpy().copy()
     z_arr = df_out[coord_cols[2]].to_numpy(dtype=np.float64)
@@ -334,8 +337,11 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
     for ent, group in df_out.groupby(entity_col, sort=False):
         if ent == unassigned_id or ent == "UNASSIGNED" or ent.startswith("UNASSIGNED_"):
             continue
-        if not _re.match(r"^\d+(-\d+){0,2}$", ent):
-            continue  # not a known cell/partial label
+        if has_etype:
+            if str(group["_etype"].iloc[0]) not in ("cell", "partial"):
+                continue  # cascade component / unknown — not split here
+        elif not _re.match(r"^\d+(-\d+){0,2}$", ent):
+            continue  # legacy fallback: numeric cell/partial labels only
         rows = group.index.to_numpy()
         if len(rows) < min_entity_size:
             continue
@@ -365,11 +371,6 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
         groups_rows.sort(key=lambda a: -len(a))
         stats["entities_split"] += 1
 
-        # Pre-parse the parent label for relabel logic
-        m_main = _re.match(r"^(\d+)$", ent)
-        m_part = _re.match(r"^(\d+)-(\d+)$", ent)
-        m_sub = _re.match(r"^(\d+)-(\d+)-(\d+)$", ent)
-
         # Collect (rows, new_etype) updates per parent for batched _etype write.
         rows_to_unknown_local: list[np.ndarray] = []
         rows_to_partial_local: list[np.ndarray] = []
@@ -384,23 +385,12 @@ def _spatial_split_phase1_entities(df_in: pd.DataFrame, *,
             if k == 0:
                 continue  # largest keeps original label (and its existing _etype)
 
-            # Mint fresh label without colliding with existing partials
-            if m_main is not None:
-                cell = m_main.group(1)
-                next_suffix[cell] = next_suffix.get(cell, 0) + 1
-                new_label = f"{cell}-{next_suffix[cell]}"
-            elif m_part is not None:
-                cell, d1 = m_part.group(1), m_part.group(2)
-                key = f"{cell}-{d1}"
-                next_subsuffix[key] = next_subsuffix.get(key, 0) + 1
-                new_label = f"{cell}-{d1}-{next_subsuffix[key]}"
-            elif m_sub is not None:
-                cell, d1, d2 = m_sub.group(1), m_sub.group(2), m_sub.group(3)
-                key = f"{cell}-{d1}-{d2}"
-                next_subsuffix[key] = next_subsuffix.get(key, 0) + 1
-                new_label = f"{key}-{next_subsuffix[key]}"
-            else:
-                continue
+            # Mint a fresh child label by appending the next collision-free
+            # suffix to the parent label. Prefix-agnostic: works for numeric
+            # ("37962" → "37962-1") and dash-containing cell_ids
+            # ("jikammne-1" → "jikammne-1-1") alike.
+            next_child[ent] = next_child.get(ent, 0) + 1
+            new_label = f"{ent}-{next_child[ent]}"
 
             out_labels[gr] = new_label
             stats["subgroups_minted"] += 1
