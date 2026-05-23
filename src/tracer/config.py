@@ -46,13 +46,43 @@ else:
 
 @dataclass(frozen=True)
 class Phase1Config:
-    """Phase 1 (a/b/c) — nuclear-anchored greedy prune + admission."""
+    """Phase 1 (a/b/c) — nuclear-anchored greedy prune + admission.
+
+    Phase 1b admission gate
+    -----------------------
+    The 1b gate decides whether a cytoplasmic / non-seed nuclear tx
+    admits to the main cell via gene-fit to the seed. ``veto_mode``
+    selects the gate:
+
+    - ``"mean"`` (default; back-compat): admit when mean PMI(gene,seed)
+      >= ``pmi_threshold``. Permissive — at lineage interfaces a few
+      housekeeping/IFN positives can dilute strong opposing-lineage
+      signal (see the EPCAM-vs-macrophage case study in the hybrid
+      admission spec).
+    - ``"hybrid"``: real-signal filter + unanimous-min fast-pass +
+      percentile-aggregator gate. Mirrors the Rescue hybrid kernel
+      (see `_cy_prune._admission_test`). Recommended for lineage-aware
+      panels; rejects cross-lineage candidates that the mean gate
+      admits. Note: switching the default to ``"hybrid"`` will
+      regenerate the Phase-1 partition. Regression refs will need
+      deliberate regeneration before flipping the default.
+    - ``"min"``: veto on any seed pair with PMI < ``neg_npmi_threshold``.
+      Strictest, rarely used outside diagnostic runs.
+    """
     # 2026-05-13: pmi_threshold raised 0.05 → 0.2 to match the new
     # bootstrap-PMI calibration (PMI=0.2 = 1.22× chance in natural-log).
     pmi_threshold: float = 0.2
     seed_coherence_floor: float = 0.10
     tx_weighted_prune: bool = True
     nuclear_only_admit: bool = True
+
+    # 1b admission gate (mirrors RescueConfig's veto knobs)
+    veto_mode: Literal["min", "mean", "hybrid"] = "mean"
+    mean_admit_threshold: float = 0.2
+    min_admit_threshold: float = 0.0
+    aggregator_percentile: float = 25.0
+    real_signal_threshold: float = 0.05
+    neg_npmi_threshold: float = -0.2
 
     def __post_init__(self) -> None:
         if not (-1.0 <= self.pmi_threshold <= 1.0):
@@ -63,6 +93,21 @@ class Phase1Config:
             raise ValueError(
                 f"phase1.seed_coherence_floor out of range: "
                 f"{self.seed_coherence_floor}"
+            )
+        if self.veto_mode not in ("min", "mean", "hybrid"):
+            raise ValueError(
+                f"phase1.veto_mode must be 'min'/'mean'/'hybrid'; "
+                f"got {self.veto_mode!r}"
+            )
+        if not (0.0 <= self.aggregator_percentile <= 100.0):
+            raise ValueError(
+                f"phase1.aggregator_percentile must be in [0, 100]; "
+                f"got {self.aggregator_percentile}"
+            )
+        if self.real_signal_threshold < 0.0:
+            raise ValueError(
+                f"phase1.real_signal_threshold must be >= 0; "
+                f"got {self.real_signal_threshold}"
             )
 
 

@@ -561,6 +561,12 @@ def prune_transcripts_nuclear_seed(
     seed_coherence_floor: float = -1e30,
     nuclear_only_admit: bool = False,
     tx_weighted: bool = True,
+    veto_mode: str = "mean",
+    mean_admit_threshold: float = 0.2,
+    min_admit_threshold: float = 0.0,
+    aggregator_percentile: float = 25.0,
+    real_signal_threshold: float = 0.05,
+    neg_npmi_threshold: float = -0.2,
 ):
     """Nuclear-seed Prune: anchor cell identity on the spatially-compact
     nucleus, then admit cytoplasmic tx whose gene fits the seed by PMI.
@@ -635,10 +641,21 @@ def prune_transcripts_nuclear_seed(
             )
         genes, gene_to_idx, W = build_sparse_npmi_matrix(npmi_df)
         W_sp_indptr, W_sp_indices, W_sp_data = _symmetric_csr_arrays(W)
+        # Sparse CSR has no NaN to fill — absent pairs are skipped by _wget.
     else:
         genes, gene_to_idx, W = build_dense_npmi_matrix(
             npmi_df, npmi_col=metric_col)
-        if nan_fill is not None:
+        # Phase 1b admission-gate NaN policy
+        # ----------------------------------
+        # Legacy `mean` gate folds NaN-filled zeros into the mean
+        # divisor identically to real near-zero PMI, so nan-filling is
+        # fine (and matches regression refs). The `hybrid`/`min` gates
+        # depend on observed-vs-unobserved status — nan-filled zeros
+        # would slip past the real-signal filter as in-band noise and
+        # would count as a finite pair in the min branch. To preserve
+        # observed-vs-unobserved semantics for hybrid/min, only nan-fill
+        # W when veto_mode == "mean".
+        if nan_fill is not None and veto_mode == "mean":
             np.nan_to_num(W, copy=False, nan=float(nan_fill))
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
 
@@ -676,6 +693,23 @@ def prune_transcripts_nuclear_seed(
                     .astype(np.int32).to_numpy())
     is_nuc_int = df["_is_nuc"].to_numpy().astype(np.uint8)
 
+    veto_mode_str = veto_mode.lower()
+    if veto_mode_str not in ("min", "mean", "hybrid"):
+        raise ValueError(
+            f"veto_mode must be 'min'/'mean'/'hybrid'; got {veto_mode!r}"
+        )
+    veto_mode_int = {"min": 0, "mean": 1, "hybrid": 2}[veto_mode_str]
+
+    # Bit-exactness gate: Phase 1b's legacy `mean` is the plain finite-
+    # mean test (no real-signal filter, no small-entity guard). The
+    # unified helper supports an `rs_active` variant of mean for Rescue,
+    # but at the prune call site we always disable it under `mean` so
+    # regression refs hold against the pre-helper `_mean_pmi_test`. The
+    # `hybrid`/`min` modes get the real-signal filter as designed.
+    rs_thr_kernel = (
+        0.0 if veto_mode_str == "mean" else float(real_signal_threshold)
+    )
+
     if use_sparse_panel:
         codes = _cy_prune.prune_cells_nuclear_seed_sparse(
             cell_tx_idx_lists,
@@ -690,6 +724,12 @@ def prune_transcripts_nuclear_seed(
             float(seed_coherence_floor),
             1 if nuclear_only_admit else 0,
             1 if tx_weighted else 0,
+            veto_mode_int,
+            float(min_admit_threshold),
+            float(mean_admit_threshold),
+            float(aggregator_percentile),
+            rs_thr_kernel,
+            float(neg_npmi_threshold),
         )
     else:
         codes = _cy_prune.prune_cells_nuclear_seed(
@@ -703,6 +743,12 @@ def prune_transcripts_nuclear_seed(
             float(seed_coherence_floor),
             1 if nuclear_only_admit else 0,
             1 if tx_weighted else 0,
+            veto_mode_int,
+            float(min_admit_threshold),
+            float(mean_admit_threshold),
+            float(aggregator_percentile),
+            rs_thr_kernel,
+            float(neg_npmi_threshold),
         )
 
     # Apply codes to out_col. Default state of out_col is the cell_id

@@ -2,6 +2,7 @@
 # cython: boundscheck=False, wraparound=False, nonecheck=False
 import numpy as np
 cimport numpy as cnp
+
 from libc.stdlib cimport malloc, free
 from cython.parallel cimport prange
 cimport openmp
@@ -339,6 +340,12 @@ cdef cnp.ndarray _prune_cells_nuclear_seed_core(
     double seed_coherence_floor,
     int nuclear_only_admit,
     int tx_weighted,
+    int veto_mode,
+    double min_admit_threshold,
+    double mean_admit_threshold,
+    double aggregator_percentile,
+    double real_signal_threshold,
+    double neg_npmi_threshold,
 ):
     """Shared orchestration for the dense and sparse nuclear-seed prune.
 
@@ -369,6 +376,20 @@ cdef cnp.ndarray _prune_cells_nuclear_seed_core(
     cdef cnp.ndarray[cnp.int32_t, ndim=1] sub_seed
     cdef cnp.int32_t[:] sub_seed_mv
     cdef int sub_seed_len
+
+    # Scratch float buffer for the hybrid admission gate's percentile
+    # aggregator. Sized at the PMI panel's row dimension. Allocated once,
+    # reused across all cell loops. Only meaningful when veto_mode != 1
+    # (legacy mean); harmless otherwise.
+    cdef int panel_n_genes
+    if use_sparse:
+        panel_n_genes = W_indptr.shape[0] - 1
+    else:
+        panel_n_genes = W_mv.shape[0]
+    cdef cnp.ndarray[cnp.float32_t, ndim=1] pmi_buf_arr = np.zeros(
+        panel_n_genes if panel_n_genes > 0 else 1, dtype=np.float32
+    )
+    cdef cnp.float32_t[:] pmi_buf_mv = pmi_buf_arr
 
     # Seed-membership lookup via a compact "in" check using sorted seed.
     # For typical seed sizes (<50 genes), linear scan is faster than a
@@ -467,9 +488,22 @@ cdef cnp.ndarray _prune_cells_nuclear_seed_core(
                     fitted = 1
                     break
             if fitted == 0:
-                fitted = _mean_pmi_test(
-                    g, seed_mv, seed_len, W_mv,
-                    W_indptr, W_indices, W_data, use_sparse, threshold)
+                fitted = _admission_test(
+                    g,
+                    &seed_mv[0],
+                    seed_len,
+                    W_mv,
+                    W_indptr, W_indices, W_data, use_sparse,
+                    &pmi_buf_mv[0],
+                    veto_mode,
+                    mean_admit_threshold if veto_mode != 1 else threshold,
+                    min_admit_threshold,
+                    aggregator_percentile,
+                    real_signal_threshold,
+                    neg_npmi_threshold,
+                    0,  # small_entity_guard_n unused at Phase 1b
+                    1,  # legacy_mean_test = 1 (Phase 1b mean uses `>=`)
+                )
             if fitted:
                 out_mv[tx_row] = 0  # main
             else:
@@ -532,9 +566,22 @@ cdef cnp.ndarray _prune_cells_nuclear_seed_core(
                     fitted = 1
                     break
             if fitted == 0:
-                fitted = _mean_pmi_test(
-                    g, sub_seed_mv, sub_seed_len, W_mv,
-                    W_indptr, W_indices, W_data, use_sparse, threshold)
+                fitted = _admission_test(
+                    g,
+                    &sub_seed_mv[0],
+                    sub_seed_len,
+                    W_mv,
+                    W_indptr, W_indices, W_data, use_sparse,
+                    &pmi_buf_mv[0],
+                    veto_mode,
+                    mean_admit_threshold if veto_mode != 1 else threshold,
+                    min_admit_threshold,
+                    aggregator_percentile,
+                    real_signal_threshold,
+                    neg_npmi_threshold,
+                    0,
+                    1,
+                )
             if fitted:
                 out_mv[tx_row] = 1  # partial
             # else: stays 2 (unassigned) — already default
@@ -553,6 +600,12 @@ def prune_cells_nuclear_seed(
     double seed_coherence_floor=-1e30,
     int nuclear_only_admit=0,
     int tx_weighted=1,
+    int veto_mode=1,
+    double min_admit_threshold=0.0,
+    double mean_admit_threshold=0.2,
+    double aggregator_percentile=25.0,
+    double real_signal_threshold=0.0,
+    double neg_npmi_threshold=-0.2,
 ):
     """Batch nuclear-seed prune over many cells — DENSE PMI backend.
 
@@ -607,6 +660,8 @@ def prune_cells_nuclear_seed(
         tx_gene_idx.shape[0],
         threshold, min_nuclear_genes, skip_phase_1c,
         seed_coherence_floor, nuclear_only_admit, tx_weighted,
+        veto_mode, min_admit_threshold, mean_admit_threshold,
+        aggregator_percentile, real_signal_threshold, neg_npmi_threshold,
     )
 
 
@@ -623,6 +678,12 @@ def prune_cells_nuclear_seed_sparse(
     double seed_coherence_floor=-1e30,
     int nuclear_only_admit=0,
     int tx_weighted=1,
+    int veto_mode=1,
+    double min_admit_threshold=0.0,
+    double mean_admit_threshold=0.2,
+    double aggregator_percentile=25.0,
+    double real_signal_threshold=0.0,
+    double neg_npmi_threshold=-0.2,
 ):
     """Batch nuclear-seed prune over many cells — SPARSE CSR PMI backend.
 
@@ -647,6 +708,8 @@ def prune_cells_nuclear_seed_sparse(
         tx_gene_idx.shape[0],
         threshold, min_nuclear_genes, skip_phase_1c,
         seed_coherence_floor, nuclear_only_admit, tx_weighted,
+        veto_mode, min_admit_threshold, mean_admit_threshold,
+        aggregator_percentile, real_signal_threshold, neg_npmi_threshold,
     )
 
 
@@ -1119,6 +1182,182 @@ cdef inline double _percentile_sorted(float *sorted_buf, int n, double p) noexce
     return sorted_buf[lo] * (1.0 - frac) + sorted_buf[hi] * frac
 
 
+cdef inline int _admission_test(
+    int gene_idx,
+    const cnp.int32_t *seed,
+    int seed_len,
+    cnp.float32_t[:, :] W,
+    const int[::1] W_indptr,       # sparse CSR row offsets (dummy when use_sparse=0)
+    const int[::1] W_indices,      # sparse CSR column indices
+    const float[::1] W_data,       # sparse CSR data
+    int use_sparse,                # 0 = dense W (NaN-skip); 1 = sparse CSR (absent-skip)
+    float *pmi_buf,                # caller-owned scratch >= seed_len
+    int veto_mode,                 # 0=min, 1=mean, 2=hybrid
+    double mean_threshold,
+    double min_admit_threshold,
+    double aggregator_percentile,
+    double real_signal_threshold,
+    double neg_npmi_threshold,
+    int small_entity_guard_n,
+    int legacy_mean_test,          # 1 = `>=` (Phase 1b legacy), 0 = `>` (Rescue legacy)
+) nogil:
+    """Unified admission gate for a candidate gene against a seed/entity
+    gene set. Returns 1 = admit, 0 = veto.
+
+    Modes
+    -----
+    0 (min)    : Veto if any seed gene has PMI < ``neg_npmi_threshold``.
+                 NaN entries are skipped (not treated as < threshold).
+    1 (mean)   : Legacy mean-PMI test. Admit if mean(finite PMIs) passes
+                 ``mean_threshold`` (>= when ``legacy_mean_test==1``;
+                 > when 0). NaN entries skipped. Empty / no-finite → veto.
+                 The ``real_signal_threshold > 0`` path adds the "real
+                 players" filter (Rescue's rs_active), and
+                 ``small_entity_guard_n > 0`` adds the found-neg fallback.
+    2 (hybrid) : Real-signal filter + unanimous-min fast-pass + percentile
+                 gate. Mirrors the Rescue hybrid branch (see
+                 `spatial.py:reassign_unassigned_grid_pool` for the
+                 Python reference impl). When
+                 ``real_signal_threshold <= 0`` it degenerates to a
+                 simple min-fast-pass + mean fallback over finite PMIs.
+
+    Note on NaN semantics: callers that nan-fill W to 0 will see those
+    cells as "real-signal" only if ``|0| > real_signal_threshold`` (i.e.
+    never for any positive threshold). For the hybrid gate to work as
+    intended, callers should pass an unfilled W (NaN-preserving) or
+    accept that nan-filled pairs are treated as in-band-zero (= dropped
+    by the real-signal filter when ``real_signal_threshold > 0``).
+    """
+    cdef int j, eg
+    cdef int n_finite = 0
+    cdef int n_signal = 0
+    cdef int found_neg = 0
+    cdef double pmi_sum = 0.0
+    cdef double mean_p, p_aggregate
+    cdef float v, av, min_signal_f, min_v_f
+    cdef int rs_active = 1 if real_signal_threshold > 0.0 else 0
+    cdef double rs_thr = real_signal_threshold
+
+    if seed_len <= 0:
+        # Empty seed: legacy `_mean_pmi_test` returned 0 (no admit);
+        # mirror that across all modes for safety.
+        return 0
+
+    if veto_mode == 0:
+        # min: veto on any PMI < neg_threshold. Unobserved pairs are
+        # skipped (NaN under dense, absent under sparse) — see _wget.
+        for j in range(seed_len):
+            eg = seed[j]
+            if eg == gene_idx:
+                continue
+            if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                         gene_idx, eg, &v):
+                continue
+            if v < neg_npmi_threshold:
+                return 0
+        return 1
+
+    if veto_mode == 1:
+        # mean (legacy).
+        if rs_active:
+            # Real-players filter; aggregator-percentile gate.
+            n_signal = 0
+            for j in range(seed_len):
+                eg = seed[j]
+                if eg == gene_idx:
+                    continue
+                if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                             gene_idx, eg, &v):
+                    continue
+                av = v if v >= 0.0 else -v
+                if av <= rs_thr:
+                    continue
+                pmi_buf[n_signal] = v
+                n_signal += 1
+            if n_signal == 0:
+                return 1  # no real signal → defer (admit)
+            _insertion_sort_floats(pmi_buf, n_signal)
+            p_aggregate = _percentile_sorted(pmi_buf, n_signal, aggregator_percentile)
+            if legacy_mean_test:
+                return 1 if p_aggregate >= mean_threshold else 0
+            return 1 if p_aggregate > mean_threshold else 0
+        else:
+            pmi_sum = 0.0
+            n_finite = 0
+            found_neg = 0
+            for j in range(seed_len):
+                eg = seed[j]
+                if eg == gene_idx:
+                    continue
+                if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                             gene_idx, eg, &v):
+                    continue
+                pmi_sum += v
+                n_finite += 1
+                if v < neg_npmi_threshold:
+                    found_neg = 1
+            if small_entity_guard_n > 0 and n_finite < small_entity_guard_n:
+                # Rescue's small-entity fallback (min-veto).
+                return 0 if found_neg else 1
+            if n_finite == 0:
+                # Legacy `_mean_pmi_test` returns 0 (no admit) on no-finite.
+                return 0
+            mean_p = pmi_sum / n_finite
+            if legacy_mean_test:
+                return 1 if mean_p >= mean_threshold else 0
+            return 1 if mean_p > mean_threshold else 0
+
+    # veto_mode == 2: hybrid.
+    if rs_active:
+        n_signal = 0
+        min_signal_f = 1e30
+        for j in range(seed_len):
+            eg = seed[j]
+            if eg == gene_idx:
+                continue
+            if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                         gene_idx, eg, &v):
+                continue
+            av = v if v >= 0.0 else -v
+            if av <= rs_thr:
+                continue
+            pmi_buf[n_signal] = v
+            if v < min_signal_f:
+                min_signal_f = v
+            n_signal += 1
+        if n_signal == 0:
+            return 1  # defer
+        if min_signal_f > min_admit_threshold:
+            return 1  # unanimous-positive fast-pass
+        _insertion_sort_floats(pmi_buf, n_signal)
+        p_aggregate = _percentile_sorted(pmi_buf, n_signal, aggregator_percentile)
+        # Rescue's hybrid uses `> mean_threshold` (i.e. veto when <=); preserve.
+        return 1 if p_aggregate > mean_threshold else 0
+    else:
+        # No real-signal filter active: min-fast-pass + mean-fallback
+        # over finite pairs. Matches Rescue's hybrid non-rs branch.
+        pmi_sum = 0.0
+        n_finite = 0
+        min_v_f = 1e30
+        for j in range(seed_len):
+            eg = seed[j]
+            if eg == gene_idx:
+                continue
+            if not _wget(W, W_indptr, W_indices, W_data, use_sparse,
+                         gene_idx, eg, &v):
+                continue
+            pmi_sum += v
+            n_finite += 1
+            if v < min_v_f:
+                min_v_f = v
+        if n_finite == 0:
+            return 0  # veto (Rescue mirrors this with vetoed=1)
+        if min_v_f > min_admit_threshold:
+            return 1
+        mean_p = pmi_sum / n_finite
+        return 1 if mean_p > mean_threshold else 0
+
+
 cdef void _rescue_one_tx(
     int i,
     int tid,
@@ -1158,6 +1397,9 @@ cdef void _rescue_one_tx(
     cnp.int32_t[:] ent_off_mv,
     cnp.int32_t[:] ent_g_mv,
     cnp.float32_t[:, :] W_mv,
+    const int[::1] dummy_W_indptr,    # for the dense-only _admission_test call
+    const int[::1] dummy_W_indices,
+    const float[::1] dummy_W_data,
     cnp.int32_t[:] best_ent_mv,
     cnp.float32_t[:] best_dist_mv,
     cnp.int32_t[:] reason_mv,
@@ -1227,115 +1469,70 @@ cdef void _rescue_one_tx(
 
                 if n_ent_genes == 0:
                     vetoed = 0
-                elif veto_mode == 0:
-                    for ig in range(e_off_lo, e_off_hi):
-                        eg = ent_g_mv[ig]
-                        if eg == g_idx:
-                            continue
-                        if W_mv[g_idx, eg] < neg_npmi_threshold:
-                            vetoed = 1
-                            break
-                elif veto_mode == 1:
-                    if rs_active:
-                        n_signal = 0
-                        for ig in range(e_off_lo, e_off_hi):
-                            eg = ent_g_mv[ig]
-                            if eg == g_idx:
-                                continue
-                            v_f = W_mv[g_idx, eg]
-                            if v_f != v_f:
-                                continue
-                            av_f = v_f if v_f >= 0.0 else -v_f
-                            if av_f <= rs_thr:
-                                continue
-                            pmi_buf[n_signal] = v_f
-                            n_signal += 1
-                        if n_signal == 0:
-                            vetoed = 0
-                        else:
-                            _insertion_sort_floats(pmi_buf, n_signal)
-                            p_aggregate = _percentile_sorted(
-                                pmi_buf, n_signal, agg_p
-                            )
-                            vetoed = 1 if p_aggregate <= mean_threshold else 0
-                    else:
-                        pmi_sum = 0.0
-                        n_finite = 0
-                        found_neg = 0
-                        for ig in range(e_off_lo, e_off_hi):
-                            eg = ent_g_mv[ig]
-                            if eg == g_idx:
-                                continue
-                            pmi_val = W_mv[g_idx, eg]
-                            if pmi_val == pmi_val:
-                                pmi_sum += pmi_val
-                                n_finite += 1
-                                if pmi_val < neg_npmi_threshold:
-                                    found_neg = 1
-                        if n_finite < small_entity_guard_n:
-                            vetoed = found_neg
-                            if not found_neg and n_finite > 0:
-                                used_fallback += 1
-                        elif n_finite == 0:
-                            vetoed = 1
-                        else:
-                            mean_p = pmi_sum / n_finite
-                            vetoed = 1 if mean_p <= mean_threshold else 0
                 else:
-                    # hybrid (veto_mode == 2)
+                    # Hybrid: short-circuit when candidate gene already
+                    # belongs to E's seed (rest of E has already been
+                    # vetted compatible with g by an earlier stage).
+                    # Mean/min modes never had this fast-path; preserve.
                     g_in_E = 0
-                    for ig in range(e_off_lo, e_off_hi):
-                        if ent_g_mv[ig] == g_idx:
-                            g_in_E = 1
-                            break
+                    if veto_mode == 2:
+                        for ig in range(e_off_lo, e_off_hi):
+                            if ent_g_mv[ig] == g_idx:
+                                g_in_E = 1
+                                break
                     if g_in_E:
                         vetoed = 0
                     else:
-                        if rs_active:
-                            n_signal = 0
-                            min_signal_f = 1e30
-                            for ig in range(e_off_lo, e_off_hi):
-                                eg = ent_g_mv[ig]
-                                v_f = W_mv[g_idx, eg]
-                                if v_f != v_f:
-                                    continue
-                                av_f = v_f if v_f >= 0.0 else -v_f
-                                if av_f <= rs_thr:
-                                    continue
-                                pmi_buf[n_signal] = v_f
-                                if v_f < min_signal_f:
-                                    min_signal_f = v_f
-                                n_signal += 1
-                            if n_signal == 0:
-                                vetoed = 0
-                            elif min_signal_f > min_admit_threshold:
-                                vetoed = 0
-                            else:
-                                _insertion_sort_floats(pmi_buf, n_signal)
-                                p_aggregate = _percentile_sorted(
-                                    pmi_buf, n_signal, agg_p
-                                )
-                                vetoed = 1 if p_aggregate <= mean_threshold else 0
-                        else:
+                        # Rescue's mean+non-rs_active branch tracks
+                        # `used_fallback` when small_entity_guard kicks
+                        # in with a positive (no-neg) outcome. The
+                        # shared helper doesn't surface that counter, so
+                        # we detect the fallback condition here and
+                        # bookkeep before the helper call. Behavior on
+                        # the admit/veto decision is identical to the
+                        # helper's mean+small_entity_guard branch.
+                        if (veto_mode == 1
+                                and not rs_active
+                                and small_entity_guard_n > 0):
                             pmi_sum = 0.0
                             n_finite = 0
-                            min_pmi = 1e300
+                            found_neg = 0
                             for ig in range(e_off_lo, e_off_hi):
                                 eg = ent_g_mv[ig]
+                                if eg == g_idx:
+                                    continue
                                 pmi_val = W_mv[g_idx, eg]
                                 if pmi_val == pmi_val:
                                     pmi_sum += pmi_val
                                     n_finite += 1
-                                    if pmi_val < min_pmi:
-                                        min_pmi = pmi_val
-                            if n_finite == 0:
-                                vetoed = 1
-                            elif min_pmi > min_admit_threshold:
-                                vetoed = 0
-                            elif pmi_sum / n_finite > mean_threshold:
-                                vetoed = 0
-                            else:
-                                vetoed = 1
+                                    if pmi_val < neg_npmi_threshold:
+                                        found_neg = 1
+                            if n_finite < small_entity_guard_n and not found_neg and n_finite > 0:
+                                used_fallback += 1
+                        # Dispatch to the shared admission gate. Rescue
+                        # uses `> mean_threshold` (legacy_mean_test=0).
+                        # Rescue is dense-only — pass dummy sparse arrays
+                        # and use_sparse=0. (Sparse-W support for Rescue
+                        # would need _wget-backed plumbing here too.)
+                        vetoed = 0 if _admission_test(
+                            g_idx,
+                            &ent_g_mv[e_off_lo],
+                            e_off_hi - e_off_lo,
+                            W_mv,
+                            dummy_W_indptr,
+                            dummy_W_indices,
+                            dummy_W_data,
+                            0,  # use_sparse = 0 (Rescue is dense-only)
+                            pmi_buf,
+                            veto_mode,
+                            mean_threshold,
+                            min_admit_threshold,
+                            agg_p,
+                            rs_thr if rs_active else 0.0,
+                            neg_npmi_threshold,
+                            small_entity_guard_n,
+                            0,  # legacy_mean_test = 0 (Rescue: `>`)
+                        ) else 1
 
                 cache_mv[tid, ent] = 1 if vetoed else 2
                 gen_mv[tid, ent] = current_gen
@@ -1585,6 +1782,16 @@ def rescue_per_tx_batch(
     cdef int i
     cdef int tid_loop
 
+    # Dense-only dummy CSR buffers for the shared _admission_test
+    # helper. Rescue never indexes sparse W; these satisfy the typed
+    # memoryview contract.
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] _dummy_ip = np.zeros(1, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] _dummy_ix = np.zeros(1, dtype=np.int32)
+    cdef cnp.ndarray[cnp.float32_t, ndim=1] _dummy_dt = np.zeros(1, dtype=np.float32)
+    cdef const int[::1]   _dummy_ip_mv = _dummy_ip
+    cdef const int[::1]   _dummy_ix_mv = _dummy_ix
+    cdef const float[::1] _dummy_dt_mv = _dummy_dt
+
     try:
         # Per-tx work runs in parallel via prange. Per-thread state
         # (pmi_buf slice + cache row + gen row + witness buffers) is
@@ -1609,6 +1816,7 @@ def rescue_per_tx_batch(
                 una_c_mv, una_g_mv, nb_bins_mv,
                 ass_c_mv, ass_ent_mv, bin_off_mv, bin_data_mv,
                 ent_off_mv, ent_g_mv, W_mv,
+                _dummy_ip_mv, _dummy_ix_mv, _dummy_dt_mv,
                 best_ent_mv, best_dist_mv, reason_mv, sef_mv,
             )
     finally:

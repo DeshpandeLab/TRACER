@@ -1445,6 +1445,15 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # if the panel lacks a PMI column or the input has no nuclear flag
     # (legacy synthetic panels).
     metric_col = "PMI" if "PMI" in npmi_panel.columns else "NPMI"
+    # Phase 1b admission gate — pulled from cfg.phase1 when available.
+    # Defaults preserve the legacy "mean" gate bit-exactly.
+    _p1 = getattr(cfg, "phase1", None)
+    _p1_veto_mode = getattr(_p1, "veto_mode", "mean") if _p1 is not None else "mean"
+    _p1_mean_admit = getattr(_p1, "mean_admit_threshold", 0.2) if _p1 is not None else 0.2
+    _p1_min_admit = getattr(_p1, "min_admit_threshold", 0.0) if _p1 is not None else 0.0
+    _p1_agg_pct = getattr(_p1, "aggregator_percentile", 25.0) if _p1 is not None else 25.0
+    _p1_rs_thr = getattr(_p1, "real_signal_threshold", 0.05) if _p1 is not None else 0.05
+    _p1_neg_thr = getattr(_p1, "neg_npmi_threshold", -0.2) if _p1 is not None else -0.2
     if "overlaps_nucleus" in df.columns:
         df_pruned, aux = prune_transcripts_nuclear_seed(
             df, npmi_panel,
@@ -1456,6 +1465,12 @@ def run_segmented_pipeline(df: pd.DataFrame,
             seed_coherence_floor=SEED_COHERENCE_FLOOR,
             nuclear_only_admit=NUCLEAR_ONLY_ADMIT,
             tx_weighted=TX_WEIGHTED_PRUNE,
+            veto_mode=_p1_veto_mode,
+            mean_admit_threshold=_p1_mean_admit,
+            min_admit_threshold=_p1_min_admit,
+            aggregator_percentile=_p1_agg_pct,
+            real_signal_threshold=_p1_rs_thr,
+            neg_npmi_threshold=_p1_neg_thr,
             n_jobs=-1, show_progress=False,
         )
     else:

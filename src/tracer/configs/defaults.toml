@@ -30,6 +30,18 @@ tx_weighted_prune = true
 # left for Rescue. Cuts Phase-1 cost ~50% on segmented data.
 nuclear_only_admit = true
 
+# Phase 1b admission gate. "mean" = legacy (mean-PMI vs pmi_threshold,
+# default for back-compat). "hybrid" = real-signal + unanimous-min +
+# percentile-aggregator gate (mirrors Rescue). "min" = veto on any
+# strongly-negative seed pair. Switching default → "hybrid" will
+# regenerate Phase-1 partition; refs must be regenerated deliberately.
+veto_mode = "mean"
+mean_admit_threshold = 0.2
+min_admit_threshold = 0.0
+aggregator_percentile = 25.0
+real_signal_threshold = 0.05
+neg_npmi_threshold = -0.2
+
 
 # ---------------------------------------------------------------------
 # Split-Phase1 — z-gap-based splitter for Phase-1 entities.
