@@ -77,7 +77,7 @@ class Phase1Config:
     nuclear_only_admit: bool = True
 
     # 1b admission gate (mirrors RescueConfig's veto knobs)
-    veto_mode: Literal["min", "mean", "hybrid"] = "mean"
+    veto_mode: Literal["min", "mean", "hybrid"] = "hybrid"
     mean_admit_threshold: float = 0.2
     min_admit_threshold: float = 0.0
     aggregator_percentile: float = 25.0

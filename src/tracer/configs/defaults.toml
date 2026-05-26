@@ -30,12 +30,12 @@ tx_weighted_prune = true
 # left for Rescue. Cuts Phase-1 cost ~50% on segmented data.
 nuclear_only_admit = true
 
-# Phase 1b admission gate. "mean" = legacy (mean-PMI vs pmi_threshold,
-# default for back-compat). "hybrid" = real-signal + unanimous-min +
-# percentile-aggregator gate (mirrors Rescue). "min" = veto on any
-# strongly-negative seed pair. Switching default → "hybrid" will
-# regenerate Phase-1 partition; refs must be regenerated deliberately.
-veto_mode = "mean"
+# Phase 1b admission gate. "hybrid" (default) = real-signal +
+# unanimous-min + percentile-aggregator gate (mirrors Rescue) — catches
+# cross-lineage dilution admits the mean test misses (e.g. EPCAM into a
+# macrophage-leaning seed). "mean" = legacy (mean-PMI vs pmi_threshold).
+# "min" = veto on any strongly-negative seed pair.
+veto_mode = "hybrid"
 mean_admit_threshold = 0.2
 min_admit_threshold = 0.0
 aggregator_percentile = 25.0
