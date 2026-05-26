@@ -1,4 +1,28 @@
-"""Phase 4: Hierarchical entity stitching."""
+"""Phase 4: Hierarchical entity stitching.
+
+Stitch acceptance is layered:
+
+  (1) candidate enumeration via bin-grid + ``dist_threshold`` pairwise
+      tx-tx edges,
+  (2) witness floor (``min_local_tx_per_entity``) — the spatial sanity
+      check on the accept path: each entity must contribute K unique
+      tx in the shared bin neighborhood,
+  (3) ΔC test with C(union) bypass — composition is the primary
+      acceptance gate (ΔC ≥ ``deltaC_min``, or C(union) ≥
+      ``c_union_bypass`` when size-capped),
+  (4) optional Mahalanobis RESCUE (``mahalanobis_d_rescue``) — when
+      composition borderline-rejects (``rescue_delta_c_floor`` <
+      ΔC < 0) AND the two tx clouds are geometrically enmeshed
+      (Maha D ≤ threshold), override the rejection. Recovers EMT-like
+      cells whose two-program anti-correlation makes ΔC reject a
+      legitimate single-cell merge. The ΔC floor protects against
+      fusing engulfment doublets where composition rejects strongly,
+  (5) ``max_merger_depth`` cap on merger-tree height.
+
+NOTE: an earlier veto-direction Mahalanobis implementation was
+superseded — the witness count adequately gates the accept path;
+geometry's useful contribution is the rescue, not a veto.
+"""
 
 import heapq
 import itertools
@@ -1008,6 +1032,15 @@ def stitch_entities_hierarchical(
     # partial is a real fragment of the cell), as opposed to the partial
     # being embedded INSIDE the cell (the contamination case).
     spatial_gate_flipped: bool = False,
+    # Optional Mahalanobis-D RESCUE on borderline-ΔC pairs. When set,
+    # the loop OVERRIDES a ΔC reject when
+    #     rescue_delta_c_floor < ΔC < 0    AND    D ≤ mahalanobis_d_rescue
+    # where D = sqrt((μ_A − μ_B)^T Σ_pooled^-1 (μ_A − μ_B)) over the
+    # two entities' tx coords. Singular Σ / n<2 cases gracefully no-op
+    # (no rescue). None = off (default). Requires `entity_tx_coords`
+    # (or the function will silently disable). See module docstring.
+    mahalanobis_d_rescue: float | None = None,
+    rescue_delta_c_floor: float = -0.2,
 ):
     """Hierarchical entity stitching driven by ΔC.
 
@@ -1659,6 +1692,8 @@ def stitch_entities_hierarchical(
         "init_bypasses": 0,       # heap-init pairs that took the bypass
         "merges_via_bypass": 0,   # actual unions that fired through bypass
         "merges_total": 0,        # all unions
+        "mahalanobis_rescue_checks": 0,  # ΔC-borderline pairs evaluated for rescue
+        "mahalanobis_rescues": 0,        # actual ΔC rejects overridden by Maha rescue
     })
 
     # ----------------------------------------------------------------
@@ -1705,6 +1740,71 @@ def stitch_entities_hierarchical(
             root_centroid = root_bbox_min = root_bbox_max = None
             root_tx_coords = None
             # root_n_tx kept — it's used by c_union_bypass_max_n_tx too.
+
+    # Mahalanobis RESCUE: build per-root tx-coord arrays if not already
+    # built by the K≥2 spatial-gate path. Independent of
+    # `spatial_centroid_gate`. If `entity_tx_coords` is missing we
+    # silently disable (the rescue is a soft optional layer).
+    _maha_n_dim: int = 3 if use_3d else 2
+    if mahalanobis_d_rescue is not None and root_tx_coords is None:
+        coord_keys_m = ["x", "y", "z"] if use_3d else ["x", "y"]
+        _maha_n_dim = len(coord_keys_m)
+        if entity_tx_coords is None:
+            mahalanobis_d_rescue = None  # graceful no-op
+        else:
+            try:
+                root_tx_coords = [
+                    np.asarray(
+                        entity_tx_coords.get(
+                            str(eid), np.zeros((0, len(coord_keys_m)))
+                        ),
+                        dtype=np.float64,
+                    )
+                    for eid in summary_df["entity_id"].astype(str)
+                ]
+            except Exception:
+                mahalanobis_d_rescue = None  # graceful no-op
+
+    def _mahalanobis_distance(ra: int, rb: int) -> float:
+        """Mahalanobis-D between the two roots' tx clouds.
+
+        D = sqrt( (μ_A − μ_B)^T  Σ_pooled^-1  (μ_A − μ_B) ),
+        Σ_pooled = ((n_A − 1)·Cov_A + (n_B − 1)·Cov_B) / (n_A + n_B − 2)
+
+        Returns NaN when n<2 in either side, when tx coords are
+        unavailable, or when Σ_pooled is singular / numerically
+        ill-conditioned (callers treat NaN as "no rescue").
+        """
+        if root_tx_coords is None:
+            return float("nan")
+        ca = root_tx_coords[ra]
+        cb = root_tx_coords[rb]
+        if ca is None or cb is None or ca.size == 0 or cb.size == 0:
+            return float("nan")
+        n_a = int(ca.shape[0])
+        n_b = int(cb.shape[0])
+        if n_a < 2 or n_b < 2:
+            return float("nan")
+        mu_a = ca.mean(axis=0)
+        mu_b = cb.mean(axis=0)
+        cov_a = np.atleast_2d(np.cov(ca, rowvar=False, ddof=1))
+        cov_b = np.atleast_2d(np.cov(cb, rowvar=False, ddof=1))
+        denom = float(n_a + n_b - 2)
+        if denom <= 0.0:
+            return float("nan")
+        cov_pooled = ((n_a - 1) * cov_a + (n_b - 1) * cov_b) / denom
+        try:
+            cond = np.linalg.cond(cov_pooled)
+            if not np.isfinite(cond) or cond > 1e12:
+                return float("nan")
+            diff = (mu_a - mu_b).reshape(-1, 1)
+            sol = np.linalg.solve(cov_pooled, diff)
+            d2 = float((diff.T @ sol).item())
+        except np.linalg.LinAlgError:
+            return float("nan")
+        if not np.isfinite(d2) or d2 < 0.0:
+            return float("nan")
+        return float(np.sqrt(d2))
 
     def _spatial_overlap(ra: int, rb: int) -> bool:
         """Default rule: smaller's centroid inside larger's tx cloud.
@@ -2021,6 +2121,17 @@ def stitch_entities_hierarchical(
             # ΔC merges happen first; this pair gets revisited at pop
             # time and merged via the spatial-override path.
             heapq.heappush(heap, _heap_item(di, i, j))
+        elif (
+            mahalanobis_d_rescue is not None
+            and np.isfinite(di)
+            and rescue_delta_c_floor < di < 0.0
+        ):
+            # Mahalanobis-rescue candidate: ΔC says reject but ΔC sits
+            # in the rescue band. Push at the real (negative) ΔC so
+            # the rescue gets a chance at pop time. The pop-time check
+            # re-evaluates ΔC against current roots and consults the
+            # Maha distance before admitting.
+            heapq.heappush(heap, _heap_item(di, i, j))
 
     _phase("heap_init")
     # greedy merging
@@ -2037,6 +2148,7 @@ def stitch_entities_hierarchical(
         # recompute deltaC for current clusters (because a,b may have merged)
         dc_now, cu_now = compute_deltaC_roots(ra, rb)
         post_override = False
+        maha_rescued = False
         if not _pair_passes_gate(dc_now, cu_now, ra, rb):
             # ΔC says reject. In "post" mode, give the spatial gate
             # one chance: if the (current-root) centroid test still
@@ -2046,6 +2158,20 @@ def stitch_entities_hierarchical(
                     and root_centroid is not None
                     and _spatial_overlap(ra, rb)):
                 post_override = True
+            elif (
+                mahalanobis_d_rescue is not None
+                and np.isfinite(dc_now)
+                and rescue_delta_c_floor < dc_now < 0.0
+            ):
+                # Mahalanobis RESCUE — override the ΔC reject when the
+                # two tx clouds are geometrically enmeshed.
+                _LAST_GATE_STATS["mahalanobis_rescue_checks"] += 1
+                d = _mahalanobis_distance(ra, rb)
+                if np.isfinite(d) and d <= float(mahalanobis_d_rescue):
+                    maha_rescued = True
+                    _LAST_GATE_STATS["mahalanobis_rescues"] += 1
+                else:
+                    continue
             else:
                 continue
 
@@ -2095,6 +2221,23 @@ def stitch_entities_hierarchical(
                         [root_tx_coords[rnew], root_tx_coords[rold]], axis=0
                     )
                 root_tx_coords[rold] = np.zeros((0, root_centroid.shape[1]), dtype=np.float64)
+        elif mahalanobis_d_rescue is not None and root_tx_coords is not None:
+            # Mahalanobis-rescue only (spatial centroid gate is off) —
+            # still need to maintain concatenated tx-coord arrays on
+            # union so the rescue sees the merged cloud on subsequent
+            # comparisons.
+            n_dim_u = (
+                root_tx_coords[rnew].shape[1] if root_tx_coords[rnew].size
+                else (root_tx_coords[rold].shape[1]
+                      if root_tx_coords[rold].size else _maha_n_dim)
+            )
+            if root_tx_coords[rnew].size == 0:
+                root_tx_coords[rnew] = root_tx_coords[rold]
+            elif root_tx_coords[rold].size > 0:
+                root_tx_coords[rnew] = np.concatenate(
+                    [root_tx_coords[rnew], root_tx_coords[rold]], axis=0
+                )
+            root_tx_coords[rold] = np.zeros((0, n_dim_u), dtype=np.float64)
 
         # union genes (and primitive sums when in decomposable mode).
         # In decomposable mode we already computed _combine_prims for
@@ -2538,6 +2681,10 @@ def apply_stitching_to_transcripts_memory_efficient(
     # Flipped overlap test: larger's centroid inside smaller's tx cloud.
     # Effective K capped at floor(n_smaller / 3).
     spatial_gate_flipped: bool = False,
+    # Optional Mahalanobis-D RESCUE on borderline-ΔC pairs. See
+    # `stitch_entities_hierarchical` docstring. None = off (default).
+    mahalanobis_d_rescue: float | None = None,
+    rescue_delta_c_floor: float = -0.2,
 ):
     """
     Memory-efficient stitching wrapper optimized for very large datasets (10M+ rows).
@@ -2651,10 +2798,15 @@ def apply_stitching_to_transcripts_memory_efficient(
         df_final[entity_col].astype(str).value_counts().to_dict()
     )
 
-    # When the K≥2 strict spatial gate is requested, compute per-entity
-    # tx-coord arrays. Cheap groupby-by-entity on transcript-level data.
+    # When the K≥2 strict spatial gate OR the Mahalanobis rescue is
+    # requested, compute per-entity tx-coord arrays. Cheap groupby-by-
+    # entity on transcript-level data.
     entity_tx_coords_dict: dict | None = None
-    if spatial_centroid_gate and spatial_centroid_k >= 2:
+    _needs_tx_coords = (
+        (spatial_centroid_gate and spatial_centroid_k >= 2)
+        or mahalanobis_d_rescue is not None
+    )
+    if _needs_tx_coords:
         coord_cols_used = list(coord_cols) if use_3d else list(coord_cols[:2])
         entity_tx_coords_dict = {}
         ent_str_col = df_final[entity_col].astype(str)
@@ -2697,6 +2849,8 @@ def apply_stitching_to_transcripts_memory_efficient(
         entity_tx_coords=entity_tx_coords_dict,
         spatial_gate_mode=spatial_gate_mode,
         spatial_gate_flipped=spatial_gate_flipped,
+        mahalanobis_d_rescue=mahalanobis_d_rescue,
+        rescue_delta_c_floor=rescue_delta_c_floor,
         **legacy_kwargs,
     )
 

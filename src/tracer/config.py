@@ -26,6 +26,7 @@ pipeline.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -489,6 +490,26 @@ class StitchConfig:
     # Witness floor (per-entity tx count in shared bin neighborhood)
     min_local_tx_per_entity: int = 3
 
+    # Mahalanobis-D RESCUE on borderline-ΔC pairs.
+    # When `mahalanobis_d_rescue` is set (recommended ~1.0), the loop
+    # OVERRIDES a ΔC reject for candidate pairs whose:
+    #     rescue_delta_c_floor < ΔC < 0    AND    D ≤ mahalanobis_d_rescue
+    # i.e. when composition borderline-rejects AND the two tx clouds
+    # are geometrically enmeshed (low Mahalanobis D relative to the
+    # pooled covariance structure). Recovers EMT-like cells where the
+    # panel's epi/mes anti-correlation drags ΔC slightly negative on a
+    # legitimate single-cell merge. Default `None` = off (back-compat).
+    #
+    # The `rescue_delta_c_floor` (default -0.2, must be ≤ 0) protects
+    # against fusing engulfment doublets (jikammne-like: ΔC = -0.49,
+    # D ≈ 0.5 — D is low, but ΔC is well below the floor → no rescue).
+    # An earlier veto-direction Maha implementation was superseded —
+    # the witness floor `min_local_tx_per_entity` already gates the
+    # accept path adequately; geometry's useful contribution is the
+    # rescue, not a veto.
+    mahalanobis_d_rescue: float | None = None
+    rescue_delta_c_floor: float = -0.2
+
     def __post_init__(self) -> None:
         if not (-1.0 <= self.deltaC_min <= 1.0):
             raise ValueError(
@@ -528,6 +549,23 @@ class StitchConfig:
             raise ValueError(
                 f"stitch.min_local_tx_per_entity must be >= 0; "
                 f"got {self.min_local_tx_per_entity}"
+            )
+        if self.mahalanobis_d_rescue is not None and not (
+            self.mahalanobis_d_rescue > 0.0
+        ):
+            raise ValueError(
+                f"stitch.mahalanobis_d_rescue must be > 0 when set; "
+                f"got {self.mahalanobis_d_rescue}"
+            )
+        if not math.isfinite(self.rescue_delta_c_floor):
+            raise ValueError(
+                f"stitch.rescue_delta_c_floor must be finite; "
+                f"got {self.rescue_delta_c_floor}"
+            )
+        if self.rescue_delta_c_floor > 0.0:
+            raise ValueError(
+                f"stitch.rescue_delta_c_floor must be <= 0; "
+                f"got {self.rescue_delta_c_floor}"
             )
 
 

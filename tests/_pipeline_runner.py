@@ -1686,6 +1686,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
         G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else auto_Gz),
         z_neighbor_depth=cfg.stitch.z_neighbor_depth,
         min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
+        mahalanobis_d_rescue=cfg.stitch.mahalanobis_d_rescue,
+        rescue_delta_c_floor=cfg.stitch.rescue_delta_c_floor,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
@@ -1884,6 +1886,8 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
         G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else 1.0),
         z_neighbor_depth=cfg.stitch.z_neighbor_depth,
         min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
+        mahalanobis_d_rescue=cfg.stitch.mahalanobis_d_rescue,
+        rescue_delta_c_floor=cfg.stitch.rescue_delta_c_floor,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
