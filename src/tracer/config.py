@@ -85,6 +85,22 @@ class Phase1Config:
     real_signal_threshold: float = 0.05
     neg_npmi_threshold: float = -0.2
 
+    # ------------------------------------------------------------------
+    # Phase-1-time Mahalanobis-gated remerge (opt-in).
+    # ------------------------------------------------------------------
+    # Sibling of StitchConfig.mahalanobis_d_rescue applied one stage
+    # earlier — between Phase1-QC and Rescue. For each entity pair
+    # sharing a bin neighborhood (xy 8-Moore + ±1 z), if
+    #
+    #     maha_remerge_delta_c_floor < ΔC < 0   AND   D ≤ maha_remerge_d
+    #
+    # the two roots are unioned via DSU. The ΔC floor (≤ 0) protects
+    # against fusing engulfment doublets where composition rejects
+    # strongly. When ``maha_remerge_d`` is ``None`` (default), the
+    # stage is a no-op and the pipeline runs bit-exact unchanged.
+    maha_remerge_d: float | None = None
+    maha_remerge_delta_c_floor: float = -0.2
+
     def __post_init__(self) -> None:
         if not (-1.0 <= self.pmi_threshold <= 1.0):
             raise ValueError(
@@ -109,6 +125,23 @@ class Phase1Config:
             raise ValueError(
                 f"phase1.real_signal_threshold must be >= 0; "
                 f"got {self.real_signal_threshold}"
+            )
+        if self.maha_remerge_d is not None and not (
+            self.maha_remerge_d > 0.0
+        ):
+            raise ValueError(
+                f"phase1.maha_remerge_d must be > 0 when set; "
+                f"got {self.maha_remerge_d}"
+            )
+        if not math.isfinite(self.maha_remerge_delta_c_floor):
+            raise ValueError(
+                f"phase1.maha_remerge_delta_c_floor must be finite; "
+                f"got {self.maha_remerge_delta_c_floor}"
+            )
+        if self.maha_remerge_delta_c_floor > 0.0:
+            raise ValueError(
+                f"phase1.maha_remerge_delta_c_floor must be <= 0; "
+                f"got {self.maha_remerge_delta_c_floor}"
             )
 
 

@@ -1533,6 +1533,27 @@ def run_segmented_pipeline(df: pd.DataFrame,
     )
     _record_stage(progression, "Phase1-QC", df_pruned, "tracer_id")
 
+    # Phase-1-time Mahalanobis-gated remerge (opt-in). Sibling of the
+    # Stitch-time rescue applied one stage earlier so EMT-like
+    # over-splits collapse before Rescue/Group/Stitch see them. No-op
+    # when ``cfg.phase1.maha_remerge_d is None`` (default).
+    _p1_maha_d = getattr(_p1, "maha_remerge_d", None) if _p1 is not None else None
+    if _p1_maha_d is not None:
+        from tracer.phase1_rescue import phase1_maha_remerge
+        _p1_maha_floor = float(
+            getattr(_p1, "maha_remerge_delta_c_floor", -0.2)
+        )
+        df_pruned, _p1_resc_stats = phase1_maha_remerge(
+            df_pruned, npmi_panel,
+            threshold=float(_p1_maha_d),
+            floor=_p1_maha_floor,
+            cfg=cfg,
+            entity_col="tracer_id",
+            gene_col="feature_name",
+            verbose=False,
+        )
+        _record_stage(progression, "Phase1-Maha-Remerge", df_pruned, "tracer_id")
+
     # Split stage REMOVED. The nuclear-seed prune emits spatially
     # compact entities by construction (anchored on the nucleus), so
     # there are no spatially-disconnected gene clusters for Split to

@@ -42,6 +42,15 @@ aggregator_percentile = 25.0
 real_signal_threshold = 0.05
 neg_npmi_threshold = -0.2
 
+# Phase-1-time Mahalanobis-gated remerge (opt-in). Sibling of
+# stitch.mahalanobis_d_rescue, applied between Phase1-QC and Rescue.
+# When set (recommended ~1.0), each candidate entity pair sharing a
+# bin neighborhood is unioned via DSU when:
+#     maha_remerge_delta_c_floor < ΔC < 0   AND   D ≤ maha_remerge_d
+# Leave commented out for default (None) — bit-exact unchanged behavior.
+# maha_remerge_d = 1.0
+maha_remerge_delta_c_floor = -0.2
+
 
 # ---------------------------------------------------------------------
 # Split-Phase1 — z-gap-based splitter for Phase-1 entities.
