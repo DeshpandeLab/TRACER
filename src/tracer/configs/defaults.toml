@@ -42,13 +42,13 @@ aggregator_percentile = 25.0
 real_signal_threshold = 0.05
 neg_npmi_threshold = -0.2
 
-# Phase-1-time Mahalanobis-gated remerge (opt-in). Sibling of
+# Phase-1-time Mahalanobis-gated remerge. Sibling of
 # stitch.mahalanobis_d_rescue, applied between Phase1-QC and Rescue.
-# When set (recommended ~1.0), each candidate entity pair sharing a
-# bin neighborhood is unioned via DSU when:
+# Each candidate entity pair sharing a bin neighborhood is unioned via
+# DSU when:
 #     maha_remerge_delta_c_floor < ΔC < 0   AND   D ≤ maha_remerge_d
-# Leave commented out for default (None) — bit-exact unchanged behavior.
-# maha_remerge_d = 1.0
+# Comment the line below (or set to "off" via code) to disable.
+maha_remerge_d = 1.0
 maha_remerge_delta_c_floor = -0.2
 
 
@@ -308,10 +308,9 @@ dist_threshold_um = 5.0
 # min(threshold, entity n_tx) internally — landed 2026-05-14).
 min_local_tx_per_entity = 3
 
-# Mahalanobis-D RESCUE on borderline-ΔC pairs (opt-in).
+# Mahalanobis-D RESCUE on borderline-ΔC pairs.
 #
-# When set (recommended ~1.0), the loop OVERRIDES a ΔC reject for
-# candidate pairs whose:
+# The loop OVERRIDES a ΔC reject for candidate pairs whose:
 #     rescue_delta_c_floor < ΔC < 0   AND   D ≤ mahalanobis_d_rescue
 # i.e. when composition borderline-rejects AND the two tx clouds are
 # geometrically enmeshed (low Mahalanobis D relative to the pooled
@@ -326,9 +325,10 @@ min_local_tx_per_entity = 3
 # path adequately; geometry's useful contribution is the rescue,
 # not a veto.
 #
-# TOML cannot encode `None`; leave commented out to keep the default
-# (off / back-compat). Uncomment with a numeric value to enable.
-# mahalanobis_d_rescue = 1.0
+# Default 1.0 ships the rescue on (PDAC 2 mm: ~1.8 k legitimate
+# cell-consolidations that ΔC alone misses). Comment out the line
+# below (or set to "off" via code) to disable.
+mahalanobis_d_rescue = 1.0
 rescue_delta_c_floor = -0.2
 
 

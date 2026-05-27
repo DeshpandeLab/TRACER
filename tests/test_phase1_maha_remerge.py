@@ -77,11 +77,17 @@ def _entity(label: str, n: int, center, sigma, gene_pool, rng):
 # Config validation
 # ---------------------------------------------------------------------
 
-def test_config_default_is_none():
-    """Default knob is None — Phase-1 rescue off, back-compat."""
+def test_config_default_ships_on():
+    """Default Phase-1-Maha-Remerge ships at D=1.0 (rescue ΔC ∈ (-0.2, 0))."""
     cfg = Phase1Config()
-    assert cfg.maha_remerge_d is None
+    assert cfg.maha_remerge_d == 1.0
     assert cfg.maha_remerge_delta_c_floor == -0.2
+
+
+def test_config_can_disable():
+    """Setting maha_remerge_d to None disables the stage (back-compat)."""
+    cfg = Phase1Config(maha_remerge_d=None)
+    assert cfg.maha_remerge_d is None
 
 
 def test_config_validates_positive_d():
@@ -233,22 +239,19 @@ def test_positive_delta_c_no_rescue():
 
 
 # ---------------------------------------------------------------------
-# Default-None pipeline back-compat: when the cfg knob is None the
-# stage is skipped — verified by mounting a synthetic two-entity df
-# through `run_segmented_pipeline` with the default config and
-# checking no Phase1-Maha-Remerge stage was recorded.
+# Default pipeline behavior: Phase1-Maha-Remerge ships on at D=1.0 with
+# ΔC floor -0.2; setting maha_remerge_d=None disables the stage as a
+# back-compat escape hatch.
 # ---------------------------------------------------------------------
 
-def test_pipeline_default_none_skips_stage():
-    """With cfg.phase1.maha_remerge_d=None (default), the new stage
-    must not be recorded — guarantees bit-exact back-compat for the
-    smoke + regression suites."""
+def test_pipeline_default_ships_on():
+    """Default config has Phase1-Maha-Remerge enabled at D=1.0."""
     pytest.importorskip("tracer.stitching")
     from tracer.config import load_config
     cfg = load_config()
-    assert cfg.phase1.maha_remerge_d is None
-    # Sanity: the field exists.
+    assert cfg.phase1.maha_remerge_d == 1.0
     assert hasattr(cfg.phase1, "maha_remerge_delta_c_floor")
+    assert cfg.phase1.maha_remerge_delta_c_floor == -0.2
 
 
 # ---------------------------------------------------------------------

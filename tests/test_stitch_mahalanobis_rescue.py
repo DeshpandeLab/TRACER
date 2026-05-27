@@ -94,11 +94,17 @@ def _gauss_entity(label: str, n: int, center, sigma, gene_pool, rng):
 # Config validation
 # ---------------------------------------------------------------------
 
-def test_config_default_is_none():
-    """Default knob value is None → rescue off (back-compat)."""
+def test_config_default_ships_on():
+    """Default Stitch Mahalanobis-D rescue ships at D=1.0."""
     cfg = StitchConfig()
-    assert cfg.mahalanobis_d_rescue is None
+    assert cfg.mahalanobis_d_rescue == 1.0
     assert cfg.rescue_delta_c_floor == -0.2
+
+
+def test_config_can_disable():
+    """Setting mahalanobis_d_rescue to None disables the rescue (back-compat)."""
+    cfg = StitchConfig(mahalanobis_d_rescue=None)
+    assert cfg.mahalanobis_d_rescue is None
 
 
 def test_config_validates_positive():

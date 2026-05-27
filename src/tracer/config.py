@@ -96,9 +96,9 @@ class Phase1Config:
     #
     # the two roots are unioned via DSU. The ΔC floor (≤ 0) protects
     # against fusing engulfment doublets where composition rejects
-    # strongly. When ``maha_remerge_d`` is ``None`` (default), the
-    # stage is a no-op and the pipeline runs bit-exact unchanged.
-    maha_remerge_d: float | None = None
+    # strongly. Default 1.0 ships the stage on; set to ``None`` to
+    # disable (the stage becomes a no-op).
+    maha_remerge_d: float | None = 1.0
     maha_remerge_delta_c_floor: float = -0.2
 
     def __post_init__(self) -> None:
@@ -531,7 +531,9 @@ class StitchConfig:
     # are geometrically enmeshed (low Mahalanobis D relative to the
     # pooled covariance structure). Recovers EMT-like cells where the
     # panel's epi/mes anti-correlation drags ΔC slightly negative on a
-    # legitimate single-cell merge. Default `None` = off (back-compat).
+    # legitimate single-cell merge. Default 1.0 ships the rescue on
+    # (PDAC 2 mm: ~1.8 k cell-consolidations that ΔC alone misses);
+    # set to ``None`` to disable.
     #
     # The `rescue_delta_c_floor` (default -0.2, must be ≤ 0) protects
     # against fusing engulfment doublets (jikammne-like: ΔC = -0.49,
@@ -540,7 +542,7 @@ class StitchConfig:
     # the witness floor `min_local_tx_per_entity` already gates the
     # accept path adequately; geometry's useful contribution is the
     # rescue, not a veto.
-    mahalanobis_d_rescue: float | None = None
+    mahalanobis_d_rescue: float | None = 1.0
     rescue_delta_c_floor: float = -0.2
 
     def __post_init__(self) -> None:
