@@ -30,7 +30,7 @@ prune_sparse = _cy.prune_cells_nuclear_seed_sparse
 
 # Gene vocabulary: epithelial / macrophage modules + a gene-sparse STAT1.
 # Kept alphabetically sorted so this fixture's gene→index ordering matches
-# the one `build_dense_npmi_matrix` derives (sorted unique genes) — the
+# the one `build_dense_pmi_matrix_small_panel` derives (sorted unique genes) — the
 # greedy bad-edge prune's tie-break is index-dependent, so the dense and
 # sparse wrapper paths must share a gene ordering to be comparable.
 GENES = sorted(["EPCAM", "KRT8", "VIM", "CD163", "LYZ", "CD68", "STAT1"])
@@ -264,7 +264,7 @@ def test_neg_one_sentinel_counts_in_greedy_strip():
 # --------------------------------------------------------------------------
 import pandas as pd  # noqa: E402
 
-from tracer.metrics import NpmiBootstrapResult  # noqa: E402
+from tracer.metrics import PmiBootstrapResult  # noqa: E402
 from tracer.pruning import prune_transcripts_nuclear_seed  # noqa: E402
 
 
@@ -301,7 +301,7 @@ def _bootstrap_result(*, include_absent):
         (np.asarray(data, np.float32), (rows, cols)), shape=(G, G),
         dtype=np.float32,
     ).tocsr()
-    return NpmiBootstrapResult(W_sparse=W, genes=np.asarray(GENES))
+    return PmiBootstrapResult(W_sparse=W, genes=np.asarray(GENES))
 
 
 def _df():
@@ -324,23 +324,37 @@ def _prune(npmi, **kw):
 def test_wrapper_dense_sparse_parity_fully_observed():
     """End-to-end through prune_transcripts_nuclear_seed: on a fully-
     observed panel the dense NaN-skip path (nan_fill=None) and the sparse
-    NpmiBootstrapResult path produce identical tracer_id labels."""
+    PmiBootstrapResult path produce identical tracer_id labels."""
     for thr in (0.0, 0.2, 0.5):
         dense = _prune(_npmi_df(fill_absent=0.0), nan_fill=None, threshold=thr)
         sparse = _prune(_bootstrap_result(include_absent=True), threshold=thr)
         np.testing.assert_array_equal(dense, sparse, err_msg=f"thr={thr}")
 
 
-def test_wrapper_sparse_skips_absent_vs_zero_fill():
-    """With genuinely-absent pairs, the sparse wrapper path matches the
-    dense NaN-skip wrapper and differs from the legacy nan_fill=0.0."""
+def test_wrapper_nan_fill_is_no_op_on_sparse_only_path():
+    """Under the sparse-only PMI panel ingest (the dense
+    `build_dense_pmi_matrix_small_panel` path retired in favor of
+    `build_sparse_pmi_matrix_from_long`), `nan_fill` becomes a no-op
+    because the CSR encoding has no NaN entries to fill — structurally-
+    absent pairs are absent (skipped by _wget), period.
+
+    The three pathways below all now reduce to the same sparse CSR:
+      - bootstrap result with absent rows omitted,
+      - long DF with absent rows omitted, nan_fill=None,
+      - long DF with absent rows omitted, nan_fill=0.0 (legacy knob).
+
+    Prior to the dense-PMI retirement the third path differed (it
+    populated absent pairs as explicit 0.0 in the dense (G,G) ndarray
+    and counted them in the mean-admission denominator). That behavior
+    is intentionally retired: see commit log for the sparse-only PMI
+    ingest migration."""
     thr = 0.5
     sparse = _prune(_bootstrap_result(include_absent=False), threshold=thr)
     nan_skip = _prune(_npmi_df(fill_absent=None), nan_fill=None, threshold=thr)
     zero_fill = _prune(_npmi_df(fill_absent=None), nan_fill=0.0, threshold=thr)
 
     np.testing.assert_array_equal(sparse, nan_skip)
-    assert not np.array_equal(sparse, zero_fill)
+    np.testing.assert_array_equal(sparse, zero_fill)  # nan_fill no-op
 
 
 def test_wrapper_aux_W_is_sparse_for_bootstrap_input():

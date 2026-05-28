@@ -192,8 +192,9 @@ class TestCascadeIntegration:
         df_in.loc[df_in.index[: n // 2], "tracer_id"] = "-1"
 
         # Build minimal aux dict
-        from tracer.pruning import build_dense_npmi_matrix
-        _, gene_to_idx, W = build_dense_npmi_matrix(panel, npmi_col="PMI")
+        from tracer.pruning import build_sparse_pmi_matrix_from_long
+        _, gene_to_idx, W = build_sparse_pmi_matrix_from_long(
+            panel, metric_col="PMI")
         aux = {"gene_to_idx": gene_to_idx, "W": W}
 
         df_out = cascade_as_residual_handler(

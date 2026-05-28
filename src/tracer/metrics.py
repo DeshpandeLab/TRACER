@@ -252,8 +252,8 @@ def compute_npmi(
 # ---------------------------------------------------------------------
 
 @dataclass
-class NpmiBootstrapResult:
-    """Output of :func:`compute_npmi_bootstrap`.
+class PmiBootstrapResult:
+    """Output of :func:`compute_pmi_bootstrap`.
 
     ``W_sparse`` is a G×G upper-triangle CSR float32 with explicit
     nonzero entries only for pairs that the active-sampler classified as
@@ -373,7 +373,7 @@ def _bootstrap_npmi_for_pairs(
     metric : {"npmi", "pmi"}
         Which scale to return. Affects per-iteration return value AND
         therefore the downstream bootstrap median/CI. tau thresholds in
-        the parent ``compute_npmi_bootstrap`` are interpreted in this
+        the parent ``compute_pmi_bootstrap`` are interpreted in this
         same metric.
     """
     if metric not in ("npmi", "pmi"):
@@ -414,7 +414,7 @@ def _bootstrap_npmi_for_pairs(
     return out
 
 
-def compute_npmi_bootstrap(
+def compute_pmi_bootstrap(
     df_subset: pd.DataFrame,
     *,
     group_key: str = "cell_id",
@@ -443,7 +443,7 @@ def compute_npmi_bootstrap(
     per_gene_percentile_filter: tuple[float, float] | None = None,
     exclude_contexts: set | list | None = None,
     memory_optimize: bool = True,
-) -> NpmiBootstrapResult:
+) -> PmiBootstrapResult:
     """Bootstrap NPMI over contexts (cells) with active sampling.
 
     Returns sparse output: only pairs whose 95% bootstrap CI excludes
@@ -969,7 +969,7 @@ def compute_npmi_bootstrap(
             dtype=np.float32,
         ).tocsr()
         pair_ci_df = _ci_records_to_df(ci_records) if ci_records is not None else None
-        return NpmiBootstrapResult(
+        return PmiBootstrapResult(
             W_sparse=W_sparse, genes=genes,
             diagnostics=diagnostics, pair_ci=pair_ci_df,
         )
@@ -1222,7 +1222,7 @@ def compute_npmi_bootstrap(
         "pre_filter": pre_filter_diag,
     }
     pair_ci_df = _ci_records_to_df(ci_records) if ci_records is not None else None
-    return NpmiBootstrapResult(
+    return PmiBootstrapResult(
         W_sparse=W_sparse, genes=genes,
         diagnostics=diagnostics, pair_ci=pair_ci_df,
     )

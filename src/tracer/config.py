@@ -612,7 +612,7 @@ class StitchConfig:
 
 @dataclass(frozen=True)
 class BootstrapConfig:
-    """`compute_npmi_bootstrap` config-recommended defaults.
+    """`compute_pmi_bootstrap` config-recommended defaults.
 
     These are the flavor-C "production" settings (PMI metric, per-gene
     size-band filter, dual-tau, set_neg_one). The function's own Python

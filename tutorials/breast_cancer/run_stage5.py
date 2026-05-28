@@ -32,12 +32,12 @@ def main():
     # Import tracer
     sys.path.insert(0, str(repo_root / "src"))
     from tracer import apply_stitching_to_transcripts_fast
-    from tracer.core import build_dense_npmi_matrix
+    from tracer.core import build_dense_pmi_matrix_small_panel
 
     # Rebuild aux dict from NPMI CSV
     print("Building NPMI matrix...")
     t0 = time.time()
-    genes, gene_to_idx, W = build_dense_npmi_matrix(df_npmi)
+    genes, gene_to_idx, W = build_dense_pmi_matrix_small_panel(df_npmi)
     aux = {
         "genes": genes,
         "gene_to_idx": gene_to_idx,

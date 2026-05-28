@@ -416,7 +416,7 @@ def _slice_npmi_submatrix(npmi_mat, gene_ids):
     Handles both dense ``np.ndarray`` and ``scipy.sparse`` inputs. For
     sparse inputs we slice to a sparse submatrix and densify only the
     small per-entity block; absent entries become exact zeros — by
-    design (see :func:`compute_npmi_bootstrap` docs).
+    design (see :func:`compute_pmi_bootstrap` docs).
     """
     try:
         from scipy import sparse
@@ -625,7 +625,7 @@ def compute_housekeeping_mask(
         # Symmetrise virtually by counting both rows and columns.
         Wcsr = W.tocsr().astype(np.float32)
         # Boolean masks as sparse — diagonal entries shouldn't be stored
-        # (NpmiBootstrapResult never stores i==j) but be defensive.
+        # (PmiBootstrapResult never stores i==j) but be defensive.
         Wcsr.setdiag(0.0)
         Wcsr.eliminate_zeros()
         pos_mask = (Wcsr > pos_thresh)

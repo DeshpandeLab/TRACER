@@ -11,8 +11,8 @@ from ._repro import (
 )
 from ._utils import relu_symmetric
 from .pruning import (
-    build_dense_npmi_matrix,
-    build_sparse_npmi_matrix,
+    build_dense_pmi_matrix_small_panel,
+    build_sparse_pmi_matrix,
     prune_genes_by_npmi_greedy,
     prune_transcripts,
     prune_transcripts_fast,

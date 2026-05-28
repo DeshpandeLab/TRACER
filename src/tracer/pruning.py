@@ -1,7 +1,13 @@
-"""Phase 1/2: Conservative NPMI pruning.
+"""Phase 1/2: Conservative PMI-coherence pruning.
 
-Denoise cell and create partial cell IDs based on NPMI gene coherence (Phase 1),
-then further denoise partial cells (Phase 2).
+Denoise cell and create partial cell IDs based on per-pair PMI gene
+coherence (Phase 1), then further denoise partial cells (Phase 2).
+
+PMI vs NPMI naming: the package historically called the panel "NPMI",
+but the production bootstrap (:func:`tracer.metrics.compute_pmi_bootstrap`)
+emits unnormalized PMI. Function names and parameters in this module
+default to ``PMI``; legacy synthetic test panels passing the NPMI form
+opt in via ``metric_col="NPMI"`` on the small-panel dense builder.
 """
 
 import concurrent.futures  # noqa: F401 — retained for API compatibility
@@ -20,20 +26,29 @@ from ._utils import prepare_transcript_df
 # ---------- Phase 1/2: Conservative NPMI pruning ----------
 # Denoise cell and create partial cell IDs based on NPMI gene coherence (Phase 1)
 # Then further denoise partial cells (Phase 2)
-def build_dense_npmi_matrix(
+def build_dense_pmi_matrix_small_panel(
     npmi_df,
     gene_i_col="gene_i",
     gene_j_col="gene_j",
-    npmi_col="NPMI",
+    metric_col="PMI",
 ):
-    """
-    Build dense symmetric NPMI matrix.
-    Missing pairs remain NaN (conservative).
+    """Build a dense symmetric NPMI/PMI matrix (small-panel legacy path).
+
+    Retained only for the synthetic-only legacy callers
+    :func:`prune_transcripts` and :func:`prune_transcripts_fast`, which
+    use a dense ``_cy_prune.prune_cells`` kernel. The production SEG
+    path (:func:`prune_transcripts_nuclear_seed`) is sparse end-to-end
+    via :func:`build_sparse_pmi_matrix_from_long`.
+
+    Missing pairs remain NaN (conservative). ``metric_col`` defaults to
+    ``"PMI"`` to match the bootstrap panel convention; callers feeding
+    legacy NPMI long-DFs (the synthetic test panels) pass
+    ``metric_col="NPMI"``.
     """
     npmi_df = npmi_df.copy()
     npmi_df[gene_i_col] = npmi_df[gene_i_col].astype(str).str.strip()
     npmi_df[gene_j_col] = npmi_df[gene_j_col].astype(str).str.strip()
-    npmi_df[npmi_col] = pd.to_numeric(npmi_df[npmi_col], errors="coerce")
+    npmi_df[metric_col] = pd.to_numeric(npmi_df[metric_col], errors="coerce")
 
     genes = pd.Index(
         np.unique(
@@ -51,7 +66,7 @@ def build_dense_npmi_matrix(
 
     ai = npmi_df[gene_i_col].map(gene_to_idx).to_numpy()
     bi = npmi_df[gene_j_col].map(gene_to_idx).to_numpy()
-    vv = npmi_df[npmi_col].to_numpy(dtype=np.float32)
+    vv = npmi_df[metric_col].to_numpy(dtype=np.float32)
 
     W[ai, bi] = vv
     W[bi, ai] = vv
@@ -59,8 +74,8 @@ def build_dense_npmi_matrix(
     return np.asarray(genes), gene_to_idx, W
 
 
-def build_sparse_npmi_matrix(result):
-    """Adapt a :class:`tracer.metrics.NpmiBootstrapResult` to the
+def build_sparse_pmi_matrix(result):
+    """Adapt a :class:`tracer.metrics.PmiBootstrapResult` to the
     ``(genes, gene_to_idx, W)`` triple consumed by
     :func:`prune_transcripts_fast`.
 
@@ -68,7 +83,7 @@ def build_sparse_npmi_matrix(result):
     code (notably :func:`tracer.stitching.coherence`) detects sparse
     inputs and densifies the per-entity submatrix on the fly. Pairs
     encoded as absent in CSR are treated as zero by the coherence
-    kernel — by design (see :func:`compute_npmi_bootstrap`).
+    kernel — by design (see :func:`compute_pmi_bootstrap`).
     """
     genes = np.asarray(result.genes, dtype=str)
     gene_to_idx = {g: i for i, g in enumerate(genes)}
@@ -78,8 +93,69 @@ def build_sparse_npmi_matrix(result):
     return genes, gene_to_idx, W
 
 
+def build_sparse_pmi_matrix_from_long(
+    npmi_df,
+    *,
+    gene_i_col: str = "gene_i",
+    gene_j_col: str = "gene_j",
+    metric_col: str = "PMI",
+):
+    """Build a sparse upper-triangle CSR PMI panel from a long DataFrame.
+
+    Sparse drop-in for the legacy
+    :func:`build_dense_pmi_matrix_small_panel` — same
+    ``(genes, gene_to_idx, W)`` triple, but ``W`` is a
+    :class:`scipy.sparse.csr_matrix` instead of a dense ``(G, G)`` ndarray.
+
+    Memory: O(n_pairs) instead of O(G²). At G=18k whole-transcriptome
+    scale that's the difference between ~MB of stored pairs and ~1.3 GB
+    of dense float32 (or ~33 GB for the legacy ``compute_npmi`` long-DF
+    intermediate that this output replaces). Structurally-absent pairs
+    are absent in CSR — the downstream Cython kernels skip them via
+    :func:`_cy_prune._wget` (matches the bootstrap-output contract;
+    see :func:`compute_pmi_bootstrap` docs).
+
+    ``metric_col`` defaults to ``"PMI"`` to match the on-disk bootstrap
+    panel convention (``compute_pmi_bootstrap`` writes PMI values, not
+    NPMI, despite the historical function naming). Callers feeding a
+    legacy NPMI long-DF pass ``metric_col="NPMI"``.
+
+    The output is upper-triangle by construction (i < j). Callers needing
+    a symmetric CSR for kernel input must pass it through
+    :func:`_symmetric_csr_arrays` (same convention as
+    :func:`build_sparse_pmi_matrix`).
+    """
+    df = npmi_df[[gene_i_col, gene_j_col, metric_col]].copy()
+    df[gene_i_col] = df[gene_i_col].astype(str).str.strip()
+    df[gene_j_col] = df[gene_j_col].astype(str).str.strip()
+    df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
+    df = df.dropna(subset=[metric_col])
+
+    genes = pd.Index(np.unique(np.concatenate(
+        [df[gene_i_col].to_numpy(), df[gene_j_col].to_numpy()]
+    ))).astype(str).to_numpy()
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
+    G = len(genes)
+
+    ai = df[gene_i_col].map(gene_to_idx).to_numpy()
+    bi = df[gene_j_col].map(gene_to_idx).to_numpy()
+    vv = df[metric_col].to_numpy(dtype=np.float32)
+
+    # Force upper-triangle (i < j); drop self-pairs.
+    swap = ai > bi
+    ai_u = np.where(swap, bi, ai)
+    bi_u = np.where(swap, ai, bi)
+    keep = ai_u != bi_u
+    ai_u, bi_u, vv = ai_u[keep], bi_u[keep], vv[keep]
+
+    W = sp.coo_matrix(
+        (vv, (ai_u, bi_u)), shape=(G, G), dtype=np.float32,
+    ).tocsr()
+    return genes, gene_to_idx, W
+
+
 def _is_bootstrap_result(obj) -> bool:
-    """True for a :class:`tracer.metrics.NpmiBootstrapResult` (or any
+    """True for a :class:`tracer.metrics.PmiBootstrapResult` (or any
     duck-typed object carrying ``W_sparse`` + ``genes``)."""
     return hasattr(obj, "W_sparse") and hasattr(obj, "genes")
 
@@ -181,7 +257,7 @@ def prune_transcripts(
     df["_cell_str"] = df[cell_id_col].astype(str)
     df[gene_col] = df[gene_col].astype(str).str.strip()
 
-    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df)
+    genes, gene_to_idx, W = build_dense_pmi_matrix_small_panel(npmi_df)
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
 
     # ---------- PASS 1 ----------
@@ -320,10 +396,11 @@ def prune_transcripts_fast(
         # this path is tracked as a follow-up.
         raise NotImplementedError(
             "prune_transcripts_fast does not yet accept a sparse / "
-            "NpmiBootstrapResult panel; use prune_transcripts_nuclear_seed "
+            "PmiBootstrapResult panel; use prune_transcripts_nuclear_seed "
             "for whole-transcriptome sparse panels."
         )
-    genes, gene_to_idx, W = build_dense_npmi_matrix(npmi_df, npmi_col=metric_col)
+    genes, gene_to_idx, W = build_dense_pmi_matrix_small_panel(
+        npmi_df, metric_col=metric_col)
     if nan_fill is not None:
         np.nan_to_num(W, copy=False, nan=float(nan_fill))
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
@@ -625,38 +702,42 @@ def prune_transcripts_nuclear_seed(
     df["_cell_str"] = df[cell_id_col].astype(str)
     df["_is_nuc"] = df[nuclear_col].astype(bool)
 
-    # Two PMI backends:
-    #   - dense (G,G) float32: legacy path. Unobserved pairs are NaN, then
-    #     filled per `nan_fill` (default 0.0 — counts absent as 0).
-    #   - sparse symmetric CSR from a NpmiBootstrapResult: scales to
-    #     whole-transcriptome panels (dense (G,G) is ~1.6 GB at 20k genes
-    #     and OOMs the prune ~15k). Structurally-absent pairs are SKIPPED
-    #     (NOT counted as 0); never materializes the dense matrix.
-    use_sparse_panel = _is_bootstrap_result(npmi_df) or sp.issparse(npmi_df)
-    if use_sparse_panel:
+    # PMI panel ingest — sparse CSR end-to-end.
+    #
+    # Two upstream shapes are accepted:
+    #   - PmiBootstrapResult / scipy.sparse: training-time output of
+    #     :func:`compute_pmi_bootstrap`. The W_sparse upper-triangle CSR
+    #     is adopted as-is.
+    #   - Long-format DataFrame (gene_i, gene_j, NPMI/PMI columns): the
+    #     legacy on-disk panel format. Converted to upper-triangle CSR
+    #     by :func:`build_sparse_pmi_matrix_from_long`.
+    #
+    # Both shapes funnel into the same symmetric-CSR triple
+    # ``(W_indptr, W_indices, W_data)`` consumed by the sparse Cython
+    # kernel _cy_prune.prune_cells_nuclear_seed_sparse (use_sparse=True).
+    # Structurally-absent pairs are SKIPPED by `_wget` — never counted
+    # as zero. Memory: O(n_pairs), not O(G²), so WTX panels (G~18k)
+    # don't OOM.
+    use_sparse_panel = True
+    if _is_bootstrap_result(npmi_df) or sp.issparse(npmi_df):
         if sp.issparse(npmi_df):
             raise TypeError(
-                "Pass a NpmiBootstrapResult (carries gene names) for the "
+                "Pass a PmiBootstrapResult (carries gene names) for the "
                 "sparse prune, not a bare scipy matrix."
             )
-        genes, gene_to_idx, W = build_sparse_npmi_matrix(npmi_df)
-        W_sp_indptr, W_sp_indices, W_sp_data = _symmetric_csr_arrays(W)
-        # Sparse CSR has no NaN to fill — absent pairs are skipped by _wget.
+        genes, gene_to_idx, W = build_sparse_pmi_matrix(npmi_df)
     else:
-        genes, gene_to_idx, W = build_dense_npmi_matrix(
-            npmi_df, npmi_col=metric_col)
-        # Phase 1b admission-gate NaN policy
-        # ----------------------------------
-        # Legacy `mean` gate folds NaN-filled zeros into the mean
-        # divisor identically to real near-zero PMI, so nan-filling is
-        # fine (and matches regression refs). The `hybrid`/`min` gates
-        # depend on observed-vs-unobserved status — nan-filled zeros
-        # would slip past the real-signal filter as in-band noise and
-        # would count as a finite pair in the min branch. To preserve
-        # observed-vs-unobserved semantics for hybrid/min, only nan-fill
-        # W when veto_mode == "mean".
-        if nan_fill is not None and veto_mode == "mean":
-            np.nan_to_num(W, copy=False, nan=float(nan_fill))
+        genes, gene_to_idx, W = build_sparse_pmi_matrix_from_long(
+            npmi_df, metric_col=metric_col)
+    W_sp_indptr, W_sp_indices, W_sp_data = _symmetric_csr_arrays(W)
+    # Sparse CSR has no NaN to fill — absent pairs are skipped by _wget.
+    # The legacy `nan_fill`/`veto_mode == "mean"` policy is a no-op here:
+    # the bootstrap and long-DF builders both encode unobserved pairs as
+    # absent (not as explicit NaN entries), and the mean-admission gate
+    # in `_cy_prune` treats absent-as-zero on the sparse path — same
+    # numeric result as the previous dense-NaN→0 fill. The `hybrid` /
+    # `min` gates use the observed-vs-unobserved distinction, which is
+    # preserved end-to-end by the CSR encoding.
     df["_gene_idx"] = df[gene_col].map(gene_to_idx)
 
     df[out_col] = df["_cell_str"].copy()

@@ -1084,7 +1084,12 @@ def reassign_unassigned_to_nearby_entities(
         cached = neg_cache.get(g_idx)
         if cached is not None:
             return cached
-        row = np.asarray(W[g_idx])
+        # W may be dense ndarray or CSR; densify the row only when sparse
+        # (per-gene cache amortizes the cost).
+        if hasattr(W, "toarray"):
+            row = np.asarray(W[g_idx].toarray()).ravel()
+        else:
+            row = np.asarray(W[g_idx])
         s = frozenset(int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist())
         neg_cache[g_idx] = s
         return s
@@ -1739,7 +1744,12 @@ def reassign_unassigned_grid_pool(
         cached = neg_cache.get(g_idx)
         if cached is not None:
             return cached
-        row = np.asarray(W[g_idx])
+        # W may be dense ndarray or CSR; densify the row only when sparse
+        # (per-gene cache amortizes the cost).
+        if hasattr(W, "toarray"):
+            row = np.asarray(W[g_idx].toarray()).ravel()
+        else:
+            row = np.asarray(W[g_idx])
         s = frozenset(int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist())
         neg_cache[g_idx] = s
         return s

@@ -1,4 +1,4 @@
-"""Synthetic correctness test for ``tracer.metrics.compute_npmi_bootstrap``.
+"""Synthetic correctness test for ``tracer.metrics.compute_pmi_bootstrap``.
 
 Plants 5 known gene-pair structures via :func:`tests.synthetic.make_synthetic_npmi_panel`
 and asserts the bootstrap classifies each correctly:
@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from tracer.metrics import compute_npmi_bootstrap
+from tracer.metrics import compute_pmi_bootstrap
 
 from tests.synthetic import make_synthetic_npmi_panel
 
@@ -26,7 +26,7 @@ from tests.synthetic import make_synthetic_npmi_panel
 def bootstrap_result():
     """Compute the bootstrap once and reuse across the test module."""
     df, M = make_synthetic_npmi_panel()
-    res = compute_npmi_bootstrap(
+    res = compute_pmi_bootstrap(
         df, group_key="cell_id", feature_col="feature_name",
         tau=0.05, ci_level=0.95,
         max_bootstraps=2000, coarse_block=200, refine_block=200,

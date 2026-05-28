@@ -58,7 +58,7 @@ def main():
         enforce_spatial_coherence_fast,
         apply_stitching_to_transcripts_fast,
         prune_genes_by_npmi_greedy,
-        build_dense_npmi_matrix,
+        build_dense_pmi_matrix_small_panel,
     )
     import torch
     from torch_geometric.data import Data
@@ -66,7 +66,7 @@ def main():
 
     # Build aux dict (same as Stage 3)
     print("Building NPMI matrix...")
-    genes, gene_to_idx, W = build_dense_npmi_matrix(df_npmi)
+    genes, gene_to_idx, W = build_dense_pmi_matrix_small_panel(df_npmi)
     aux = {
         "genes": genes,
         "gene_to_idx": gene_to_idx,

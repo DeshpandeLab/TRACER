@@ -27,8 +27,38 @@ from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
-from tracer.pruning import build_dense_npmi_matrix
+# NOTE: `build_dense_pmi_matrix_small_panel` is intentionally NOT imported at module
+# level — that path is a fallback used only when callers invoke
+# `density_cascade_phase1` with `panel=` but no `aux={"W": ...}` (i.e.
+# standalone, outside the pipeline). The lazy import lives inside that
+# else-branch (see line ~268) so cascade can load and run cleanly on
+# the sparse-only path the rest of the package is migrating toward.
+
+
+def _wget(W, i: int, j: int) -> float:
+    """Single-element PMI lookup that works for dense ndarray and sparse CSR.
+
+    Dense: returns ``W[i, j]`` directly (may be NaN for structurally-absent
+    pairs depending on how W was built).
+
+    Sparse CSR: random-access via the indptr/indices/data triple. Pairs
+    encoded as absent return NaN to match dense-NaN semantics (matches
+    the existing `_cy_prune._wget` contract used by the Cython kernels).
+    """
+    if isinstance(W, np.ndarray):
+        return float(W[i, j])
+    # CSR random access; W.indices for row i is sorted (CSR invariant).
+    row_start = int(W.indptr[i])
+    row_end = int(W.indptr[i + 1])
+    if row_end <= row_start:
+        return float("nan")
+    indices = W.indices[row_start:row_end]
+    pos = int(np.searchsorted(indices, j))
+    if pos < (row_end - row_start) and indices[pos] == j:
+        return float(W.data[row_start + pos])
+    return float("nan")
 
 
 # ============================================================================
@@ -182,9 +212,15 @@ def auto_thresholds(
 # ============================================================================
 # Phase 1a-style greedy prune
 # ============================================================================
-def greedy_prune(unique_gene_idx: list[int], W: np.ndarray,
+def greedy_prune(unique_gene_idx: list[int], W,
                   threshold: float = 0.05) -> list[int]:
-    """Iteratively remove the gene with most bad edges (PMI < threshold)."""
+    """Iteratively remove the gene with most bad edges (PMI < threshold).
+
+    Accepts ``W`` as either a dense ``np.ndarray`` or a sparse CSR matrix —
+    per-pair lookups go through :func:`_wget`, which has the same NaN
+    semantics on both backends (structurally-absent CSR pairs return NaN
+    and are treated as "unknown" / not-bad, matching dense-NaN behavior).
+    """
     g = list(unique_gene_idx)
     while len(g) >= 2:
         bad_count = [0] * len(g)
@@ -193,7 +229,7 @@ def greedy_prune(unique_gene_idx: list[int], W: np.ndarray,
             for j in range(len(g)):
                 if i == j:
                     continue
-                v = W[gi, g[j]]
+                v = _wget(W, gi, g[j])
                 if v == v and v < threshold:  # NaN-safe
                     bad_count[i] += 1
         worst_idx = int(np.argmax(bad_count))
@@ -259,15 +295,27 @@ def density_cascade_phase1(
     # Resolve W matrix
     if aux is not None and "W" in aux and "gene_to_idx" in aux:
         gene_to_idx = aux["gene_to_idx"]
-        W = aux["W"].astype(np.float32)
+        W = aux["W"]
+        if isinstance(W, np.ndarray):
+            W = W.astype(np.float32)
+        # Sparse CSR: keep as-is; _wget handles random access without densifying.
     else:
         if panel is None:
             raise ValueError(
                 "density_cascade_phase1 needs either panel= or aux= with W"
             )
-        _, gene_to_idx, W = build_dense_npmi_matrix(panel, npmi_col="PMI")
-        W = W.astype(np.float32)
-    np.nan_to_num(W, copy=False, nan=0.0)
+        # Standalone fallback (no pipeline aux). The pipeline path is
+        # sparse end-to-end via the prune stage; this fallback only
+        # fires when a caller invokes density_cascade_phase1 directly
+        # with a long-DataFrame panel. Use the sparse builder so even
+        # the standalone path doesn't materialize a (G,G) dense matrix.
+        from tracer.pruning import build_sparse_pmi_matrix_from_long
+        _, gene_to_idx, W = build_sparse_pmi_matrix_from_long(
+            panel, metric_col="PMI")
+    # NaN→0 fill only for dense W (sparse CSR has no NaNs by construction —
+    # structurally-absent pairs are skipped by _wget).
+    if isinstance(W, np.ndarray):
+        np.nan_to_num(W, copy=False, nan=0.0)
 
     coords = df[["x", "y"]].to_numpy(dtype=np.float32)
     gene_strs = df["feature_name"].to_numpy()
