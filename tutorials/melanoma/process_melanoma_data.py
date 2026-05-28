@@ -10,7 +10,7 @@ from shapely.geometry import Polygon
 from spatialdata import SpatialData
 from spatialdata.models import TableModel, PointsModel, ShapesModel
 
-from tracer.metrics import compute_npmi
+from tracer.metrics import compute_pmi_bootstrap
 
 
 def _build_polygons_from_vertices(df: pd.DataFrame) -> gpd.GeoDataFrame:
@@ -138,7 +138,24 @@ def main() -> None:
         nuc_df_confident = nuc_df[nuc_df["cell_id"].isin(good_nuc_ids)].copy()
         print("Number of confident nuclei:", len(good_nuc_ids))
 
-        npmi_df = compute_npmi(nuc_df_confident, group_key="cell_id")
+        # Compute pair-wise NPMI on the confident-nuclei context with the
+        # sparse bootstrap builder. Memory: O(n_settled_pairs) instead of
+        # O(G²); single-digit MB at G=18k WTX vs ~33 GB for the retired
+        # dense compute_npmi.
+        result = compute_pmi_bootstrap(
+            nuc_df_confident, group_key="cell_id", metric="npmi",
+        )
+        # Flatten upper-triangle CSR → long DataFrame for the legacy
+        # CSV schema that the downstream run_<dataset>.py scripts read.
+        # Pipeline-runner auto-detects the metric column name; "NPMI"
+        # matches the original tutorial output.
+        coo = result.W_sparse.tocoo()
+        genes_arr = np.asarray(result.genes)
+        npmi_df = pd.DataFrame({
+            "gene_i": genes_arr[coo.row],
+            "gene_j": genes_arr[coo.col],
+            "NPMI": coo.data,
+        })
         npmi_out = out_dir / f"{prefix}_nucleus_npmi.csv"
         npmi_df.to_csv(npmi_out, index=False)
 

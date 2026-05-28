@@ -10,12 +10,13 @@ __all__ = [
     "plot_metis_hulls",
     "chunk_transcripts",
     "get_confident_nuclei_transcripts",
-    # `compute_npmi` is a sparse-internal shim around
-    # `compute_pmi_bootstrap` that preserves the legacy tutorial CSV
-    # schema. The original 33-GB-blow-up implementation is preserved
-    # under `tracer.metrics._legacy_dense_compute_npmi` for one-off
+    # `compute_npmi` retired. The production tutorial caller
+    # (process_melanoma_data.py) calls `compute_pmi_bootstrap`
+    # directly; the unused imports in 2 other notebooks
+    # (lung_cancer/mouse_ileum metrics_umap.ipynb) were stripped. The
+    # 33-GB-blow-up dense implementation is preserved under
+    # `tracer.metrics._legacy_dense_compute_npmi` for one-off
     # comparisons only.
-    "compute_npmi",
     "compute_pmi_bootstrap",
     "PmiBootstrapResult",
     "build_cell_gene_matrix",
@@ -94,10 +95,9 @@ from .tiling import (
 
 from .metrics import (
     get_confident_nuclei_transcripts,
-    # `compute_npmi` is now a sparse-internal shim that forwards to
-    # `compute_pmi_bootstrap`; the 33-GB-blow-up dense implementation is
-    # preserved under `_legacy_dense_compute_npmi` for one-off comparisons.
-    compute_npmi,
+    # `compute_npmi` retired — production callers migrated to
+    # `compute_pmi_bootstrap`. Dense 33 GB blow-up implementation
+    # preserved at `_legacy_dense_compute_npmi` for explicit imports.
     compute_pmi_bootstrap,
     PmiBootstrapResult,
     build_cell_gene_matrix,
