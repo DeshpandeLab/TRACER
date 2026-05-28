@@ -103,7 +103,7 @@ def get_confident_nuclei_transcripts(
     return nuc_df_confident, df
 
 #
-def compute_npmi(
+def _disabled_compute_npmi(
     df_subset,
     group_key="cell_id",
     min_occurrences_per_context=2,
@@ -111,7 +111,20 @@ def compute_npmi(
     set_neg_one=False,
     thr=0.05
 ):
-    """
+    """RETIRED — use :func:`compute_pmi_bootstrap` instead.
+
+    The legacy single-pass NPMI/PMI computer. Builds three dense (G, G)
+    float64 matrices (``P_ij``, ``PMI``, ``NPMI``) plus a long DataFrame
+    with G² rows × 9 columns. At G=18k whole-transcriptome scale that
+    peaks at ~33 GB resident memory — the documented blow-up. Renamed
+    with the ``_disabled_`` prefix to make every caller fail loudly
+    (``AttributeError`` on ``tracer.compute_npmi``); call sites should
+    migrate to :func:`compute_pmi_bootstrap`, which is sparse end-to-end
+    and the canonical training-time PMI builder.
+
+    Still importable directly for one-off comparisons:
+        ``from tracer.metrics import _disabled_compute_npmi``
+
     Compute PMI/NPMI using presence/absence of genes at the cell or nucleus level,
     with robustness control by requiring each gene to occur at least N times
     within a context (cell or nucleus) before being considered "present".

@@ -10,7 +10,8 @@ __all__ = [
     "plot_metis_hulls",
     "chunk_transcripts",
     "get_confident_nuclei_transcripts",
-    "compute_npmi",
+    # compute_npmi retired (33 GB blow-up at G=18k); see
+    # `_disabled_compute_npmi` in tracer.metrics. Use compute_pmi_bootstrap.
     "compute_pmi_bootstrap",
     "PmiBootstrapResult",
     "build_cell_gene_matrix",
@@ -89,7 +90,8 @@ from .tiling import (
 
 from .metrics import (
     get_confident_nuclei_transcripts,
-    compute_npmi,
+    # compute_npmi retired — see `_disabled_compute_npmi` in
+    # tracer.metrics if a one-off comparison is still needed.
     compute_pmi_bootstrap,
     PmiBootstrapResult,
     build_cell_gene_matrix,
