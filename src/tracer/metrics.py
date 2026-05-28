@@ -103,7 +103,99 @@ def get_confident_nuclei_transcripts(
     return nuc_df_confident, df
 
 #
-def _disabled_compute_npmi(
+def compute_npmi(
+    df_subset,
+    group_key="cell_id",
+    min_occurrences_per_context=2,
+    count_col=None,
+    set_neg_one=False,
+    thr=0.05,
+    metric="npmi",
+):
+    """Memory-safe long-DataFrame NPMI/PMI computer (tutorial-compatible shim).
+
+    Forwards to :func:`compute_pmi_bootstrap` (sparse, memory-safe) and
+    adapts the output to the long-DataFrame schema with columns
+    ``[gene_i, gene_j, NPMI]`` (or ``PMI`` when ``metric="pmi"``) that
+    the tutorial ``run_<dataset>.py`` scripts read via ``pd.read_csv``
+    and pass on as ``npmi_df=...`` to the prune stage.
+
+    Memory: O(n_settled_pairs) instead of O(G²). The legacy
+    single-pass implementation built three dense ``(G, G)`` float64
+    matrices plus a long DataFrame with G² rows × 9 columns — peaked
+    at ~33 GB resident at G=18k. This wrapper stays in single-digit MB
+    at the same scale (only pairs whose bootstrap CI excludes ±tau, or
+    pairs assigned -1 by the dropout rule, are emitted).
+
+    Behavior differences from the original ``compute_npmi``:
+      - **Sparse output schema.** Only "settled" pairs are emitted
+        (positive-settled, negative-settled, or dropout-assigned -1).
+        Dead-zone, indeterminate, and unsettled-at-budget pairs are
+        absent. Downstream pipeline code accepts this: the prune stage
+        treats absent pairs as structurally-skipped (sparse) or
+        NaN-skipped (dense small-panel), matching the new contract.
+      - **Legacy intermediate columns dropped.** The 5 by-product
+        columns ``P_i``, ``P_j``, ``P_ij``, ``P_i_given_j``,
+        ``P_j_given_i`` are not carried — they were not consumed by any
+        of the tutorial downstream scripts (``run_melanoma.py``,
+        ``run_lung_cancer.py``, ``run_breast_cancer.py``,
+        ``run_mouse_ileum.py``). If you need them, call
+        :func:`compute_pmi_bootstrap` directly and inspect
+        ``result.diagnostics``.
+
+    For one-off comparisons against the legacy 33 GB implementation
+    (e.g., regression-testing the bootstrap output's tau choice),
+    import it directly:
+        ``from tracer.metrics import _legacy_dense_compute_npmi``
+
+    Parameters
+    ----------
+    df_subset, group_key, min_occurrences_per_context, count_col,
+    set_neg_one, thr : same as the legacy contract; forwarded to
+        :func:`compute_pmi_bootstrap`.
+    metric : {"npmi", "pmi"}, default "npmi"
+        Which metric column to emit. Legacy default was NPMI (the
+        tutorial CSVs are named ``*_npmi.csv``); pass ``"pmi"`` when
+        a downstream consumer expects the unnormalized PMI column.
+
+    Returns
+    -------
+    long_df : DataFrame
+        Columns: ``gene_i, gene_j, {"NPMI" or "PMI"}``.
+    """
+    import warnings
+    warnings.warn(
+        "tracer.compute_npmi forwards to compute_pmi_bootstrap (sparse, "
+        "memory-safe). Migrate calls to compute_pmi_bootstrap directly "
+        "for explicit control over tau / CI / bootstrap budget. The shim "
+        "will be retained for tutorial-compatibility.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    metric_lower = str(metric).strip().lower()
+    if metric_lower not in ("npmi", "pmi"):
+        raise ValueError(
+            f"metric must be 'npmi' or 'pmi'; got {metric!r}"
+        )
+    result = compute_pmi_bootstrap(
+        df_subset,
+        group_key=group_key,
+        min_occurrences_per_context=min_occurrences_per_context,
+        count_col=count_col,
+        metric=metric_lower,
+        set_neg_one=set_neg_one,
+    )
+    coo = result.W_sparse.tocoo()
+    out_col = metric_lower.upper()  # "NPMI" or "PMI" — match CSV header convention
+    long_df = pd.DataFrame({
+        "gene_i": np.asarray(result.genes)[coo.row],
+        "gene_j": np.asarray(result.genes)[coo.col],
+        out_col: coo.data,
+    })
+    return long_df
+
+
+def _legacy_dense_compute_npmi(
     df_subset,
     group_key="cell_id",
     min_occurrences_per_context=2,
@@ -111,19 +203,15 @@ def _disabled_compute_npmi(
     set_neg_one=False,
     thr=0.05
 ):
-    """RETIRED — use :func:`compute_pmi_bootstrap` instead.
+    """RETIRED — the original dense single-pass NPMI/PMI computer.
 
-    The legacy single-pass NPMI/PMI computer. Builds three dense (G, G)
-    float64 matrices (``P_ij``, ``PMI``, ``NPMI``) plus a long DataFrame
-    with G² rows × 9 columns. At G=18k whole-transcriptome scale that
-    peaks at ~33 GB resident memory — the documented blow-up. Renamed
-    with the ``_disabled_`` prefix to make every caller fail loudly
-    (``AttributeError`` on ``tracer.compute_npmi``); call sites should
-    migrate to :func:`compute_pmi_bootstrap`, which is sparse end-to-end
-    and the canonical training-time PMI builder.
-
-    Still importable directly for one-off comparisons:
-        ``from tracer.metrics import _disabled_compute_npmi``
+    Kept for one-off comparisons against the sparse shim above. Builds
+    three dense (G, G) float64 matrices (``P_ij``, ``PMI``, ``NPMI``)
+    plus a long DataFrame with G² rows × 9 columns — peaks at ~33 GB
+    resident at G=18k whole-transcriptome scale. Do not call from
+    production code; ``compute_npmi`` (the shim) and
+    ``compute_pmi_bootstrap`` (the canonical builder) are sparse and
+    safe.
 
     Compute PMI/NPMI using presence/absence of genes at the cell or nucleus level,
     with robustness control by requiring each gene to occur at least N times

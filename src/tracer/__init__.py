@@ -10,8 +10,12 @@ __all__ = [
     "plot_metis_hulls",
     "chunk_transcripts",
     "get_confident_nuclei_transcripts",
-    # compute_npmi retired (33 GB blow-up at G=18k); see
-    # `_disabled_compute_npmi` in tracer.metrics. Use compute_pmi_bootstrap.
+    # `compute_npmi` is a sparse-internal shim around
+    # `compute_pmi_bootstrap` that preserves the legacy tutorial CSV
+    # schema. The original 33-GB-blow-up implementation is preserved
+    # under `tracer.metrics._legacy_dense_compute_npmi` for one-off
+    # comparisons only.
+    "compute_npmi",
     "compute_pmi_bootstrap",
     "PmiBootstrapResult",
     "build_cell_gene_matrix",
@@ -90,8 +94,10 @@ from .tiling import (
 
 from .metrics import (
     get_confident_nuclei_transcripts,
-    # compute_npmi retired — see `_disabled_compute_npmi` in
-    # tracer.metrics if a one-off comparison is still needed.
+    # `compute_npmi` is now a sparse-internal shim that forwards to
+    # `compute_pmi_bootstrap`; the 33-GB-blow-up dense implementation is
+    # preserved under `_legacy_dense_compute_npmi` for one-off comparisons.
+    compute_npmi,
     compute_pmi_bootstrap,
     PmiBootstrapResult,
     build_cell_gene_matrix,
