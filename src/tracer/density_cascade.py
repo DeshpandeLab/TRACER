@@ -257,17 +257,36 @@ def density_cascade_phase1(
         coverage_curve : list (when thresholds="auto") for diagnostics
     """
     # Resolve W matrix
+    import scipy.sparse as _sp
     if aux is not None and "W" in aux and "gene_to_idx" in aux:
         gene_to_idx = aux["gene_to_idx"]
-        W = aux["W"].astype(np.float32)
+        W = aux["W"]
     else:
         if panel is None:
             raise ValueError(
                 "density_cascade_phase1 needs either panel= or aux= with W"
             )
         _, gene_to_idx, W = build_dense_npmi_matrix(panel, npmi_col="PMI")
+    # Densify if sparse: this kernel does dense W[g, s] indexing throughout.
+    # Sparsifying density_cascade is a separate follow-up; for now we eat the
+    # O(G^2) here. At WT scale this will OOM — caller's burden to know.
+    # Symmetrize the upper-triangle CSR via COO-stacking (NOT W + W.T —
+    # scipy's sparse add drops explicit zeros).
+    if _sp.issparse(W):
+        Wu = W.tocoo()
+        rows = np.concatenate([Wu.row, Wu.col])
+        cols = np.concatenate([Wu.col, Wu.row])
+        data = np.concatenate([Wu.data, Wu.data])
+        Wsym = _sp.csr_matrix(
+            (data.astype(np.float32), (rows, cols)),
+            shape=W.shape, dtype=np.float32,
+        )
+        W = np.asarray(Wsym.todense(), dtype=np.float32)
+        # Sparse "absent" already means "zero" in this kernel's convention
+        # (coherence-style), so no nan_to_num is needed on a sparse-derived W.
+    else:
         W = W.astype(np.float32)
-    np.nan_to_num(W, copy=False, nan=0.0)
+        np.nan_to_num(W, copy=False, nan=0.0)
 
     coords = df[["x", "y"]].to_numpy(dtype=np.float32)
     gene_strs = df["feature_name"].to_numpy()

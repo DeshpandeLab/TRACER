@@ -331,16 +331,25 @@ def test_wrapper_dense_sparse_parity_fully_observed():
         np.testing.assert_array_equal(dense, sparse, err_msg=f"thr={thr}")
 
 
-def test_wrapper_sparse_skips_absent_vs_zero_fill():
-    """With genuinely-absent pairs, the sparse wrapper path matches the
-    dense NaN-skip wrapper and differs from the legacy nan_fill=0.0."""
+def test_wrapper_dataframe_input_routes_through_sparse_path():
+    """Deprecated DataFrame input is now auto-converted to a
+    NpmiBootstrapResult internally — no dense (G,G) is built — and the
+    `nan_fill` kwarg is a no-op. So passing a DataFrame with absent pairs
+    yields the same result as passing the equivalent bootstrap result,
+    regardless of the (ignored) `nan_fill` value. The kernel-level
+    skip-vs-zero-fill discriminator lives in
+    `test_sparse_matches_dense_nan_skip_not_zero_fill` above."""
     thr = 0.5
     sparse = _prune(_bootstrap_result(include_absent=False), threshold=thr)
-    nan_skip = _prune(_npmi_df(fill_absent=None), nan_fill=None, threshold=thr)
-    zero_fill = _prune(_npmi_df(fill_absent=None), nan_fill=0.0, threshold=thr)
-
-    np.testing.assert_array_equal(sparse, nan_skip)
-    assert not np.array_equal(sparse, zero_fill)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from_df_skip = _prune(
+            _npmi_df(fill_absent=None), nan_fill=None, threshold=thr)
+        from_df_fill_ignored = _prune(
+            _npmi_df(fill_absent=None), nan_fill=0.0, threshold=thr)
+    np.testing.assert_array_equal(sparse, from_df_skip)
+    np.testing.assert_array_equal(sparse, from_df_fill_ignored)
 
 
 def test_wrapper_aux_W_is_sparse_for_bootstrap_input():
