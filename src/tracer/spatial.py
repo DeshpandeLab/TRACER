@@ -901,6 +901,54 @@ def enforce_spatial_coherence_per_label(
     return df_out
 
 
+def _make_negative_set_lookup(W, neg_npmi_threshold: float):
+    """Return a cached per-gene lookup ``g_idx → frozenset(j: W[g,j] ≤ τ)``.
+
+    Used by the three Phase-6 reassignment routines
+    (:func:`reassign_unassigned_to_nearby_entities`,
+    :func:`reassign_unassigned_grid_pool`,
+    :func:`reassign_unassigned_to_nearest_tx_no_neg`) to veto a candidate
+    entity when any of its genes is a strong-negative neighbour of the
+    candidate transcript's gene. Lifted to a module-level helper so the
+    body lives in one place (used to be three near-identical inner closures,
+    one of which silently lacked sparse-W support).
+
+    Two backends:
+      * sparse CSR: scan only the row's stored ``data`` / ``indices`` — no
+        ``(G,)`` densification per call, no ``(G, G)`` materialization
+        anywhere. O(nnz_row) per cache miss; ~20× lighter than densify-then-
+        compare on a typical WT panel with ~5% pairs stored.
+      * dense ndarray: direct row indexing + ``np.where`` over the full row.
+
+    Both backends use the convention that structurally-absent CSR entries
+    are NOT in the negative set (no evidence either way) — consistent with
+    the prune / reassign sparse path. An observed ``W[g, j] == 0.0`` IS a
+    stored entry and is correctly excluded from the negative set by the
+    ``<= τ`` test (for any τ < 0).
+    """
+    cache: dict[int, frozenset] = {}
+    use_sparse = hasattr(W, "getrow")
+
+    def lookup(g_idx: int) -> frozenset:
+        cached = cache.get(g_idx)
+        if cached is not None:
+            return cached
+        gi = int(g_idx)
+        if use_sparse:
+            row = W.getrow(gi)
+            mask = row.data <= neg_npmi_threshold
+            s = frozenset(int(c) for c in row.indices[mask].tolist())
+        else:
+            row = np.asarray(W[gi])
+            s = frozenset(
+                int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist()
+            )
+        cache[gi] = s
+        return s
+
+    return lookup
+
+
 # ---------- Phase 6: Reassign unassigned transcripts to nearby partials/components ----------
 def reassign_unassigned_to_nearby_entities(
     df_spatial: pd.DataFrame,
@@ -1077,22 +1125,9 @@ def reassign_unassigned_to_nearby_entities(
     knn.fit(assigned_coords)
     radius_dists, radius_idxs = knn.radius_neighbors(unassigned_coords, return_distance=True)
 
-    # Per-gene veto cache (only used if aux is provided).
-    neg_cache: dict[int, frozenset] = {}
-
-    def negative_set(g_idx: int) -> frozenset:
-        cached = neg_cache.get(g_idx)
-        if cached is not None:
-            return cached
-        # W may be dense ndarray or CSR; densify the row only when sparse
-        # (per-gene cache amortizes the cost).
-        if hasattr(W, "toarray"):
-            row = np.asarray(W[g_idx].toarray()).ravel()
-        else:
-            row = np.asarray(W[g_idx])
-        s = frozenset(int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist())
-        neg_cache[g_idx] = s
-        return s
+    # Per-gene veto cache via module-level factory (sparse-native on CSR W,
+    # ~20× lighter than the prior densify-then-compare on a WT panel).
+    negative_set = _make_negative_set_lookup(W, neg_npmi_threshold)
 
     new_labels = np.empty(len(unassigned_idx), dtype=object)
     matched = np.zeros(len(unassigned_idx), dtype=bool)
@@ -1737,22 +1772,8 @@ def reassign_unassigned_grid_pool(
 
     una_bin_keys = bin_xy(una_coords[:, :2], G)
 
-    # Per-gene cache for the negative-veto set.
-    neg_cache: dict[int, frozenset] = {}
-
-    def negative_set(g_idx: int) -> frozenset:
-        cached = neg_cache.get(g_idx)
-        if cached is not None:
-            return cached
-        # W may be dense ndarray or CSR; densify the row only when sparse
-        # (per-gene cache amortizes the cost).
-        if hasattr(W, "toarray"):
-            row = np.asarray(W[g_idx].toarray()).ravel()
-        else:
-            row = np.asarray(W[g_idx])
-        s = frozenset(int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist())
-        neg_cache[g_idx] = s
-        return s
+    # Per-gene veto cache via module-level factory (sparse-native on CSR W).
+    negative_set = _make_negative_set_lookup(W, neg_npmi_threshold)
 
     new_labels = np.empty(len(una_idx), dtype=object)
     matched = np.zeros(len(una_idx), dtype=bool)
@@ -2517,19 +2538,10 @@ def reassign_unassigned_to_nearest_tx_no_neg(
     knn.fit(assigned_coords)
     radius_dists, radius_idxs = knn.radius_neighbors(una_coords, return_distance=True)
 
-    # Per-gene cache: set of gene indices that are "strongly incompatible" with g.
-    neg_cache: dict[int, frozenset] = {}
-
-    def negative_set(g_idx: int) -> frozenset:
-        cached = neg_cache.get(g_idx)
-        if cached is not None:
-            return cached
-        row = np.asarray(W[g_idx])
-        neg = frozenset(
-            int(x) for x in np.where(row <= neg_npmi_threshold)[0].tolist()
-        )
-        neg_cache[g_idx] = neg
-        return neg
+    # Per-gene veto cache via module-level factory (sparse-native on CSR W);
+    # subsumes the prior dense-only `np.asarray(W[g_idx])` access, which would
+    # have raised at runtime on a sparse `aux["W"]` — fixes a latent bug here.
+    negative_set = _make_negative_set_lookup(W, neg_npmi_threshold)
 
     new_labels = np.empty(len(una_idx), dtype=object)
     matched = np.zeros(len(una_idx), dtype=bool)
