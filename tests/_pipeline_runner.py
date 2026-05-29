@@ -1445,6 +1445,15 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # if the panel lacks a PMI column or the input has no nuclear flag
     # (legacy synthetic panels).
     metric_col = "PMI" if "PMI" in npmi_panel.columns else "NPMI"
+    # Phase 1b admission gate — pulled from cfg.phase1 when available.
+    # Defaults preserve the legacy "mean" gate bit-exactly.
+    _p1 = getattr(cfg, "phase1", None)
+    _p1_veto_mode = getattr(_p1, "veto_mode", "mean") if _p1 is not None else "mean"
+    _p1_mean_admit = getattr(_p1, "mean_admit_threshold", 0.2) if _p1 is not None else 0.2
+    _p1_min_admit = getattr(_p1, "min_admit_threshold", 0.0) if _p1 is not None else 0.0
+    _p1_agg_pct = getattr(_p1, "aggregator_percentile", 25.0) if _p1 is not None else 25.0
+    _p1_rs_thr = getattr(_p1, "real_signal_threshold", 0.05) if _p1 is not None else 0.05
+    _p1_neg_thr = getattr(_p1, "neg_npmi_threshold", -0.2) if _p1 is not None else -0.2
     if "overlaps_nucleus" in df.columns:
         df_pruned, aux = prune_transcripts_nuclear_seed(
             df, npmi_panel,
@@ -1456,6 +1465,12 @@ def run_segmented_pipeline(df: pd.DataFrame,
             seed_coherence_floor=SEED_COHERENCE_FLOOR,
             nuclear_only_admit=NUCLEAR_ONLY_ADMIT,
             tx_weighted=TX_WEIGHTED_PRUNE,
+            veto_mode=_p1_veto_mode,
+            mean_admit_threshold=_p1_mean_admit,
+            min_admit_threshold=_p1_min_admit,
+            aggregator_percentile=_p1_agg_pct,
+            real_signal_threshold=_p1_rs_thr,
+            neg_npmi_threshold=_p1_neg_thr,
             n_jobs=-1, show_progress=False,
         )
     else:
@@ -1517,6 +1532,27 @@ def run_segmented_pipeline(df: pd.DataFrame,
         unassigned_id="-1",
     )
     _record_stage(progression, "Phase1-QC", df_pruned, "tracer_id")
+
+    # Phase-1-time Mahalanobis-gated remerge (opt-in). Sibling of the
+    # Stitch-time rescue applied one stage earlier so EMT-like
+    # over-splits collapse before Rescue/Group/Stitch see them. No-op
+    # when ``cfg.phase1.maha_remerge_d is None`` (default).
+    _p1_maha_d = getattr(_p1, "maha_remerge_d", None) if _p1 is not None else None
+    if _p1_maha_d is not None:
+        from tracer.phase1_rescue import phase1_maha_remerge
+        _p1_maha_floor = float(
+            getattr(_p1, "maha_remerge_delta_c_floor", -0.2)
+        )
+        df_pruned, _p1_resc_stats = phase1_maha_remerge(
+            df_pruned, npmi_panel,
+            threshold=float(_p1_maha_d),
+            floor=_p1_maha_floor,
+            cfg=cfg,
+            entity_col="tracer_id",
+            gene_col="feature_name",
+            verbose=False,
+        )
+        _record_stage(progression, "Phase1-Maha-Remerge", df_pruned, "tracer_id")
 
     # Split stage REMOVED. The nuclear-seed prune emits spatially
     # compact entities by construction (anchored on the nucleus), so
@@ -1671,6 +1707,8 @@ def run_segmented_pipeline(df: pd.DataFrame,
         G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else auto_Gz),
         z_neighbor_depth=cfg.stitch.z_neighbor_depth,
         min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
+        mahalanobis_d_rescue=cfg.stitch.mahalanobis_d_rescue,
+        rescue_delta_c_floor=cfg.stitch.rescue_delta_c_floor,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 
@@ -1869,6 +1907,8 @@ def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,
         G_z=(cfg.stitch.g_z_um if cfg.stitch.g_z_um is not None else 1.0),
         z_neighbor_depth=cfg.stitch.z_neighbor_depth,
         min_local_tx_per_entity=cfg.stitch.min_local_tx_per_entity,
+        mahalanobis_d_rescue=cfg.stitch.mahalanobis_d_rescue,
+        rescue_delta_c_floor=cfg.stitch.rescue_delta_c_floor,
     )
     _record_stage(progression, "Stitch", df_stitched, "stitched")
 

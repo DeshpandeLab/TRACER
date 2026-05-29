@@ -30,6 +30,27 @@ tx_weighted_prune = true
 # left for Rescue. Cuts Phase-1 cost ~50% on segmented data.
 nuclear_only_admit = true
 
+# Phase 1b admission gate. "hybrid" (default) = real-signal +
+# unanimous-min + percentile-aggregator gate (mirrors Rescue) — catches
+# cross-lineage dilution admits the mean test misses (e.g. EPCAM into a
+# macrophage-leaning seed). "mean" = legacy (mean-PMI vs pmi_threshold).
+# "min" = veto on any strongly-negative seed pair.
+veto_mode = "hybrid"
+mean_admit_threshold = 0.2
+min_admit_threshold = 0.0
+aggregator_percentile = 25.0
+real_signal_threshold = 0.05
+neg_npmi_threshold = -0.2
+
+# Phase-1-time Mahalanobis-gated remerge. Sibling of
+# stitch.mahalanobis_d_rescue, applied between Phase1-QC and Rescue.
+# Each candidate entity pair sharing a bin neighborhood is unioned via
+# DSU when:
+#     maha_remerge_delta_c_floor < ΔC < 0   AND   D ≤ maha_remerge_d
+# Comment the line below (or set to "off" via code) to disable.
+maha_remerge_d = 1.0
+maha_remerge_delta_c_floor = -0.2
+
 
 # ---------------------------------------------------------------------
 # Split-Phase1 — z-gap-based splitter for Phase-1 entities.
@@ -286,6 +307,29 @@ dist_threshold_um = 5.0
 # Per-entity witness floor in the shared bin neighborhood (capped at
 # min(threshold, entity n_tx) internally — landed 2026-05-14).
 min_local_tx_per_entity = 3
+
+# Mahalanobis-D RESCUE on borderline-ΔC pairs.
+#
+# The loop OVERRIDES a ΔC reject for candidate pairs whose:
+#     rescue_delta_c_floor < ΔC < 0   AND   D ≤ mahalanobis_d_rescue
+# i.e. when composition borderline-rejects AND the two tx clouds are
+# geometrically enmeshed (low Mahalanobis D relative to the pooled
+# covariance structure). Recovers EMT-like cells where the panel's
+# epi/mes anti-correlation makes ΔC reject a legitimate single-cell
+# merge. The ΔC floor protects against fusing engulfment doublets
+# where composition rejects strongly (e.g. jikammne ΔC = -0.49 with
+# D ≈ 0.5 stays split because -0.49 < -0.2 floor).
+#
+# An earlier veto-direction Maha implementation was superseded — the
+# witness floor `min_local_tx_per_entity` already gates the accept
+# path adequately; geometry's useful contribution is the rescue,
+# not a veto.
+#
+# Default 1.0 ships the rescue on (PDAC 2 mm: ~1.8 k legitimate
+# cell-consolidations that ΔC alone misses). Comment out the line
+# below (or set to "off" via code) to disable.
+mahalanobis_d_rescue = 1.0
+rescue_delta_c_floor = -0.2
 
 
 # ---------------------------------------------------------------------

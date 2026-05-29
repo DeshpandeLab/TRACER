@@ -38,6 +38,13 @@
     {
       "n_cells": 8,
       "n_components": 0,
+      "n_partials": 4,
+      "n_unassigned_tx": 19,
+      "stage": "Phase1-Maha-Remerge"
+    },
+    {
+      "n_cells": 8,
+      "n_components": 0,
       "n_partials": 8,
       "n_unassigned_tx": 19,
       "stage": "Split"

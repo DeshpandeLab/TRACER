@@ -26,6 +26,7 @@ pipeline.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -46,13 +47,59 @@ else:
 
 @dataclass(frozen=True)
 class Phase1Config:
-    """Phase 1 (a/b/c) — nuclear-anchored greedy prune + admission."""
+    """Phase 1 (a/b/c) — nuclear-anchored greedy prune + admission.
+
+    Phase 1b admission gate
+    -----------------------
+    The 1b gate decides whether a cytoplasmic / non-seed nuclear tx
+    admits to the main cell via gene-fit to the seed. ``veto_mode``
+    selects the gate:
+
+    - ``"mean"`` (default; back-compat): admit when mean PMI(gene,seed)
+      >= ``pmi_threshold``. Permissive — at lineage interfaces a few
+      housekeeping/IFN positives can dilute strong opposing-lineage
+      signal (see the EPCAM-vs-macrophage case study in the hybrid
+      admission spec).
+    - ``"hybrid"``: real-signal filter + unanimous-min fast-pass +
+      percentile-aggregator gate. Mirrors the Rescue hybrid kernel
+      (see `_cy_prune._admission_test`). Recommended for lineage-aware
+      panels; rejects cross-lineage candidates that the mean gate
+      admits. Note: switching the default to ``"hybrid"`` will
+      regenerate the Phase-1 partition. Regression refs will need
+      deliberate regeneration before flipping the default.
+    - ``"min"``: veto on any seed pair with PMI < ``neg_npmi_threshold``.
+      Strictest, rarely used outside diagnostic runs.
+    """
     # 2026-05-13: pmi_threshold raised 0.05 → 0.2 to match the new
     # bootstrap-PMI calibration (PMI=0.2 = 1.22× chance in natural-log).
     pmi_threshold: float = 0.2
     seed_coherence_floor: float = 0.10
     tx_weighted_prune: bool = True
     nuclear_only_admit: bool = True
+
+    # 1b admission gate (mirrors RescueConfig's veto knobs)
+    veto_mode: Literal["min", "mean", "hybrid"] = "hybrid"
+    mean_admit_threshold: float = 0.2
+    min_admit_threshold: float = 0.0
+    aggregator_percentile: float = 25.0
+    real_signal_threshold: float = 0.05
+    neg_npmi_threshold: float = -0.2
+
+    # ------------------------------------------------------------------
+    # Phase-1-time Mahalanobis-gated remerge (opt-in).
+    # ------------------------------------------------------------------
+    # Sibling of StitchConfig.mahalanobis_d_rescue applied one stage
+    # earlier — between Phase1-QC and Rescue. For each entity pair
+    # sharing a bin neighborhood (xy 8-Moore + ±1 z), if
+    #
+    #     maha_remerge_delta_c_floor < ΔC < 0   AND   D ≤ maha_remerge_d
+    #
+    # the two roots are unioned via DSU. The ΔC floor (≤ 0) protects
+    # against fusing engulfment doublets where composition rejects
+    # strongly. Default 1.0 ships the stage on; set to ``None`` to
+    # disable (the stage becomes a no-op).
+    maha_remerge_d: float | None = 1.0
+    maha_remerge_delta_c_floor: float = -0.2
 
     def __post_init__(self) -> None:
         if not (-1.0 <= self.pmi_threshold <= 1.0):
@@ -63,6 +110,38 @@ class Phase1Config:
             raise ValueError(
                 f"phase1.seed_coherence_floor out of range: "
                 f"{self.seed_coherence_floor}"
+            )
+        if self.veto_mode not in ("min", "mean", "hybrid"):
+            raise ValueError(
+                f"phase1.veto_mode must be 'min'/'mean'/'hybrid'; "
+                f"got {self.veto_mode!r}"
+            )
+        if not (0.0 <= self.aggregator_percentile <= 100.0):
+            raise ValueError(
+                f"phase1.aggregator_percentile must be in [0, 100]; "
+                f"got {self.aggregator_percentile}"
+            )
+        if self.real_signal_threshold < 0.0:
+            raise ValueError(
+                f"phase1.real_signal_threshold must be >= 0; "
+                f"got {self.real_signal_threshold}"
+            )
+        if self.maha_remerge_d is not None and not (
+            self.maha_remerge_d > 0.0
+        ):
+            raise ValueError(
+                f"phase1.maha_remerge_d must be > 0 when set; "
+                f"got {self.maha_remerge_d}"
+            )
+        if not math.isfinite(self.maha_remerge_delta_c_floor):
+            raise ValueError(
+                f"phase1.maha_remerge_delta_c_floor must be finite; "
+                f"got {self.maha_remerge_delta_c_floor}"
+            )
+        if self.maha_remerge_delta_c_floor > 0.0:
+            raise ValueError(
+                f"phase1.maha_remerge_delta_c_floor must be <= 0; "
+                f"got {self.maha_remerge_delta_c_floor}"
             )
 
 
@@ -444,6 +523,28 @@ class StitchConfig:
     # Witness floor (per-entity tx count in shared bin neighborhood)
     min_local_tx_per_entity: int = 3
 
+    # Mahalanobis-D RESCUE on borderline-ΔC pairs.
+    # When `mahalanobis_d_rescue` is set (recommended ~1.0), the loop
+    # OVERRIDES a ΔC reject for candidate pairs whose:
+    #     rescue_delta_c_floor < ΔC < 0    AND    D ≤ mahalanobis_d_rescue
+    # i.e. when composition borderline-rejects AND the two tx clouds
+    # are geometrically enmeshed (low Mahalanobis D relative to the
+    # pooled covariance structure). Recovers EMT-like cells where the
+    # panel's epi/mes anti-correlation drags ΔC slightly negative on a
+    # legitimate single-cell merge. Default 1.0 ships the rescue on
+    # (PDAC 2 mm: ~1.8 k cell-consolidations that ΔC alone misses);
+    # set to ``None`` to disable.
+    #
+    # The `rescue_delta_c_floor` (default -0.2, must be ≤ 0) protects
+    # against fusing engulfment doublets (jikammne-like: ΔC = -0.49,
+    # D ≈ 0.5 — D is low, but ΔC is well below the floor → no rescue).
+    # An earlier veto-direction Maha implementation was superseded —
+    # the witness floor `min_local_tx_per_entity` already gates the
+    # accept path adequately; geometry's useful contribution is the
+    # rescue, not a veto.
+    mahalanobis_d_rescue: float | None = 1.0
+    rescue_delta_c_floor: float = -0.2
+
     def __post_init__(self) -> None:
         if not (-1.0 <= self.deltaC_min <= 1.0):
             raise ValueError(
@@ -483,6 +584,23 @@ class StitchConfig:
             raise ValueError(
                 f"stitch.min_local_tx_per_entity must be >= 0; "
                 f"got {self.min_local_tx_per_entity}"
+            )
+        if self.mahalanobis_d_rescue is not None and not (
+            self.mahalanobis_d_rescue > 0.0
+        ):
+            raise ValueError(
+                f"stitch.mahalanobis_d_rescue must be > 0 when set; "
+                f"got {self.mahalanobis_d_rescue}"
+            )
+        if not math.isfinite(self.rescue_delta_c_floor):
+            raise ValueError(
+                f"stitch.rescue_delta_c_floor must be finite; "
+                f"got {self.rescue_delta_c_floor}"
+            )
+        if self.rescue_delta_c_floor > 0.0:
+            raise ValueError(
+                f"stitch.rescue_delta_c_floor must be <= 0; "
+                f"got {self.rescue_delta_c_floor}"
             )
 
 

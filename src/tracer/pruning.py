@@ -631,6 +631,12 @@ def prune_transcripts_nuclear_seed(
     seed_coherence_floor: float = -1e30,
     nuclear_only_admit: bool = False,
     tx_weighted: bool = True,
+    veto_mode: str = "mean",
+    mean_admit_threshold: float = 0.2,
+    min_admit_threshold: float = 0.0,
+    aggregator_percentile: float = 25.0,
+    real_signal_threshold: float = 0.05,
+    neg_npmi_threshold: float = -0.2,
 ):
     """Nuclear-seed Prune: anchor cell identity on the spatially-compact
     nucleus, then admit cytoplasmic tx whose gene fits the seed by PMI.
@@ -803,6 +809,63 @@ def prune_transcripts_nuclear_seed(
         1 if nuclear_only_admit else 0,
         1 if tx_weighted else 0,
     )
+    veto_mode_str = veto_mode.lower()
+    if veto_mode_str not in ("min", "mean", "hybrid"):
+        raise ValueError(
+            f"veto_mode must be 'min'/'mean'/'hybrid'; got {veto_mode!r}"
+        )
+    veto_mode_int = {"min": 0, "mean": 1, "hybrid": 2}[veto_mode_str]
+
+    # Bit-exactness gate: Phase 1b's legacy `mean` is the plain finite-
+    # mean test (no real-signal filter, no small-entity guard). The
+    # unified helper supports an `rs_active` variant of mean for Rescue,
+    # but at the prune call site we always disable it under `mean` so
+    # regression refs hold against the pre-helper `_mean_pmi_test`. The
+    # `hybrid`/`min` modes get the real-signal filter as designed.
+    rs_thr_kernel = (
+        0.0 if veto_mode_str == "mean" else float(real_signal_threshold)
+    )
+
+    if use_sparse_panel:
+        codes = _cy_prune.prune_cells_nuclear_seed_sparse(
+            cell_tx_idx_lists,
+            gene_idx_int,
+            is_nuc_int,
+            W_sp_indptr,
+            W_sp_indices,
+            W_sp_data,
+            float(threshold),
+            int(min_nuclear_genes),
+            1 if skip_phase_1c else 0,
+            float(seed_coherence_floor),
+            1 if nuclear_only_admit else 0,
+            1 if tx_weighted else 0,
+            veto_mode_int,
+            float(min_admit_threshold),
+            float(mean_admit_threshold),
+            float(aggregator_percentile),
+            rs_thr_kernel,
+            float(neg_npmi_threshold),
+        )
+    else:
+        codes = _cy_prune.prune_cells_nuclear_seed(
+            cell_tx_idx_lists,
+            gene_idx_int,
+            is_nuc_int,
+            W if W.dtype == np.float32 else W.astype(np.float32),
+            float(threshold),
+            int(min_nuclear_genes),
+            1 if skip_phase_1c else 0,
+            float(seed_coherence_floor),
+            1 if nuclear_only_admit else 0,
+            1 if tx_weighted else 0,
+            veto_mode_int,
+            float(min_admit_threshold),
+            float(mean_admit_threshold),
+            float(aggregator_percentile),
+            rs_thr_kernel,
+            float(neg_npmi_threshold),
+        )
 
     # Apply codes to out_col. Default state of out_col is the cell_id
     # string already (set above as df[out_col] = df["_cell_str"].copy()),
