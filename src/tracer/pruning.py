@@ -795,20 +795,6 @@ def prune_transcripts_nuclear_seed(
                     .astype(np.int32).to_numpy())
     is_nuc_int = df["_is_nuc"].to_numpy().astype(np.uint8)
 
-    codes = _cy_prune.prune_cells_nuclear_seed_sparse(
-        cell_tx_idx_lists,
-        gene_idx_int,
-        is_nuc_int,
-        W_sp_indptr,
-        W_sp_indices,
-        W_sp_data,
-        float(threshold),
-        int(min_nuclear_genes),
-        1 if skip_phase_1c else 0,
-        float(seed_coherence_floor),
-        1 if nuclear_only_admit else 0,
-        1 if tx_weighted else 0,
-    )
     veto_mode_str = veto_mode.lower()
     if veto_mode_str not in ("min", "mean", "hybrid"):
         raise ValueError(
@@ -826,46 +812,30 @@ def prune_transcripts_nuclear_seed(
         0.0 if veto_mode_str == "mean" else float(real_signal_threshold)
     )
 
-    if use_sparse_panel:
-        codes = _cy_prune.prune_cells_nuclear_seed_sparse(
-            cell_tx_idx_lists,
-            gene_idx_int,
-            is_nuc_int,
-            W_sp_indptr,
-            W_sp_indices,
-            W_sp_data,
-            float(threshold),
-            int(min_nuclear_genes),
-            1 if skip_phase_1c else 0,
-            float(seed_coherence_floor),
-            1 if nuclear_only_admit else 0,
-            1 if tx_weighted else 0,
-            veto_mode_int,
-            float(min_admit_threshold),
-            float(mean_admit_threshold),
-            float(aggregator_percentile),
-            rs_thr_kernel,
-            float(neg_npmi_threshold),
-        )
-    else:
-        codes = _cy_prune.prune_cells_nuclear_seed(
-            cell_tx_idx_lists,
-            gene_idx_int,
-            is_nuc_int,
-            W if W.dtype == np.float32 else W.astype(np.float32),
-            float(threshold),
-            int(min_nuclear_genes),
-            1 if skip_phase_1c else 0,
-            float(seed_coherence_floor),
-            1 if nuclear_only_admit else 0,
-            1 if tx_weighted else 0,
-            veto_mode_int,
-            float(min_admit_threshold),
-            float(mean_admit_threshold),
-            float(aggregator_percentile),
-            rs_thr_kernel,
-            float(neg_npmi_threshold),
-        )
+    # Sparse-only wrapper: the dense kernel call branch is gone (the
+    # NpmiBootstrapResult / DataFrame / None contract above always lands
+    # on a symmetric CSR via _symmetric_csr_arrays). Carries the new
+    # Phase-1b veto_mode / hybrid percentile params.
+    codes = _cy_prune.prune_cells_nuclear_seed_sparse(
+        cell_tx_idx_lists,
+        gene_idx_int,
+        is_nuc_int,
+        W_sp_indptr,
+        W_sp_indices,
+        W_sp_data,
+        float(threshold),
+        int(min_nuclear_genes),
+        1 if skip_phase_1c else 0,
+        float(seed_coherence_floor),
+        1 if nuclear_only_admit else 0,
+        1 if tx_weighted else 0,
+        veto_mode_int,
+        float(min_admit_threshold),
+        float(mean_admit_threshold),
+        float(aggregator_percentile),
+        rs_thr_kernel,
+        float(neg_npmi_threshold),
+    )
 
     # Apply codes to out_col. Default state of out_col is the cell_id
     # string already (set above as df[out_col] = df["_cell_str"].copy()),
