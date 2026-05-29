@@ -182,9 +182,40 @@ def auto_thresholds(
 # ============================================================================
 # Phase 1a-style greedy prune
 # ============================================================================
-def greedy_prune(unique_gene_idx: list[int], W: np.ndarray,
+def _pmi_get(W, gi: int, gj: int) -> float:
+    """Coherence-convention scalar PMI accessor: dense → ``W[gi, gj]`` with
+    NaN coerced to 0; sparse symmetric CSR → stored value with absent
+    coerced to 0. Same convention as the legacy ``np.nan_to_num(W, nan=0.0)``
+    dense path, so density_cascade's outputs do not shift when ``aux["W"]``
+    arrives sparse from the prune.
+
+    Note: this is the OPPOSITE of the prune / reassign sparse convention
+    (skip absent). Density_cascade's bad-edge counter intentionally treats
+    "weakly cooccurring → no evidence" as anti-evidence; revisiting that
+    choice is its own conversation.
+    """
+    import scipy.sparse as _sp
+    if _sp.issparse(W):
+        row_start = W.indptr[gi]
+        row_end = W.indptr[gi + 1]
+        if row_start == row_end:
+            return 0.0
+        # CSR rows are column-sorted (we call sort_indices upstream).
+        idx = row_start + int(np.searchsorted(
+            W.indices[row_start:row_end], gj))
+        if idx < row_end and W.indices[idx] == gj:
+            return float(W.data[idx])
+        return 0.0
+    v = W[gi, gj]
+    return 0.0 if not (v == v) else float(v)
+
+
+def greedy_prune(unique_gene_idx: list[int], W,
                   threshold: float = 0.05) -> list[int]:
-    """Iteratively remove the gene with most bad edges (PMI < threshold)."""
+    """Iteratively remove the gene with most bad edges (PMI < threshold).
+
+    Accepts dense ndarray or symmetric sparse CSR ``W`` via :func:`_pmi_get`.
+    """
     g = list(unique_gene_idx)
     while len(g) >= 2:
         bad_count = [0] * len(g)
@@ -193,8 +224,7 @@ def greedy_prune(unique_gene_idx: list[int], W: np.ndarray,
             for j in range(len(g)):
                 if i == j:
                     continue
-                v = W[gi, g[j]]
-                if v == v and v < threshold:  # NaN-safe
+                if _pmi_get(W, gi, g[j]) < threshold:
                     bad_count[i] += 1
         worst_idx = int(np.argmax(bad_count))
         if bad_count[worst_idx] == 0:
@@ -256,7 +286,10 @@ def density_cascade_phase1(
         stats_per_pass : list of per-threshold stats
         coverage_curve : list (when thresholds="auto") for diagnostics
     """
-    # Resolve W matrix
+    # Resolve W matrix. Sparse CSR is preserved (never densified); pair
+    # lookups go through :func:`_pmi_get` so dense ndarray and sparse CSR
+    # are interchangeable. Avoids the O(G^2) materialization that used to
+    # cap whole-transcriptome panels.
     import scipy.sparse as _sp
     if aux is not None and "W" in aux and "gene_to_idx" in aux:
         gene_to_idx = aux["gene_to_idx"]
@@ -267,23 +300,23 @@ def density_cascade_phase1(
                 "density_cascade_phase1 needs either panel= or aux= with W"
             )
         _, gene_to_idx, W = build_dense_npmi_matrix(panel, npmi_col="PMI")
-    # Densify if sparse: this kernel does dense W[g, s] indexing throughout.
-    # Sparsifying density_cascade is a separate follow-up; for now we eat the
-    # O(G^2) here. At WT scale this will OOM — caller's burden to know.
-    # Symmetrize the upper-triangle CSR via COO-stacking (NOT W + W.T —
-    # scipy's sparse add drops explicit zeros).
     if _sp.issparse(W):
+        # Symmetrize the upper-triangle CSR via COO-stacking (NOT W + W.T:
+        # scipy's sparse add eliminates explicit zeros). Keep sparse — the
+        # bad-edge accessor binary-searches the row, no (G, G) ever built.
+        # Never eliminate_zeros — observed PMI of exactly 0.0 stays stored.
         Wu = W.tocoo()
-        rows = np.concatenate([Wu.row, Wu.col])
-        cols = np.concatenate([Wu.col, Wu.row])
-        data = np.concatenate([Wu.data, Wu.data])
-        Wsym = _sp.csr_matrix(
-            (data.astype(np.float32), (rows, cols)),
+        W = _sp.csr_matrix(
+            (
+                np.concatenate([Wu.data, Wu.data]).astype(np.float32),
+                (
+                    np.concatenate([Wu.row, Wu.col]),
+                    np.concatenate([Wu.col, Wu.row]),
+                ),
+            ),
             shape=W.shape, dtype=np.float32,
         )
-        W = np.asarray(Wsym.todense(), dtype=np.float32)
-        # Sparse "absent" already means "zero" in this kernel's convention
-        # (coherence-style), so no nan_to_num is needed on a sparse-derived W.
+        W.sort_indices()
     else:
         W = W.astype(np.float32)
         np.nan_to_num(W, copy=False, nan=0.0)
