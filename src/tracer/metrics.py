@@ -567,6 +567,9 @@ def compute_pmi_bootstrap(
         Stage-4 kernel. ``"pair_gather"`` is the legacy per-pair column
         gather (bitwise-identical to prior behavior); ``"gene_row"`` (default)
         is the streamed gene-row kernel for whole-transcriptome scale.
+        ``"gene_row"`` supports scalar ``tau`` and full-``C`` resampling only;
+        it raises ``NotImplementedError`` for dual-tau (weak kinds) or
+        ``subsample_size`` — use ``"pair_gather"`` for those.
     gene_order : str
         Gene processing order for the ``gene_row`` kernel
         (``"prob_ascending"`` default; also ``"prob_descending"``,
@@ -1559,6 +1562,23 @@ def _bootstrap_from_presence(
         # order; each pair is owned (bootstrapped) once by its earlier-in-order
         # endpoint (the dedup triangle). The kernel emits settled pos/neg pairs
         # directly with their legacy point-estimate value.
+        #
+        # The gene-row settle logic (`_classify_ci`) implements the scalar-tau
+        # cascade (pos_strong / neg_strong / tight_null) and resamples the full
+        # C cells per iteration. Dual-tau "weak" kinds and `subsample_size` are
+        # NOT supported here — fail loud rather than silently diverge from
+        # `pair_gather`, which does support them.
+        if not np.isscalar(tau):
+            raise NotImplementedError(
+                "bootstrap_kernel='gene_row' supports scalar `tau` only "
+                "(no dual-tau weak kinds). Use bootstrap_kernel='pair_gather' "
+                "for a (tau_low, tau_high) sequence."
+            )
+        if subsample_size is not None:
+            raise NotImplementedError(
+                "bootstrap_kernel='gene_row' does not support `subsample_size`. "
+                "Use bootstrap_kernel='pair_gather'."
+            )
         k = np.asarray(M.sum(0)).ravel().astype(np.float64)
         legacy_l1 = None
         stopping = None
