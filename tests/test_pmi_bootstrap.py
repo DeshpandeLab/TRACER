@@ -191,6 +191,26 @@ def test_gene_row_kernel_parity_with_pair_gather():
     assert len(Wa ^ Wb) <= 2
 
 
+def test_gene_row_accepts_single_element_tau_sequence():
+    """gene_row must accept single-threshold tau given as a 1-element
+    sequence (``[0.05]``/``(0.05,)``/``np.array([0.05])``) — the tau parser
+    treats size==1 as scalar — and must still reject genuine dual-tau."""
+    import numpy as np
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    common = dict(group_key="cell_id", feature_col="feature_name",
+                  metric="npmi", bootstrap_kernel="gene_row", seed=0,
+                  show_progress=False, max_bootstraps=600)
+    for tau in ([0.05], (0.05,), np.array([0.05]), [0.05, 0.05]):
+        res = compute_pmi_bootstrap(df, tau=tau, **common)
+        assert res.diagnostics["is_dual_tau"] is False
+        assert res.diagnostics["kernel"] == "gene_row"
+    # genuine dual-tau (low < high) is unsupported by gene_row → fail loud
+    with pytest.raises(NotImplementedError):
+        compute_pmi_bootstrap(df, tau=[0.02, 0.08], **common)
+
+
 def test_gene_order_prob_ascending():
     import numpy as np
     from tracer.metrics import _gene_processing_order

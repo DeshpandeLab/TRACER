@@ -1263,7 +1263,11 @@ def _bootstrap_gene_rows(
         seg_slices = []
         for (g, partners, refs) in seg:
             s = slice(t, t + len(partners))
-            seg_slices.append((g, partners, s))
+            # Hoist gc (cells where gene g is present) out of the per-iteration
+            # loop: it depends only on M and g, NOT on the resample multiplicity
+            # `rc`, so compute it once per gene here from the CSC view.
+            gc = Mcsc.indices[Mcsc.indptr[g]:Mcsc.indptr[g + 1]]
+            seg_slices.append((g, partners, s, gc))
             flat_g[s] = g
             flat_h[s] = partners
             flat_legacy[s] = legacy_for_W[refs]
@@ -1278,14 +1282,17 @@ def _bootstrap_gene_rows(
                 rc = np.bincount(draw, minlength=C).astype(np.float64)
                 marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
                 N_b = float(C)
-                for (g, partners, s) in seg_slices:
+                for (g, partners, s, gc) in seg_slices:
                     if not unsettled[s].any():
                         continue
-                    col = Mcsc.getcol(g)
-                    gc = col.indices                 # cells where g present
-                    w = np.zeros(C)
-                    w[gc] = rc[gc]
-                    co_row = np.asarray(w @ M).ravel()   # co(g, :) under resample
+                    # Row-restricted co-occurrence: only touch g's present cells
+                    # (O(nnz of those rows)) instead of `w @ M` which iterates
+                    # every nonzero of M. Mathematically identical: each present
+                    # cell's M-row is weighted by its resample multiplicity rc[c]
+                    # then summed to the length-G co-occurrence row.
+                    co_row = np.asarray(
+                        M[gc].multiply(rc[gc][:, None]).sum(axis=0)
+                    ).ravel()
                     co = co_row[partners]
                     Pij = (co + alpha) / (N_b + 2.0 * alpha)
                     Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
@@ -1616,6 +1623,11 @@ def _bootstrap_from_presence(
             "n_bootstraps_per_pair": np.zeros(0, dtype=np.int32),
             "subsample_size": iter_size,
             "min_expected_cooccur_for_evidence": thr,
+            "metric": metric,
+            "tau_low": tau_low,
+            "tau_high": tau_high,
+            "is_dual_tau": _is_dual_tau,
+            "kernel": kernel,
             "pre_filter": pre_filter_diag,
         }
         W_sparse = sp.coo_matrix(
@@ -1668,7 +1680,7 @@ def _bootstrap_from_presence(
         # C cells per iteration. Dual-tau "weak" kinds and `subsample_size` are
         # NOT supported here — fail loud rather than silently diverge from
         # `pair_gather`, which does support them.
-        if not np.isscalar(tau):
+        if _is_dual_tau:
             raise NotImplementedError(
                 "bootstrap_kernel='gene_row' supports scalar `tau` only "
                 "(no dual-tau weak kinds). Use bootstrap_kernel='pair_gather' "
