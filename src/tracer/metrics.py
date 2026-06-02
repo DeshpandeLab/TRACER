@@ -377,6 +377,50 @@ def _presence_from_counts(X, var_names, obs_names=None, *, min_occurrences_per_c
     return M, genes, contexts
 
 
+def _gene_processing_order(key, *, k, legacy_l1=None, stopping_mass=None):
+    """Return gene index order for the dedup/streaming pass.
+    'prob_ascending'/'prob_descending' sort by detection k (= p*C).
+    'l1_pmi' sorts by sum|PMI| row (magnitude proxy; not stopping-time).
+    'stopping_mass' sorts by the near-tau/low-support mass (slow-last).
+    'index' keeps native order."""
+    if key == "index":
+        return np.arange(k.size)
+    if key == "prob_ascending":
+        return np.argsort(k, kind="stable")
+    if key == "prob_descending":
+        return np.argsort(k, kind="stable")[::-1].copy()
+    if key == "l1_pmi":
+        if legacy_l1 is None:
+            raise ValueError("l1_pmi order needs legacy_l1")
+        return np.argsort(legacy_l1, kind="stable")
+    if key == "stopping_mass":
+        if stopping_mass is None:
+            raise ValueError("stopping_mass order needs stopping_mass")
+        return np.argsort(stopping_mass, kind="stable")
+    raise ValueError(f"unknown gene_order {key!r}")
+
+
+def _owned_partners(obs_i, obs_j, can_bootstrap, pos):
+    """Assign each can_bootstrap pair to its earlier-in-order endpoint.
+    Returns CSR-like (indptr, partner, pairref) over genes 0..G-1, where for
+    gene g, partner[indptr[g]:indptr[g+1]] are the genes it owns (later in
+    `pos`) and pairref the index back into obs_* for legacy lookup."""
+    G = pos.size
+    bi = obs_i[can_bootstrap]; bj = obs_j[can_bootstrap]
+    ref = np.flatnonzero(can_bootstrap)
+    earlier_is_i = pos[bi] < pos[bj]
+    owner = np.where(earlier_is_i, bi, bj)
+    partner = np.where(earlier_is_i, bj, bi)
+    order_by_owner = np.argsort(owner, kind="stable")
+    owner_s = owner[order_by_owner]
+    partner_s = partner[order_by_owner].astype(np.int32)
+    pairref_s = ref[order_by_owner].astype(np.int64)
+    indptr = np.zeros(G + 1, dtype=np.int64)
+    np.add.at(indptr, owner_s + 1, 1)
+    np.cumsum(indptr, out=indptr)
+    return indptr, partner_s, pairref_s
+
+
 def _bootstrap_npmi_for_pairs(
     M_sample: sp.csr_matrix,
     pairs_i: np.ndarray,

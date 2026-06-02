@@ -167,3 +167,34 @@ def test_pair_gather_kernel_matches_legacy_output():
     assert (2, 3) in got and got[(2, 3)] < -0.1
     assert (8, 9) in got and got[(8, 9)] == -1.0
     assert res.diagnostics["n_neg_one"] >= 1
+
+
+def test_gene_order_prob_ascending():
+    import numpy as np
+    from tracer.metrics import _gene_processing_order
+    k = np.array([100, 5, 50, 5], dtype=np.float64)   # detection per gene
+    order = _gene_processing_order("prob_ascending", k=k)
+    # ascending k: genes 1,3 (k=5) before 2 (k=50) before 0 (k=100)
+    assert order[-1] == 0
+    assert set(order[:2].tolist()) == {1, 3}
+    assert list(order) != list(range(len(k)))  # not identity unless sorted
+
+
+def test_owned_partners_each_pair_once_and_window_shrinks():
+    import numpy as np
+    from tracer.metrics import _owned_partners
+    # candidate upper-tri pairs (by gene index): (0,1),(0,2),(1,2),(2,3)
+    obs_i = np.array([0, 0, 1, 2]); obs_j = np.array([1, 2, 2, 3])
+    can = np.array([True, True, True, True])
+    order = np.array([0, 1, 2, 3])           # process in index order
+    pos = np.empty(4, dtype=np.int64); pos[order] = np.arange(4)
+    indptr, partner, pairref = _owned_partners(obs_i, obs_j, can, pos)
+    # each pair owned exactly once
+    assert partner.size == 4
+    # gene 0 owns {1,2}; gene 1 owns {2}; gene 2 owns {3}; gene 3 owns {}
+    owned = {g: partner[indptr[g]:indptr[g+1]].tolist() for g in range(4)}
+    assert sorted(owned[0]) == [1, 2]
+    assert owned[1] == [2] and owned[2] == [3] and owned[3] == []
+    # window (owned count) is non-increasing here
+    counts = [indptr[g+1]-indptr[g] for g in range(4)]
+    assert counts == [2, 1, 1, 0]
