@@ -624,10 +624,10 @@ def test_counter_mode_incompatible_with_persist_ci():
 
 
 def test_counter_mode_o1_memory_independent_of_budget():
-    """GATE 4 — counter mode stores NO per-pair sample arrays; per-pair
-    accumulator state is 3 ints regardless of max_bootstraps. Drive the kernel
-    directly and assert the only per-pair state is cnt_below/cnt_above/nsamp,
-    whose total nbytes is independent of max_bootstraps."""
+    """GATE 4 — single-pass counter mode stores NO per-pair sample arrays and NO
+    (n_owned x block) buffer; per-pair accumulator state is 3 ints regardless of
+    max_bootstraps. Assert the only per-pair state is cnt_below/cnt_above/nsamp,
+    whose total nbytes is independent of max_bootstraps and of the block size."""
     from tracer.metrics import compute_pmi_bootstrap
     from tests.synthetic import make_synthetic_npmi_panel
     df, _ = make_synthetic_npmi_panel()
@@ -643,16 +643,84 @@ def test_counter_mode_o1_memory_independent_of_budget():
     n_small = np.asarray(r_small.diagnostics["n_bootstraps_per_pair"]).size
     n_big = np.asarray(r_big.diagnostics["n_bootstraps_per_pair"]).size
     assert n_small == n_big
-    # Structural check: in counter mode the per-pair sample store is never
-    # materialized (set to None) and the settle runs from counts only.
+    # The pair-count is also independent of the block cadence (single global
+    # ownership, not per-batch): same #pairs under tiny vs large blocks.
+    n_tinyblock = np.asarray(
+        compute_pmi_bootstrap(
+            df, ci_accumulator="counter", max_bootstraps=200,
+            **{**common, "coarse_block": 10, "refine_block": 10},
+        ).diagnostics["n_bootstraps_per_pair"]).size
+    assert n_tinyblock == n_small
+
+    # Structural checks on the SINGLE-PASS counter kernel.
     import inspect
     from tracer import metrics as _m
-    src = inspect.getsource(_m._bootstrap_gene_rows)
-    # sample_store is None when counter_mode (no O(B) per-pair allocation).
-    assert "sample_store: list = None if counter_mode" in src
-    # The counter branch settles via the O(1) count-based helper.
+    src = inspect.getsource(_m._bootstrap_gene_rows_counter)
+    # No per-pair sample store and no (n_owned x block) 2-D buffer is allocated.
+    assert "sample_store" not in src
+    assert "np.empty((n_owned, block)" not in src
+    assert "block_rows" not in src
+    # Counters are incremented PER ITERATION (per-gene), not from a block buffer.
+    assert "cnt_above[base:s.stop][um] += (val[um] > tau_high)" in src
+    # Single pass: no gene-batch loop, settle via the O(1) count-based helper.
+    assert "for b_idx, (bs, be) in enumerate(batches)" not in src
     assert "_counter_settle_inplace(" in src
     # The O(1) helper itself reads no stored samples — only the 3 int arrays.
     settle_src = inspect.getsource(_m._counter_settle_inplace)
     assert "sample_store" not in settle_src
     assert "cnt_above" in settle_src and "cnt_below" in settle_src
+
+
+def test_counter_single_pass_ignores_gene_batch_budget():
+    """GATE 4 (single-pass) — a budget that WOULD have forced many gene-batches
+    in samples mode is ignored in counter mode (single pass), warns, and yields
+    the SAME W as the default budget. Holds all candidate pairs at once."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    big = compute_pmi_bootstrap(
+        df, ci_accumulator="counter", gene_batch_peak_gb=16.0, **_COMMON_GR)
+    # A tiny budget would split the samples path into many single-gene batches;
+    # counter mode must ignore it (single pass) and warn.
+    with pytest.warns(UserWarning, match="gene_batch_peak_gb is ignored"):
+        small = compute_pmi_bootstrap(
+            df, ci_accumulator="counter", gene_batch_peak_gb=1e-9, **_COMMON_GR)
+    assert np.array_equal(big.W_sparse.toarray(), small.W_sparse.toarray())
+
+
+def test_counter_single_pass_block_cadence_invariant():
+    """Single-pass counter early-stop cadence still works: changing
+    coarse_block/refine_block must not change which pairs settle pos/neg
+    (settlement decision depends on accumulated counts, not the block size)."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    common = {k: v for k, v in _COMMON_GR.items()
+              if k not in ("coarse_block", "refine_block")}
+    a = compute_pmi_bootstrap(
+        df, ci_accumulator="counter", coarse_block=200, refine_block=200,
+        **common)
+    b = compute_pmi_bootstrap(
+        df, ci_accumulator="counter", coarse_block=50, refine_block=50,
+        **common)
+    Sa = {(int(i), int(j)) for i, j in zip(*a.W_sparse.nonzero())}
+    Sb = {(int(i), int(j)) for i, j in zip(*b.W_sparse.nonzero())}
+    # Unambiguous pairs settle identically regardless of cadence; only near-tau
+    # pairs may differ by at most a couple due to different early-stop points.
+    assert len(Sa ^ Sb) <= 2
+    assert (0, 1) in Sa and (0, 1) in Sb
+    assert (8, 9) in Sa and (8, 9) in Sb
+
+
+def test_counter_checkpoint_ignored_with_warning(tmp_path):
+    """Single-pass counter mode does not support per-batch checkpointing: a
+    checkpoint_path is ignored with a warning and no file is written."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    ckpt = tmp_path / "ck.npz"
+    with pytest.warns(UserWarning, match="checkpoint_path is ignored"):
+        compute_pmi_bootstrap(
+            df, ci_accumulator="counter", checkpoint_path=str(ckpt),
+            **_COMMON_GR)
+    assert not ckpt.exists()

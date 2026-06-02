@@ -1642,6 +1642,210 @@ def _bootstrap_gene_rows(
     return rows, cols, vals, kernel_diag
 
 
+def _bootstrap_gene_rows_counter(
+    M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
+    *, G, tau, ci_level, max_bootstraps, coarse_block, refine_block,
+    min_samples_for_ci, alpha, metric, seed, show_progress,
+    subsample_size=None,
+):
+    """SINGLE-PASS counter-mode gene-row bootstrap over ALL owned pairs.
+
+    Counter mode keeps only three integers per pair (``cnt_below``/``cnt_above``/
+    ``nsamp``), so the whole candidate set's accumulator state fits at once
+    (~12 B/pair). Gene-batching only ever existed to bound the *sample-store*
+    memory of the samples path, and counter mode stores no samples — so this
+    kernel processes every owned pair in ONE pass with a single global ownership
+    assignment (``_owned_partners``), no batches.
+
+    It also drops the per-block ``(n_owned x block)`` buffer the samples/batched
+    path uses: inside each iteration it increments the three counters
+    PER-GENE directly from that gene's partner-PMI vector ``val``
+    (``cnt_above += val > tau_high`` etc.), so no 2-D block buffer is ever
+    allocated. The iteration-block early-stop cadence is preserved: the
+    unsettled set is frozen for the whole block and re-tested via
+    :func:`_counter_settle_inplace` every ``coarse_block``/``refine_block``
+    iterations, so settled pairs stop being updated.
+
+    Per-pair state: the 3 int counter arrays + per-pair owner/partner/legacy
+    arrays; per iteration: the resample vector ``rc`` and a length-G shared
+    marginal; per gene: one length-G co-occurrence row. Memory is O(n_pairs)
+    independent of ``coarse_block``/``refine_block`` and of any batch budget.
+    Works with ``subsample_size`` (only the per-gene ``val`` computation
+    differs). Returns ``(rows, cols, vals, kernel_diag)`` matching
+    :func:`_bootstrap_gene_rows`.
+    """
+    tau_arr = np.atleast_1d(np.asarray(tau, dtype=float))
+    if tau_arr.size == 1:
+        tau_low = tau_high = float(tau_arr[0])
+    else:
+        tau_low = float(tau_arr.min())
+        tau_high = float(tau_arr.max())
+    ci_lo_q = (1.0 - ci_level) / 2.0
+    ci_hi_q = 1.0 - ci_lo_q
+
+    Mcsc = M.tocsc()
+    C = M.shape[0]
+    subsample = subsample_size is not None
+    s_cells = int(subsample_size) if subsample else C
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+
+    # Single global ownership over ALL genes (no batching). Flatten every owned
+    # pair into a contiguous flat slot `t`; seg_slices maps each gene to its
+    # contiguous slot range + its hoisted present-cell indices `gc`.
+    seg = [(int(g),
+            own_partner[own_indptr[g]:own_indptr[g + 1]],
+            own_pairref[own_indptr[g]:own_indptr[g + 1]])
+           for g in order]
+    n_owned = sum(len(p) for _, p, _ in seg)
+    if n_owned == 0:
+        kernel_diag = {
+            "n_pos": 0, "n_neg": 0, "n_dead_zone": 0, "n_unsettled": 0,
+            "n_bootstraps_per_pair": np.zeros(0, dtype=np.int32),
+        }
+        return rows, cols, vals, kernel_diag
+
+    rng = np.random.default_rng(seed)
+
+    # Per-pair state: 3 int counters + owner/partner/legacy arrays. No sample
+    # store, no (n_owned x block) buffer.
+    cnt_below = np.zeros(n_owned, dtype=np.int64)
+    cnt_above = np.zeros(n_owned, dtype=np.int64)
+    nsamp = np.zeros(n_owned, dtype=np.int32)
+    unsettled = np.ones(n_owned, dtype=bool)
+    kind = np.zeros(n_owned, dtype=np.int8)
+    flat_g = np.empty(n_owned, dtype=np.int64)
+    flat_h = np.empty(n_owned, dtype=np.int64)
+    flat_legacy = np.empty(n_owned, dtype=np.float64)
+    t = 0
+    seg_slices = []
+    for (g, partners, refs) in seg:
+        s = slice(t, t + len(partners))
+        gc = Mcsc.indices[Mcsc.indptr[g]:Mcsc.indptr[g + 1]]
+        seg_slices.append((g, partners, s, gc))
+        flat_g[s] = g
+        flat_h[s] = partners
+        flat_legacy[s] = legacy_for_W[refs]
+        t += len(partners)
+
+    N_b = float(s_cells) if subsample else float(C)
+    n_done = 0
+    while n_done < max_bootstraps and unsettled.any():
+        block = coarse_block if n_done == 0 else refine_block
+        block = min(block, max_bootstraps - n_done)
+
+        # The unsettled set is FIXED for the whole block (only mutated in the
+        # post-block settle pass below), so every currently-unsettled pair gets
+        # exactly one increment per finite value per iteration.
+        for bi in range(block):
+            # RNG discipline: exactly one draw per iteration (iter_size == C in
+            # the full path, == s_cells in the subsample path), matching the
+            # batched kernel's draw order so a fixed seed -> identical W.
+            if not subsample:
+                draw = rng.integers(0, C, size=C)
+                rc = np.bincount(draw, minlength=C).astype(np.float64)
+                marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
+                for (g, partners, s, gc) in seg_slices:
+                    if not unsettled[s].any():
+                        continue
+                    co_row = np.asarray(
+                        M[gc].multiply(rc[gc][:, None]).sum(axis=0)
+                    ).ravel()
+                    co = co_row[partners]
+                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        pmi = np.log(Pij / (Pi * Pj))
+                        val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
+                    # Per-iteration counter increment for this gene's unsettled
+                    # partners only — NO (n_owned x block) buffer. Comparisons on
+                    # NaN are False, so non-finite values never increment
+                    # cnt_above/cnt_below; nsamp uses the finite mask.
+                    um = unsettled[s]
+                    fin = np.isfinite(val)
+                    base = s.start
+                    cnt_above[base:s.stop][um] += (val[um] > tau_high)
+                    cnt_below[base:s.stop][um] += (val[um] < -tau_high)
+                    nsamp[base:s.stop][um] += fin[um]
+            else:
+                draw = rng.integers(0, C, size=s_cells)
+                M_samp = M[draw]
+                marg = np.asarray(M_samp.sum(axis=0)).ravel()  # length-G
+                M_samp_csc = M_samp.tocsc()
+                for (g, partners, s, gc) in seg_slices:
+                    if not unsettled[s].any():
+                        continue
+                    gc_s = M_samp_csc.indices[
+                        M_samp_csc.indptr[g]:M_samp_csc.indptr[g + 1]]
+                    co_row = np.asarray(M_samp[gc_s].sum(axis=0)).ravel()
+                    co = co_row[partners]
+                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        pmi = np.log(Pij / (Pi * Pj))
+                        val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
+                    um = unsettled[s]
+                    fin = np.isfinite(val)
+                    base = s.start
+                    cnt_above[base:s.stop][um] += (val[um] > tau_high)
+                    cnt_below[base:s.stop][um] += (val[um] < -tau_high)
+                    nsamp[base:s.stop][um] += fin[um]
+        n_done += block
+
+        # In-loop settle (counter): classify currently-unsettled pairs that
+        # cleared min_samples_for_ci, then release them so they stop updating.
+        un_idx = np.flatnonzero(unsettled)
+        elig = un_idx[nsamp[un_idx] >= min_samples_for_ci]
+        if elig.size:
+            _counter_settle_inplace(
+                elig, cnt_below, cnt_above, nsamp, unsettled, kind,
+                tau_low, tau_high, ci_lo_q, ci_hi_q, release=True,
+            )
+
+    # Post-budget classification for any still-unsettled pair with enough
+    # samples (mirrors the batched kernel's final pass).
+    leftover = np.flatnonzero(unsettled)
+    elig = leftover[nsamp[leftover] >= min_samples_for_ci]
+    if elig.size:
+        _counter_settle_inplace(
+            elig, cnt_below, cnt_above, nsamp, unsettled, kind,
+            tau_low, tau_high, ci_lo_q, ci_hi_q, release=False,
+        )
+
+    n_pos = int((kind == 1).sum())
+    n_neg = int((kind == -1).sum())
+    n_tight = int((kind == 3).sum())
+    n_unsettled = int((kind == 0).sum())
+
+    # Emit settled pos/neg pairs with their LEGACY point estimate (tight_null
+    # and unsettled do NOT enter W), matching _bootstrap_gene_rows / pair_gather.
+    sett = np.flatnonzero((kind == 1) | (kind == -1))
+    for li in sett:
+        gi = int(flat_g[li])
+        hj = int(flat_h[li])
+        a, c = (gi, hj) if gi < hj else (hj, gi)
+        v = float(flat_legacy[li])
+        if np.isfinite(v):
+            rows.append(a)
+            cols.append(c)
+            vals.append(v)
+    if show_progress:
+        print(f"[gene_row:counter] single-pass owned={n_owned} "
+              f"settled={sett.size}")
+
+    kernel_diag = {
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+        "n_dead_zone": n_tight,
+        "n_unsettled": n_unsettled,
+        "n_bootstraps_per_pair": nsamp.copy(),
+    }
+    return rows, cols, vals, kernel_diag
+
+
 def _bootstrap_from_presence(
     M,
     genes,
@@ -2002,18 +2206,47 @@ def _bootstrap_from_presence(
         pos[order] = np.arange(order.size)
         own_indptr, own_partner, own_pairref = _owned_partners(
             obs_i, obs_j, can_bootstrap, pos)
-        owned_counts = np.diff(own_indptr)[order]
-        batches = _gene_batches(order, owned_counts,
-                                gene_batch_peak_gb=gene_batch_peak_gb,
-                                coarse_block=coarse_block)
-        rows4, cols4, vals4, kdiag4 = _bootstrap_gene_rows(
-            M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
-            batches=batches, checkpoint_path=checkpoint_path, G=G,
-            tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
-            coarse_block=coarse_block, refine_block=refine_block,
-            min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
-            seed=seed, show_progress=show_progress,
-            subsample_size=subsample_size, ci_accumulator=ci_accumulator)
+        if ci_accumulator == "counter":
+            # Counter mode keeps only 3 ints per pair, so ALL candidate pairs'
+            # accumulator state fits at once: process them in a SINGLE PASS with
+            # one global ownership assignment, no gene-batching, no per-block
+            # (n_owned x block) buffer (per-iteration increments instead).
+            # gene_batch_peak_gb / gene_order bound the sample-store memory and
+            # the batch-major order — both are irrelevant to a single counter
+            # pass, so they are unused here.
+            if gene_batch_peak_gb not in (None, 16.0):
+                warnings.warn(
+                    "gene_batch_peak_gb is ignored with ci_accumulator='counter'"
+                    " (single-pass counter mode does not batch genes).",
+                    stacklevel=2,
+                )
+            if checkpoint_path is not None:
+                warnings.warn(
+                    "checkpoint_path is ignored with ci_accumulator='counter'"
+                    " (per-batch checkpointing is not supported in single-pass"
+                    " counter mode).",
+                    stacklevel=2,
+                )
+            rows4, cols4, vals4, kdiag4 = _bootstrap_gene_rows_counter(
+                M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
+                G=G, tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
+                coarse_block=coarse_block, refine_block=refine_block,
+                min_samples_for_ci=min_samples_for_ci, alpha=alpha,
+                metric=metric, seed=seed, show_progress=show_progress,
+                subsample_size=subsample_size)
+        else:
+            owned_counts = np.diff(own_indptr)[order]
+            batches = _gene_batches(order, owned_counts,
+                                    gene_batch_peak_gb=gene_batch_peak_gb,
+                                    coarse_block=coarse_block)
+            rows4, cols4, vals4, kdiag4 = _bootstrap_gene_rows(
+                M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
+                batches=batches, checkpoint_path=checkpoint_path, G=G,
+                tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
+                coarse_block=coarse_block, refine_block=refine_block,
+                min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+                seed=seed, show_progress=show_progress,
+                subsample_size=subsample_size, ci_accumulator=ci_accumulator)
         out_rows.extend(rows4)
         out_cols.extend(cols4)
         out_vals.extend(vals4)
