@@ -1148,6 +1148,15 @@ def _bootstrap_gene_rows(
         if ck is not None:
             rows, cols, vals, done_batches = ck
 
+    # Aggregate settle counts across batches for the diagnostics contract
+    # (parity with pair_gather's n_pos/n_neg/n_dead_zone/n_unsettled). Best-
+    # effort under checkpoint resume (counts only reflect batches run this call).
+    agg_n_pos = 0
+    agg_n_neg = 0
+    agg_n_tight = 0          # kind == 3 (tight_null == dead_zone in scalar tau)
+    agg_n_unsettled = 0
+    nboot_chunks: list[np.ndarray] = []
+
     for b_idx, (bs, be) in enumerate(batches):
         if b_idx < done_batches:
             continue
@@ -1233,6 +1242,12 @@ def _bootstrap_gene_rows(
                     sample_lists[li], tau_low, tau_high, ci_lo_q, ci_hi_q)
                 kind[li] = kd
 
+        agg_n_pos += int((kind == 1).sum())
+        agg_n_neg += int((kind == -1).sum())
+        agg_n_tight += int((kind == 3).sum())
+        agg_n_unsettled += int((kind == 0).sum())
+        nboot_chunks.append(nsamp.copy())
+
         # Emit settled pos/neg pairs (kind == 1 / -1) with their LEGACY point
         # estimate. tight_null (kind == 3) and unsettled (kind == 0) do NOT
         # enter W, matching pair_gather.
@@ -1251,7 +1266,16 @@ def _bootstrap_gene_rows(
                   f"owned={n_owned} settled={sett.size}")
         if checkpoint_path is not None:
             _write_checkpoint(checkpoint_path, rows, cols, vals, G, b_idx + 1)
-    return rows, cols, vals
+
+    kernel_diag = {
+        "n_pos": agg_n_pos,
+        "n_neg": agg_n_neg,
+        "n_dead_zone": agg_n_tight,
+        "n_unsettled": agg_n_unsettled,
+        "n_bootstraps_per_pair": (np.concatenate(nboot_chunks)
+                                  if nboot_chunks else np.zeros(0, dtype=np.int32)),
+    }
+    return rows, cols, vals, kernel_diag
 
 
 def _bootstrap_from_presence(
@@ -1602,7 +1626,7 @@ def _bootstrap_from_presence(
             obs_i, obs_j, can_bootstrap, pos)
         # Task 4: single batch (memory-budgeted batching lands in a later task).
         batches = [(0, order.size)]
-        rows4, cols4, vals4 = _bootstrap_gene_rows(
+        rows4, cols4, vals4, kdiag4 = _bootstrap_gene_rows(
             M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
             batches=batches, checkpoint_path=checkpoint_path, G=G,
             tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
@@ -1631,6 +1655,11 @@ def _bootstrap_from_presence(
             "n_low_evidence": n_low_evidence,
             "n_legacy_only": n_legacy_only,
             "n_can_bootstrap": n_can_bootstrap,
+            "n_pos": kdiag4["n_pos"],
+            "n_neg": kdiag4["n_neg"],
+            "n_dead_zone": kdiag4["n_dead_zone"],
+            "n_unsettled": kdiag4["n_unsettled"],
+            "n_bootstraps_per_pair": kdiag4["n_bootstraps_per_pair"],
             "subsample_size": iter_size,
             "min_expected_cooccur_for_evidence": thr,
             "metric": metric,
