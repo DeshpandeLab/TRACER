@@ -776,22 +776,6 @@ def compute_pmi_bootstrap(
                 flush=True,
             )
 
-    # Parse tau: accept scalar (legacy) or 2-element vector (dual threshold).
-    tau_arr = np.atleast_1d(np.asarray(tau, dtype=float))
-    if tau_arr.size == 1:
-        tau_low = tau_high = float(tau_arr[0])
-        _is_dual_tau = False
-    elif tau_arr.size == 2:
-        tau_low = float(tau_arr.min())
-        tau_high = float(tau_arr.max())
-        _is_dual_tau = (tau_low < tau_high)
-    else:
-        raise ValueError(
-            f"tau must be scalar or 2-element sequence (got shape {tau_arr.shape})"
-        )
-
-    rng = np.random.default_rng(seed)
-
     M, genes, contexts = _build_presence_matrix(
         df_subset,
         group_key=group_key,
@@ -840,6 +824,278 @@ def compute_pmi_bootstrap(
                 f"M_admit_density={m_density:.3f}, "
                 f"bands_for_n_genes={len(pgp_bands)}", flush=True,
             )
+
+    # All pre-filtering and M construction is done; hand off to the shared
+    # presence-matrix core (which parses tau, runs Stages 1–4, and assembles
+    # the result). This is the SAME core the `counts=` path uses.
+    return _bootstrap_from_presence(
+        M, genes,
+        kernel=bootstrap_kernel, gene_order=gene_order,
+        gene_batch_peak_gb=gene_batch_peak_gb, checkpoint_path=checkpoint_path,
+        tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
+        coarse_block=coarse_block, refine_block=refine_block,
+        min_expected_cooccur_for_evidence=min_expected_cooccur_for_evidence,
+        min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
+        min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+        set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
+        persist_ci=persist_ci, subsample_size=subsample_size,
+        pre_filter_diag=pre_filter_diag,
+    )
+
+
+def _classify_ci(arr, tau_low, tau_high, ci_lo_q, ci_hi_q):
+    """CI-based classification of one pair's bootstrap sample list.
+
+    Returns ``(kind, ci_lo, ci_hi, median)``. ``kind``: 1 pos_strong,
+    -1 neg_strong, 3 tight_null, 0 not-yet-settled (caller keeps iterating).
+    """
+    lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+    med = float(np.median(arr))
+    if lo > tau_high:
+        return 1, lo, hi, med
+    if hi < -tau_high:
+        return -1, lo, hi, med
+    if lo > -tau_low and hi < tau_low:
+        return 3, lo, hi, med
+    return 0, lo, hi, med
+
+
+def _bootstrap_pairs_gather(
+    M,
+    pairs_i,
+    pairs_j,
+    *,
+    C,
+    iter_size,
+    rng,
+    tau_low,
+    tau_high,
+    ci_level,
+    max_bootstraps,
+    coarse_block,
+    refine_block,
+    min_samples_for_ci,
+    alpha,
+    metric,
+    persist_ci,
+    show_progress,
+):
+    """Per-pair column-gather active-sampling bootstrap (Stage 4).
+
+    This is the original ``compute_pmi_bootstrap`` inner loop, extracted
+    verbatim so ``bootstrap_kernel="pair_gather"`` is bitwise-identical to
+    the pre-refactor behavior. Each iteration resamples ``iter_size`` cells
+    with replacement, gathers the unsettled pairs' columns from ``M``, and
+    accumulates per-pair NPMI/PMI samples until each pair's CI clears the
+    ±tau thresholds (early stop) or the budget is exhausted.
+
+    Returns ``(settled_kind, n_samples, settled_at_n_done, per_pair_ci_lo,
+    per_pair_ci_hi, per_pair_median, n_done)``. The CI arrays are ``None``
+    when ``persist_ci`` is False.
+    """
+    n_pairs = pairs_i.size
+    unsettled = np.ones(n_pairs, dtype=bool)
+    n_samples = np.zeros(n_pairs, dtype=np.int32)
+    sample_lists: list[list[float]] = [[] for _ in range(n_pairs)]
+    # settled_kind values:
+    #   0  unsettled
+    #   1  pos_strong  (CI_lo > tau_high)
+    #   2  pos_weak    (tau_low < CI_lo ≤ tau_high) — only fires when _is_dual_tau
+    #  -1  neg_strong  (CI_hi < -tau_high)
+    #  -2  neg_weak    (-tau_high ≤ CI_hi < -tau_low) — only fires when _is_dual_tau
+    #   3  tight_null  (CI inside ±tau_low) — only fires when _is_dual_tau
+    #   4  dead_zone   (CI inside ±tau_high but straddles ±tau_low; collapses to "dead_zone"
+    #                   in scalar mode where it's the same as kind=3)
+    settled_kind = np.zeros(n_pairs, dtype=np.int8)
+    # Track at which n_done each pair settled. -1 = never settled.
+    settled_at_n_done = np.full(n_pairs, -1, dtype=np.int32)
+
+    ci_lo_q = (1.0 - ci_level) / 2.0
+    ci_hi_q = 1.0 - ci_lo_q
+
+    if persist_ci:
+        per_pair_ci_lo = np.full(n_pairs, np.nan, dtype=np.float64)
+        per_pair_ci_hi = np.full(n_pairs, np.nan, dtype=np.float64)
+        per_pair_median = np.full(n_pairs, np.nan, dtype=np.float64)
+    else:
+        per_pair_ci_lo = per_pair_ci_hi = per_pair_median = None
+
+    n_done = 0
+    while n_done < max_bootstraps and unsettled.any():
+        block = coarse_block if n_done == 0 else refine_block
+        block = min(block, max_bootstraps - n_done)
+        un_idx = np.flatnonzero(unsettled)
+        i_un = pairs_i[un_idx]
+        j_un = pairs_j[un_idx]
+        if show_progress:
+            print(f"[bootstrap_npmi] block of {block}, unsettled={un_idx.size}")
+        for _ in range(block):
+            sample_idx = rng.integers(0, C, size=iter_size)
+            M_b = M[sample_idx]
+            npmi_block = _bootstrap_npmi_for_pairs(
+                M_b, i_un, j_un, alpha=alpha, metric=metric,
+            )
+            for kk, gk in enumerate(un_idx):
+                v = npmi_block[kk]
+                if np.isfinite(v):
+                    sample_lists[gk].append(float(v))
+                    n_samples[gk] += 1
+        n_done += block
+
+        for gk in un_idx:
+            if n_samples[gk] < min_samples_for_ci:
+                continue
+            arr = sample_lists[gk]
+            lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+            median = float(np.median(arr))
+            # IN-LOOP early-stop: only on CONFIDENT classifications.
+            #   - pos_strong / neg_strong  : CI clearly outside ±tau_high
+            #   - tight_null               : CI clearly inside ±tau_low
+            # Weak (CI between ±tau_low and ±tau_high) and dead_zone (CI inside
+            # ±tau_high but straddles ±tau_low) intentionally do NOT early-stop:
+            # those pairs should keep iterating so they can either firm up to
+            # strong or have a precise post-budget median, not get locked in
+            # by a CI that just crossed the lower threshold. With scalar tau
+            # (tau_low == tau_high), the tight_null branch IS the legacy
+            # dead_zone, so behavior matches the original 3-kind early-stop.
+            if lo > tau_high:
+                unsettled[gk] = False
+                settled_kind[gk] = 1   # pos_strong
+            elif hi < -tau_high:
+                unsettled[gk] = False
+                settled_kind[gk] = -1  # neg_strong
+            elif lo > -tau_low and hi < tau_low:
+                unsettled[gk] = False
+                settled_kind[gk] = 3   # tight_null (= legacy "dead_zone" when scalar)
+            if not unsettled[gk] and persist_ci:
+                per_pair_ci_lo[gk] = lo
+                per_pair_ci_hi[gk] = hi
+                per_pair_median[gk] = median
+            if not unsettled[gk]:
+                settled_at_n_done[gk] = n_done
+                sample_lists[gk] = []  # release memory
+
+    # Post-budget classification: pairs that didn't early-stop as
+    # strong/strong-/tight_null get classified now based on their final CI.
+    # In-loop early-stop excluded weak/dead_zone branches, so this pass
+    # assigns those kinds (plus catches any pair that drifted into strong
+    # territory at the very end).
+    for gk in np.flatnonzero(unsettled):
+        arr = sample_lists[gk]
+        if len(arr) < min_samples_for_ci:
+            continue   # leave kind=0 (unsettled), no CI info captured below
+        lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+        median = float(np.median(arr))
+        # Apply full 6-condition cascade to the final CI:
+        if lo > tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = 1   # pos_strong (drifted up at end)
+        elif lo > tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = 2   # pos_weak
+        elif hi < -tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = -1  # neg_strong (drifted down at end)
+        elif hi < -tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = -2  # neg_weak
+        elif lo > -tau_low and hi < tau_low:
+            unsettled[gk] = False
+            settled_kind[gk] = 3   # tight_null
+        elif lo > -tau_high and hi < tau_high:
+            unsettled[gk] = False
+            settled_kind[gk] = 4   # dead_zone
+        # else: stays kind=0 (genuinely unsettled — CI extends beyond ±tau_high
+        #       and doesn't clear ±tau_low)
+        if persist_ci:
+            per_pair_ci_lo[gk] = lo
+            per_pair_ci_hi[gk] = hi
+            per_pair_median[gk] = median
+
+    # Capture CI for pairs that have <min_samples and didn't go through cascade above.
+    if persist_ci:
+        for gk in np.flatnonzero(unsettled):
+            arr = sample_lists[gk]
+            if len(arr) >= 2:
+                # Only happens if min_samples_for_ci wasn't met above.
+                lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+                per_pair_ci_lo[gk] = lo
+                per_pair_ci_hi[gk] = hi
+                per_pair_median[gk] = float(np.median(arr))
+            elif len(arr) == 1:
+                per_pair_median[gk] = float(arr[0])
+
+    return (settled_kind, n_samples, settled_at_n_done,
+            per_pair_ci_lo, per_pair_ci_hi, per_pair_median, n_done)
+
+
+def _bootstrap_from_presence(
+    M,
+    genes,
+    *,
+    kernel: str = "pair_gather",
+    gene_order: str = "prob_ascending",
+    gene_batch_peak_gb: float = 16.0,
+    checkpoint_path=None,
+    tau: float | tuple[float, float] | list = 0.05,
+    ci_level: float = 0.95,
+    max_bootstraps: int = 10_000,
+    coarse_block: int = 200,
+    refine_block: int = 500,
+    min_expected_cooccur_for_evidence: float = 10.0,
+    min_expected_cooccur_for_bootstrap: float | None = None,
+    min_samples_for_ci: int = 30,
+    alpha: float = 0.1,
+    metric: str = "npmi",
+    set_neg_one: bool = True,
+    seed: int | None = None,
+    show_progress: bool = False,
+    persist_ci: bool = False,
+    subsample_size: int | None = None,
+    pre_filter_diag: dict | None = None,
+) -> PmiBootstrapResult:
+    """Bootstrap NPMI/PMI core that consumes a prebuilt contexts × genes
+    presence matrix ``M``.
+
+    Both front-ends of :func:`compute_pmi_bootstrap` (long-form ``df_subset``
+    and the ``counts=`` matrix path) build ``M`` and then route through this
+    function. It parses ``tau``, runs Stage 1 (k=0 neg_one / indeterminate),
+    Stage 2 (legacy point estimates), Stage 3 (evidence-tier classification),
+    and Stage 4 (active-sampling bootstrap via a pluggable ``kernel``).
+
+    ``kernel="pair_gather"`` runs the original per-pair column-gather while
+    loop (bitwise-identical to the pre-refactor behavior). ``kernel="gene_row"``
+    is implemented in a later task and currently raises ``NotImplementedError``.
+
+    The ``gene_order`` / ``gene_batch_peak_gb`` / ``checkpoint_path`` params are
+    plumbed through for the gene-row kernel and are unused by ``pair_gather``.
+    With the gene-row kernel the per-iteration column-slice term vanishes (the
+    co-occurrence row is a matvec against the resample-multiplicity vector and
+    the shared marginal ``rc @ M`` is length-G), so the batch memory budget is
+    accumulator-dominated rather than the spec's 70/30 slice/accum split.
+    """
+    if metric not in ("npmi", "pmi"):
+        raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+    if kernel not in ("pair_gather", "gene_row"):
+        raise ValueError(f"unknown bootstrap_kernel {kernel!r}")
+
+    C, G = M.shape
+
+    # Parse tau: accept scalar (legacy) or 2-element vector (dual threshold).
+    tau_arr = np.atleast_1d(np.asarray(tau, dtype=float))
+    if tau_arr.size == 1:
+        tau_low = tau_high = float(tau_arr[0])
+        _is_dual_tau = False
+    elif tau_arr.size == 2:
+        tau_low = float(tau_arr.min())
+        tau_high = float(tau_arr.max())
+        _is_dual_tau = (tau_low < tau_high)
+    else:
+        raise ValueError(
+            f"tau must be scalar or 2-element sequence (got shape {tau_arr.shape})"
+        )
+
+    rng = np.random.default_rng(seed)
 
     # Global marginals (computed from M, which IS M_admit when per-gene
     # filter is active — denoised presence). Standard PMI scoping: single
@@ -1059,136 +1315,30 @@ def compute_pmi_bootstrap(
     legacy_for_W_boot = legacy_for_W[boot_idx]
 
     n_pairs = pairs_i.size
-    unsettled = np.ones(n_pairs, dtype=bool)
-    n_samples = np.zeros(n_pairs, dtype=np.int32)
-    sample_lists: list[list[float]] = [[] for _ in range(n_pairs)]
-    # settled_kind values:
-    #   0  unsettled
-    #   1  pos_strong  (CI_lo > tau_high)
-    #   2  pos_weak    (tau_low < CI_lo ≤ tau_high) — only fires when _is_dual_tau
-    #  -1  neg_strong  (CI_hi < -tau_high)
-    #  -2  neg_weak    (-tau_high ≤ CI_hi < -tau_low) — only fires when _is_dual_tau
-    #   3  tight_null  (CI inside ±tau_low) — only fires when _is_dual_tau
-    #   4  dead_zone   (CI inside ±tau_high but straddles ±tau_low; collapses to "dead_zone"
-    #                   in scalar mode where it's the same as kind=3)
-    settled_kind = np.zeros(n_pairs, dtype=np.int8)
-    # Track at which n_done each pair settled. -1 = never settled.
-    settled_at_n_done = np.full(n_pairs, -1, dtype=np.int32)
 
-    ci_lo_q = (1.0 - ci_level) / 2.0
-    ci_hi_q = 1.0 - ci_lo_q
-
-    if persist_ci:
-        per_pair_ci_lo = np.full(n_pairs, np.nan, dtype=np.float64)
-        per_pair_ci_hi = np.full(n_pairs, np.nan, dtype=np.float64)
-        per_pair_median = np.full(n_pairs, np.nan, dtype=np.float64)
-    else:
-        per_pair_ci_lo = per_pair_ci_hi = per_pair_median = None
-
-    n_done = 0
-    while n_done < max_bootstraps and unsettled.any():
-        block = coarse_block if n_done == 0 else refine_block
-        block = min(block, max_bootstraps - n_done)
-        un_idx = np.flatnonzero(unsettled)
-        i_un = pairs_i[un_idx]
-        j_un = pairs_j[un_idx]
-        if show_progress:
-            print(f"[bootstrap_npmi] block of {block}, unsettled={un_idx.size}")
-        for _ in range(block):
-            sample_idx = rng.integers(0, C, size=iter_size)
-            M_b = M[sample_idx]
-            npmi_block = _bootstrap_npmi_for_pairs(
-                M_b, i_un, j_un, alpha=alpha, metric=metric,
+    # Stage-4 kernel dispatch. `pair_gather` is the original per-pair
+    # column-gather active sampler (behavior-preserving). `gene_row` is the
+    # resample-multiplicity matvec kernel (implemented in a later task).
+    if kernel == "pair_gather":
+        (settled_kind, n_samples, settled_at_n_done,
+         per_pair_ci_lo, per_pair_ci_hi, per_pair_median, n_done) = (
+            _bootstrap_pairs_gather(
+                M, pairs_i, pairs_j,
+                C=C, iter_size=iter_size, rng=rng,
+                tau_low=tau_low, tau_high=tau_high, ci_level=ci_level,
+                max_bootstraps=max_bootstraps, coarse_block=coarse_block,
+                refine_block=refine_block, min_samples_for_ci=min_samples_for_ci,
+                alpha=alpha, metric=metric, persist_ci=persist_ci,
+                show_progress=show_progress,
             )
-            for kk, gk in enumerate(un_idx):
-                v = npmi_block[kk]
-                if np.isfinite(v):
-                    sample_lists[gk].append(float(v))
-                    n_samples[gk] += 1
-        n_done += block
-
-        for gk in un_idx:
-            if n_samples[gk] < min_samples_for_ci:
-                continue
-            arr = sample_lists[gk]
-            lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
-            median = float(np.median(arr))
-            # IN-LOOP early-stop: only on CONFIDENT classifications.
-            #   - pos_strong / neg_strong  : CI clearly outside ±tau_high
-            #   - tight_null               : CI clearly inside ±tau_low
-            # Weak (CI between ±tau_low and ±tau_high) and dead_zone (CI inside
-            # ±tau_high but straddles ±tau_low) intentionally do NOT early-stop:
-            # those pairs should keep iterating so they can either firm up to
-            # strong or have a precise post-budget median, not get locked in
-            # by a CI that just crossed the lower threshold. With scalar tau
-            # (tau_low == tau_high), the tight_null branch IS the legacy
-            # dead_zone, so behavior matches the original 3-kind early-stop.
-            if lo > tau_high:
-                unsettled[gk] = False
-                settled_kind[gk] = 1   # pos_strong
-            elif hi < -tau_high:
-                unsettled[gk] = False
-                settled_kind[gk] = -1  # neg_strong
-            elif lo > -tau_low and hi < tau_low:
-                unsettled[gk] = False
-                settled_kind[gk] = 3   # tight_null (= legacy "dead_zone" when scalar)
-            if not unsettled[gk] and persist_ci:
-                per_pair_ci_lo[gk] = lo
-                per_pair_ci_hi[gk] = hi
-                per_pair_median[gk] = median
-            if not unsettled[gk]:
-                settled_at_n_done[gk] = n_done
-                sample_lists[gk] = []  # release memory
-
-    # Post-budget classification: pairs that didn't early-stop as
-    # strong/strong-/tight_null get classified now based on their final CI.
-    # In-loop early-stop excluded weak/dead_zone branches, so this pass
-    # assigns those kinds (plus catches any pair that drifted into strong
-    # territory at the very end).
-    for gk in np.flatnonzero(unsettled):
-        arr = sample_lists[gk]
-        if len(arr) < min_samples_for_ci:
-            continue   # leave kind=0 (unsettled), no CI info captured below
-        lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
-        median = float(np.median(arr))
-        # Apply full 6-condition cascade to the final CI:
-        if lo > tau_high:
-            unsettled[gk] = False
-            settled_kind[gk] = 1   # pos_strong (drifted up at end)
-        elif lo > tau_low:
-            unsettled[gk] = False
-            settled_kind[gk] = 2   # pos_weak
-        elif hi < -tau_high:
-            unsettled[gk] = False
-            settled_kind[gk] = -1  # neg_strong (drifted down at end)
-        elif hi < -tau_low:
-            unsettled[gk] = False
-            settled_kind[gk] = -2  # neg_weak
-        elif lo > -tau_low and hi < tau_low:
-            unsettled[gk] = False
-            settled_kind[gk] = 3   # tight_null
-        elif lo > -tau_high and hi < tau_high:
-            unsettled[gk] = False
-            settled_kind[gk] = 4   # dead_zone
-        # else: stays kind=0 (genuinely unsettled — CI extends beyond ±tau_high
-        #       and doesn't clear ±tau_low)
-        if persist_ci:
-            per_pair_ci_lo[gk] = lo
-            per_pair_ci_hi[gk] = hi
-            per_pair_median[gk] = median
-
-    # Capture CI for pairs that have <min_samples and didn't go through cascade above.
-    if persist_ci:
-        for gk in np.flatnonzero(unsettled):
-            arr = sample_lists[gk]
-            if len(arr) >= 2:
-                # Only happens if min_samples_for_ci wasn't met above.
-                lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
-                per_pair_ci_lo[gk] = lo
-                per_pair_ci_hi[gk] = hi
-                per_pair_median[gk] = float(np.median(arr))
-            elif len(arr) == 1:
-                per_pair_median[gk] = float(arr[0])
+        )
+    elif kernel == "gene_row":
+        raise NotImplementedError(
+            "bootstrap_kernel='gene_row' is not implemented yet "
+            "(lands in a later task); use bootstrap_kernel='pair_gather'."
+        )
+    else:
+        raise ValueError(f"unknown bootstrap_kernel {kernel!r}")
 
     n_pos_strong = int((settled_kind == 1).sum())
     n_pos_weak   = int((settled_kind == 2).sum())
@@ -1196,7 +1346,7 @@ def compute_pmi_bootstrap(
     n_neg_weak   = int((settled_kind == -2).sum())
     n_tight_null = int((settled_kind == 3).sum())
     n_dead_zone  = int((settled_kind == 4).sum())
-    n_unsettled  = int(unsettled.sum())
+    n_unsettled  = int((settled_kind == 0).sum())
     # Legacy aggregate counts (scalar-tau back-compat: weak bins are empty,
     # tight_null collapses into "dead_zone" reporting).
     n_pos  = n_pos_strong + n_pos_weak

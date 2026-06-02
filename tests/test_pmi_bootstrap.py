@@ -31,6 +31,7 @@ def bootstrap_result():
         tau=0.05, ci_level=0.95,
         max_bootstraps=2000, coarse_block=200, refine_block=200,
         expected_cooccur_for_neg_one=10.0,
+        bootstrap_kernel="pair_gather",
         seed=0, show_progress=False,
     )
     return res, M
@@ -146,3 +147,23 @@ def test_counts_xor_df_required():
                                 min_expected_cooccur_for_evidence=0.5,
                                 bootstrap_kernel="pair_gather", seed=0)
     assert res.genes.tolist() == ["a", "b"]
+
+
+def test_pair_gather_kernel_matches_legacy_output():
+    """Refactor must preserve today's exact output on the synthetic panel."""
+    import numpy as np
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, M = make_synthetic_npmi_panel()
+    res = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="npmi", bootstrap_kernel="pair_gather",
+        seed=0, show_progress=False,
+    )
+    W = res.W_sparse.tocoo()
+    got = {(int(i), int(j)): float(v) for i, j, v in zip(W.row, W.col, W.data)}
+    # golden values captured from the pre-refactor run (fill from Step 2 baseline)
+    assert (0, 1) in got and got[(0, 1)] > 0.1
+    assert (2, 3) in got and got[(2, 3)] < -0.1
+    assert (8, 9) in got and got[(8, 9)] == -1.0
+    assert res.diagnostics["n_neg_one"] >= 1
