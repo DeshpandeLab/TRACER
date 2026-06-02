@@ -1100,6 +1100,40 @@ def _bootstrap_pairs_gather(
             per_pair_ci_lo, per_pair_ci_hi, per_pair_median, n_done)
 
 
+def _gene_batches(order, owned_counts, *, gene_batch_peak_gb, coarse_block):
+    """Greedy contiguous batching over ``order``.
+
+    In the gene-row kernel the per-iteration column-slice term vanishes (a
+    gene's co-occurrence row is a matvec against ``rc`` and the shared marginal
+    ``rc @ M`` is length G), so peak memory is *accumulator-dominated*: roughly
+    ``(owned pairs in batch) · coarse_block · 32 B`` for the per-pair sample
+    accumulators held during the first (coarse) block. We therefore cap each
+    batch's owned-pair count at
+    ``cap = gene_batch_peak_gb·1e9 / (coarse_block · 32 B)`` rather than using
+    the spec's 70/30 slice/accumulator split.
+
+    Greedy: walk ``order`` and grow a contiguous batch until adding the next
+    gene's owned pairs would exceed ``cap``. A single gene whose owned-pair
+    count alone exceeds ``cap`` forms its own batch (cannot be split further).
+    Every gene is covered exactly once, contiguously.
+
+    Returns a list of ``(start, end)`` half-open index ranges into ``order``.
+    """
+    cap = max(1, int(gene_batch_peak_gb * 1e9 / (coarse_block * 32)))
+    batches: list[tuple[int, int]] = []
+    n = order.size
+    s = 0
+    while s < n:
+        tot = 0
+        e = s
+        while e < n and (e == s or tot + owned_counts[e] <= cap):
+            tot += owned_counts[e]
+            e += 1
+        batches.append((s, e))
+        s = e
+    return batches
+
+
 def _bootstrap_gene_rows(
     M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
     *, batches, checkpoint_path, G,
@@ -1624,8 +1658,10 @@ def _bootstrap_from_presence(
         pos[order] = np.arange(order.size)
         own_indptr, own_partner, own_pairref = _owned_partners(
             obs_i, obs_j, can_bootstrap, pos)
-        # Task 4: single batch (memory-budgeted batching lands in a later task).
-        batches = [(0, order.size)]
+        owned_counts = np.diff(own_indptr)[order]
+        batches = _gene_batches(order, owned_counts,
+                                gene_batch_peak_gb=gene_batch_peak_gb,
+                                coarse_block=coarse_block)
         rows4, cols4, vals4, kdiag4 = _bootstrap_gene_rows(
             M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
             batches=batches, checkpoint_path=checkpoint_path, G=G,

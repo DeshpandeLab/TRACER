@@ -220,3 +220,38 @@ def test_owned_partners_each_pair_once_and_window_shrinks():
     # window (owned count) is non-increasing here
     counts = [indptr[g+1]-indptr[g] for g in range(4)]
     assert counts == [2, 1, 1, 0]
+
+
+def test_gene_batches_respect_pair_cap_and_cover_all():
+    import numpy as np
+    from tracer.metrics import _gene_batches
+    order = np.arange(6)
+    owned_counts = np.array([3, 3, 3, 3, 3, 0])   # owned pairs per gene (in order)
+    # budget that allows ~5 pairs/batch -> batches: [0,2)=6>5 so [0,1],... check coverage
+    batches = _gene_batches(order, owned_counts, gene_batch_peak_gb=1e-6,
+                            coarse_block=200)
+    # every gene covered exactly once, contiguous
+    covered = []
+    for (s, e) in batches:
+        covered.extend(range(s, e))
+    assert covered == list(range(6))
+    # each batch's owned-pair sum <= cap (except a single gene that alone exceeds)
+    cap = max(1, int(1e-6 * 1e9 / (200 * 32)))
+    for (s, e) in batches:
+        tot = owned_counts[s:e].sum()
+        assert (e - s == 1) or tot <= cap
+
+
+def test_gene_row_multibatch_matches_singlebatch():
+    import numpy as np
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, M = make_synthetic_npmi_panel()
+    common = dict(group_key="cell_id", feature_col="feature_name",
+                  metric="npmi", bootstrap_kernel="gene_row", seed=0,
+                  show_progress=False)
+    big = compute_pmi_bootstrap(df, gene_batch_peak_gb=16.0, **common)
+    small = compute_pmi_bootstrap(df, gene_batch_peak_gb=1e-7, **common)  # force splits
+    Sbig = {(int(i), int(j)) for i, j in zip(*big.W_sparse.nonzero())}
+    Ssmall = {(int(i), int(j)) for i, j in zip(*small.W_sparse.nonzero())}
+    assert len(Sbig ^ Ssmall) <= 2   # same settled set up to boundary RNG
