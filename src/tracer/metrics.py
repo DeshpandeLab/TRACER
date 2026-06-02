@@ -7,6 +7,7 @@
 #-----------------------------------------------------------
 
 from dataclasses import dataclass, field
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -507,9 +508,30 @@ def compute_pmi_bootstrap(
 
     Parameters
     ----------
-    df_subset : DataFrame
+    df_subset : DataFrame, optional
         Long-format transcripts with at least ``group_key`` and
         ``feature_col`` columns. Same contract as :func:`compute_npmi`.
+        Provide exactly one of ``df_subset`` or ``counts``.
+    counts : tuple, optional
+        ``(X, var_names[, obs_names])`` matrix input (e.g. an h5ad layer):
+        ``X`` is a cells×genes count matrix, binarized at
+        ``min_occurrences_per_context`` directly into the presence matrix
+        (no groupby). Mutually exclusive with ``df_subset``. The df-only
+        pre-filters (``nuclear_only``/``percentile_filter``/
+        ``per_gene_percentile_filter``) do not apply and are warned+ignored.
+    bootstrap_kernel : {"gene_row", "pair_gather"}
+        Stage-4 kernel. ``"pair_gather"`` is the legacy per-pair column
+        gather (bitwise-identical to prior behavior); ``"gene_row"`` (default)
+        is the streamed gene-row kernel for whole-transcriptome scale.
+    gene_order : str
+        Gene processing order for the ``gene_row`` kernel
+        (``"prob_ascending"`` default; also ``"prob_descending"``,
+        ``"l1_pmi"``, ``"stopping_mass"``, ``"index"``).
+    gene_batch_peak_gb : float
+        Per-batch memory budget (GB) for the ``gene_row`` kernel.
+    checkpoint_path : str or os.PathLike, optional
+        When set, the ``gene_row`` kernel flushes accumulated results after
+        each batch and resumes from an existing checkpoint. ``None`` = no I/O.
     tau : float or 2-element sequence
         Dead-zone threshold(s). If scalar, single threshold (legacy
         behavior): pairs classified as ``pos`` (CI_lo > tau), ``neg``
@@ -583,7 +605,6 @@ def compute_pmi_bootstrap(
                           (percentile_filter, "percentile_filter"),
                           (per_gene_percentile_filter, "per_gene_percentile_filter")]:
             if bad:
-                import warnings
                 warnings.warn(f"{name} ignored for matrix `counts=` input")
         M, genes, contexts = _presence_from_counts(
             X, var_names, obs_names,
@@ -843,6 +864,9 @@ def compute_pmi_bootstrap(
     )
 
 
+# NOTE: consumed by the gene_row kernel (`_bootstrap_gene_rows`, added in a
+# later task). `_bootstrap_pairs_gather` keeps its inline classification for
+# exact legacy parity, so this helper is intentionally unused until then.
 def _classify_ci(arr, tau_low, tau_high, ci_lo_q, ci_hi_q):
     """CI-based classification of one pair's bootstrap sample list.
 
