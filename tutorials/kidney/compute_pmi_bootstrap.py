@@ -44,12 +44,15 @@ METRIC = "pmi"
 MIN_OCCURRENCES_PER_CONTEXT = 2     # gene present in a cell when count >= 2
 MIN_EXPECTED_COOCCUR_FOR_EVIDENCE = 10.0
 SEED = 0
-# Bootstrap iteration ceiling (gene-row mode). The default (10000) makes
-# low-support near-tau pairs iterate to the cap, dominating wall-clock on a
-# whole-transcriptome reference. 1000 is a 10x cut: pairs that haven't settled
-# by 1000 iters are the near-tau "dead-zone" ones whose exact CI barely matters
-# (they classify as unsettled -> absent from W either way).
-MAX_BOOTSTRAPS = 1000
+# Bootstrap iteration ceiling + block size (gene-row mode). Empirically (A/B on a
+# 2,500-gene subset of this reference): ~97% of candidate pairs settle within the
+# FIRST 100 samples, +0.1% by 700, and the ~2.7% that reach the cap almost never
+# settle (genuinely near-tau / low-support). So max=300 with a 100-iter block
+# (settle checks at 100/200/300) is ~3.3x faster than max=1000/block=200 while the
+# settled set differs by only ~0.1% (boundary churn at the ~0.13-PMI resolution
+# floor). max=10000 (library default) was far past the knee.
+MAX_BOOTSTRAPS = 300
+BOOTSTRAP_BLOCK = 100      # coarse_block == refine_block; settle checks at 100/200/300
 # Output filename prefix is chosen per --mode in main() and passed to
 # _write_outputs(): "legacy_pmi" (legacy) or "bootstrap_pmi" (gene-row bootstrap).
 
@@ -201,7 +204,8 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
     print(f"[info] running compute_pmi_bootstrap (gene-row BOOTSTRAP) "
           f"metric={METRIC!r}, min_occ={MIN_OCCURRENCES_PER_CONTEXT}, "
           f"min_expected_cooccur={MIN_EXPECTED_COOCCUR_FOR_EVIDENCE}, "
-          f"max_bootstraps={MAX_BOOTSTRAPS}, checkpoint={ckpt!r}, seed={SEED}")
+          f"max_bootstraps={MAX_BOOTSTRAPS}, block={BOOTSTRAP_BLOCK}, "
+          f"checkpoint={ckpt!r}, seed={SEED}")
     result = metrics.compute_pmi_bootstrap(
         None,
         counts=(X, a.var_names.astype(str).to_numpy(), a.obs_names.astype(str).to_numpy()),
@@ -211,6 +215,7 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
         bootstrap_kernel="gene_row", gene_order="prob_ascending",
         gene_batch_peak_gb=16.0, checkpoint_path=ckpt,
         max_bootstraps=MAX_BOOTSTRAPS,
+        coarse_block=BOOTSTRAP_BLOCK, refine_block=BOOTSTRAP_BLOCK,
         seed=SEED, show_progress=True,
     )
     _write_outputs(result, "bootstrap_pmi", {
@@ -219,6 +224,7 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
         "bootstrap_kernel": "gene_row",
         "gene_order": "prob_ascending",
         "max_bootstraps": MAX_BOOTSTRAPS,
+        "bootstrap_block": BOOTSTRAP_BLOCK,
         "checkpoint_path": ckpt,
         "mode": "gene_row_bootstrap",
     })
