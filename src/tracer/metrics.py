@@ -931,6 +931,63 @@ def _classify_ci(arr, tau_low, tau_high, ci_lo_q, ci_hi_q):
     return 0, lo, hi, med
 
 
+def _vectorized_settle_inplace(
+    elig, sample_store, nsamp, unsettled, kind,
+    tau_low, tau_high, ci_lo_q, ci_hi_q, *, release,
+):
+    """Vectorized batch equivalent of the per-pair ``_classify_ci`` settle.
+
+    Classifies every flat-slot index in ``elig`` (already gated on
+    ``nsamp >= min_samples_for_ci``) using the SAME 3-kind cascade as the
+    in-loop test in ``_bootstrap_pairs_gather`` / the legacy gene_row loop:
+    kind 1 if ``lo > tau_high``, -1 if ``hi < -tau_high``, 3 if the CI sits
+    inside ``±tau_low``, else 0 (left unsettled). ``lo``/``hi`` are the
+    ``[ci_lo_q, ci_hi_q]`` quantiles of the pair's accumulated samples.
+
+    Pairs are grouped by their (within-group identical) stored-sample length
+    so each group is a contiguous 2-D array and the quantiles are computed
+    with a single ``np.quantile(..., axis=1)`` call. NumPy's axis-wise
+    quantile is bit-identical to the per-row 1-D call, so this is a pure
+    speedup with no change in settle decisions. Mutates ``unsettled``/``kind``
+    in place; when ``release`` is True, settled pairs' sample stores are freed
+    (set to ``None``) exactly as the legacy code did (``sample_lists[li] = []``).
+
+    In the common all-finite path every still-unsettled pair has the same
+    number of samples, so this collapses to one group and one quantile call.
+    """
+    lengths = np.fromiter((sample_store[li].shape[0] for li in elig),
+                          dtype=np.int64, count=elig.size)
+    for L in np.unique(lengths):
+        grp = elig[lengths == L]
+        S = np.empty((grp.size, int(L)), dtype=np.float64)
+        for r, li in enumerate(grp):
+            S[r] = sample_store[li]
+        q = np.quantile(S, [ci_lo_q, ci_hi_q], axis=1)
+        lo = q[0]
+        hi = q[1]
+        kd = np.zeros(grp.size, dtype=np.int8)
+        pos = lo > tau_high
+        neg = (~pos) & (hi < -tau_high)
+        tight = (~pos) & (~neg) & (lo > -tau_low) & (hi < tau_low)
+        kd[pos] = 1
+        kd[neg] = -1
+        kd[tight] = 3
+        settled = kd != 0
+        if release:
+            # In-loop settle: only mutate pairs that classified (kd != 0),
+            # leaving kd==0 pairs unsettled to keep iterating.
+            sg = grp[settled]
+            kind[sg] = kd[settled]
+            unsettled[sg] = False
+            for li in sg:
+                sample_store[li] = None   # release memory
+        else:
+            # Post-budget pass: assign the final kind to ALL eligible pairs
+            # (including kd==0), matching the legacy `kind[li] = kd` which
+            # wrote the result unconditionally without clearing `unsettled`.
+            kind[grp] = kd
+
+
 def _write_checkpoint(path, rows, cols, vals, G, cursor):
     """Atomically persist the gene_row kernel's accumulated state.
 
@@ -1252,7 +1309,13 @@ def _bootstrap_gene_rows(
                 _write_checkpoint(checkpoint_path, rows, cols, vals, G, b_idx + 1)
             continue
 
-        sample_lists: list[list[float]] = [[] for _ in range(n_owned)]
+        # Per-pair persistent sample store. ``sample_store[li]`` holds the
+        # finite samples drawn for pair ``li`` so far as a 1-D float64 array
+        # (released to None once the pair settles). The legacy kernel held a
+        # python list per pair and ``.append(float(...))`` per (pair,iter);
+        # we instead accumulate a whole block at once (vectorized) and extend
+        # the store with a single concatenate per unsettled pair per block.
+        sample_store: list = [None] * n_owned
         nsamp = np.zeros(n_owned, dtype=np.int32)
         unsettled = np.ones(n_owned, dtype=bool)
         kind = np.zeros(n_owned, dtype=np.int8)
@@ -1273,15 +1336,24 @@ def _bootstrap_gene_rows(
             flat_legacy[s] = legacy_for_W[refs]
             t += len(partners)
 
+        N_b = float(C)
         n_done = 0
         while n_done < max_bootstraps and unsettled.any():
             block = coarse_block if n_done == 0 else refine_block
             block = min(block, max_bootstraps - n_done)
-            for _ in range(block):
+
+            # The unsettled set is FIXED for the whole block (it is only
+            # mutated in the post-block settle pass below), so freeze it once.
+            # Every currently-unsettled pair receives exactly one sample per
+            # iteration (one per finite value), so we accumulate the block's
+            # samples for all unsettled pairs into a single (n_owned x block)
+            # buffer and extend each pair's store with the block in one shot,
+            # replacing the per-(pair,iter) python append.
+            buf = np.empty((n_owned, block), dtype=np.float64)
+            for bi in range(block):
                 draw = rng.integers(0, C, size=C)
                 rc = np.bincount(draw, minlength=C).astype(np.float64)
                 marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
-                N_b = float(C)
                 for (g, partners, s, gc) in seg_slices:
                     if not unsettled[s].any():
                         continue
@@ -1300,30 +1372,66 @@ def _bootstrap_gene_rows(
                     with np.errstate(divide="ignore", invalid="ignore"):
                         pmi = np.log(Pij / (Pi * Pj))
                         val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
-                    loc = np.arange(s.start, s.stop)
-                    for li, vv in zip(loc, val):
-                        if unsettled[li] and np.isfinite(vv):
-                            sample_lists[li].append(float(vv))
-                            nsamp[li] += 1
+                    buf[s, bi] = val
             n_done += block
-            for li in np.flatnonzero(unsettled):
-                if nsamp[li] < min_samples_for_ci:
-                    continue
-                kd, _lo, _hi, _med = _classify_ci(
-                    sample_lists[li], tau_low, tau_high, ci_lo_q, ci_hi_q)
-                if kd != 0:
-                    unsettled[li] = False
-                    kind[li] = kd
-                    sample_lists[li] = []   # release memory
+
+            # Extend each unsettled pair's sample store with this block's
+            # finite samples (vectorized; one concatenate per pair, not one
+            # python append per sample). The legacy code skipped non-finite
+            # values and did not count them — replicate by masking the row.
+            un_idx = np.flatnonzero(unsettled)
+            block_rows = buf[un_idx]                      # (n_unsettled, block)
+            finite = np.isfinite(block_rows)
+            if finite.all():
+                # Fast path (the only one hit when alpha>0 keeps every value
+                # finite): every unsettled pair gets exactly `block` samples.
+                add_cnt = np.full(un_idx.size, block, dtype=np.int32)
+                for k, li in enumerate(un_idx):
+                    prev = sample_store[li]
+                    sample_store[li] = (block_rows[k] if prev is None
+                                        else np.concatenate((prev, block_rows[k])))
+            else:
+                # Rare correctness fallback: a non-finite value appeared, so
+                # per-pair sample counts can differ within the block. Drop the
+                # non-finite entries from each row exactly as the legacy
+                # `if np.isfinite(vv)` guard did.
+                add_cnt = finite.sum(axis=1).astype(np.int32)
+                for k, li in enumerate(un_idx):
+                    fin = block_rows[k][finite[k]]
+                    prev = sample_store[li]
+                    sample_store[li] = (fin if prev is None
+                                        else np.concatenate((prev, fin)))
+            nsamp[un_idx] += add_cnt
+
+            # Vectorized in-loop settle. All currently-unsettled pairs that
+            # cleared `min_samples_for_ci` are classified together with a single
+            # axis-1 quantile call, replacing the per-pair `_classify_ci`. Pairs
+            # below the sample gate are skipped (kept unsettled), matching legacy.
+            elig = un_idx[nsamp[un_idx] >= min_samples_for_ci]
+            if elig.size:
+                # Group eligible pairs by their (identical-within-group) store
+                # length so each group can be stacked into a 2-D array for one
+                # quantile call. In the all-finite path every still-unsettled
+                # pair has the same length (== n_done), so this is a single
+                # group; the grouping only branches when non-finite drops made
+                # counts diverge.
+                _vectorized_settle_inplace(
+                    elig, sample_store, nsamp, unsettled, kind,
+                    tau_low, tau_high, ci_lo_q, ci_hi_q,
+                    release=True,
+                )
 
         # Post-budget classification for any still-unsettled pairs with
         # enough samples (mirrors the pair_gather final-CI pass; here we use
         # the same strong/strong-/tight_null kinds the in-loop test emits).
-        for li in np.flatnonzero(unsettled):
-            if nsamp[li] >= min_samples_for_ci:
-                kd, _lo, _hi, _med = _classify_ci(
-                    sample_lists[li], tau_low, tau_high, ci_lo_q, ci_hi_q)
-                kind[li] = kd
+        leftover = np.flatnonzero(unsettled)
+        elig = leftover[nsamp[leftover] >= min_samples_for_ci]
+        if elig.size:
+            _vectorized_settle_inplace(
+                elig, sample_store, nsamp, unsettled, kind,
+                tau_low, tau_high, ci_lo_q, ci_hi_q,
+                release=False,
+            )
 
         agg_n_pos += int((kind == 1).sum())
         agg_n_neg += int((kind == -1).sum())

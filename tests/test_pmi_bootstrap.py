@@ -304,3 +304,103 @@ def test_checkpoint_resume_equiv(tmp_path):
     Sfull = {(int(i), int(j)) for i, j in zip(*full.W_sparse.nonzero())}
     Sres = {(int(i), int(j)) for i, j in zip(*resumed.W_sparse.nonzero())}
     assert Sfull == Sres
+
+
+# Golden values captured from the PRE-vectorization gene_row kernel on the
+# default synthetic panel (make_synthetic_npmi_panel(), seed 42 fixture).
+# Run config: tau=0.05, ci_level=0.95, max_bootstraps=2000,
+# coarse_block=refine_block=200, metric="npmi". These are the same for
+# seeds 0 and 1 because the only bootstrap-settled W entry (the strong
+# positive pair (0,1)) clears ±tau in the very first coarse block under
+# either RNG stream; the (2,3)/(8,9) entries are Stage-1 neg_one sentinels.
+# The vectorized kernel MUST reproduce these bit-for-bit.
+_GENE_ROW_GOLDEN_W_NNZ = {
+    (0, 1): np.float32(0.95119965),
+    (2, 3): np.float32(-1.0),
+    (8, 9): np.float32(-1.0),
+}
+# Bootstrap-kernel diagnostics (settle-count contract) for the same run.
+_GENE_ROW_GOLDEN_DIAG = {
+    "n_pos": 1,
+    "n_neg": 0,
+    "n_dead_zone": 1,
+    "n_unsettled": 131,
+}
+_GENE_ROW_GOLDEN_NBP_SUM = 262400
+_GENE_ROW_GOLDEN_NBP_LEN = 133
+
+
+def _golden_dense_W(G=20):
+    W = np.zeros((G, G), dtype=np.float32)
+    for (i, j), v in _GENE_ROW_GOLDEN_W_NNZ.items():
+        W[i, j] = v
+    return W
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_gene_row_vectorized_bitwise_identical(seed):
+    """HARD GATE: the vectorized gene_row kernel must reproduce the
+    pre-change kernel's W_sparse bit-for-bit AND the exact settle-count
+    diagnostics (n_pos/n_neg/n_dead_zone/n_unsettled/n_bootstraps_per_pair)
+    on the synthetic panel, for the same seed. Same RNG draws → same samples
+    → same quantiles → same settle decisions → identical W."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    res = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="npmi", bootstrap_kernel="gene_row",
+        tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        seed=seed, show_progress=False,
+    )
+    W = res.W_sparse.toarray()
+    assert np.array_equal(W, _golden_dense_W(W.shape[0])), (
+        "vectorized gene_row W diverged from golden\n"
+        f"got nnz={dict(zip(map(tuple, np.argwhere(W != 0)), W[W != 0]))}"
+    )
+    d = res.diagnostics
+    for k, v in _GENE_ROW_GOLDEN_DIAG.items():
+        assert int(d[k]) == v, f"diag[{k}] = {d[k]} != golden {v}"
+    nbp = np.asarray(d["n_bootstraps_per_pair"])
+    assert len(nbp) == _GENE_ROW_GOLDEN_NBP_LEN
+    assert int(nbp.sum()) == _GENE_ROW_GOLDEN_NBP_SUM
+
+
+# Golden for the MULTI-BATCH path (gene_batch_peak_gb=1e-7 forces many
+# single-gene batches). W is identical to single-batch (the same 3 nnz),
+# but the settle-count diagnostics differ because each batch seeds its own
+# RNG (default_rng(seed + b_idx)) so the per-block sample streams differ.
+# Captured from the pre-vectorization kernel, seed 0.
+_GENE_ROW_GOLDEN_DIAG_MB = {
+    "n_pos": 1,
+    "n_neg": 0,
+    "n_dead_zone": 0,
+    "n_unsettled": 132,
+}
+_GENE_ROW_GOLDEN_NBP_SUM_MB = 264200
+_GENE_ROW_GOLDEN_NBP_LEN_MB = 133
+
+
+def test_gene_row_vectorized_bitwise_identical_multibatch():
+    """The bitwise gate must also hold when the owned pairs are split across
+    multiple gene batches (forces the per-batch accumulate/settle path)."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    res = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="npmi", bootstrap_kernel="gene_row",
+        tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        gene_batch_peak_gb=1e-7,   # force many single-gene batches
+        seed=0, show_progress=False,
+    )
+    W = res.W_sparse.toarray()
+    assert np.array_equal(W, _golden_dense_W(W.shape[0]))
+    d = res.diagnostics
+    for k, v in _GENE_ROW_GOLDEN_DIAG_MB.items():
+        assert int(d[k]) == v, f"diag[{k}] = {d[k]} != golden {v}"
+    nbp = np.asarray(d["n_bootstraps_per_pair"])
+    assert len(nbp) == _GENE_ROW_GOLDEN_NBP_LEN_MB
+    assert int(nbp.sum()) == _GENE_ROW_GOLDEN_NBP_SUM_MB
