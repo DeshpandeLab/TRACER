@@ -20,6 +20,29 @@ _SRC = _REPO_ROOT / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# Lightweight-environment fallback: ``tracer/__init__.py`` pulls the full geo/
+# torch/open3d stack. Metrics-only tests (PMI bootstrap) need just
+# ``tracer.metrics`` (numpy/pandas/scipy/numba). When the full package can't be
+# imported, register a minimal ``tracer`` namespace and load ``tracer.metrics``
+# standalone (stubbing the unused ``geopandas`` top-level import in metrics.py).
+# No-op when the full package imports cleanly (e.g. CI with everything installed).
+try:  # pragma: no cover - environment-dependent
+    import tracer  # noqa: F401
+except Exception:
+    import types as _types
+    import importlib.util as _ilu
+
+    sys.modules.setdefault("geopandas", _types.ModuleType("geopandas"))
+    _pkg = _types.ModuleType("tracer")
+    _pkg.__path__ = [str(_SRC / "tracer")]
+    sys.modules["tracer"] = _pkg
+    _spec = _ilu.spec_from_file_location(
+        "tracer.metrics", str(_SRC / "tracer" / "metrics.py")
+    )
+    _metrics_mod = _ilu.module_from_spec(_spec)
+    sys.modules["tracer.metrics"] = _metrics_mod
+    _spec.loader.exec_module(_metrics_mod)
+
 
 import numpy as np
 import pandas as pd
