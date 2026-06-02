@@ -353,6 +353,29 @@ def _build_presence_matrix(
     return M, genes, contexts
 
 
+def _presence_from_counts(X, var_names, obs_names=None, *, min_occurrences_per_context):
+    """Build the contexts x genes binary presence CSR directly from a
+    cells x genes count matrix (e.g. an h5ad layer), skipping the long-form
+    groupby round-trip. "Present" = count >= min_occurrences_per_context.
+    """
+    if not sp.issparse(X):
+        X = sp.csr_matrix(X)
+    X = X.tocsr()
+    M = (X >= min_occurrences_per_context)          # bool CSR, drops zeros
+    M = M.astype(np.int32)
+    M.eliminate_zeros()
+    genes = np.asarray(var_names, dtype=str)
+    n = X.shape[0]
+    contexts = (np.asarray(obs_names, dtype=str)
+                if obs_names is not None
+                else np.arange(n).astype(str))
+    if M.shape[1] != genes.size:
+        raise ValueError(f"var_names ({genes.size}) != X columns ({M.shape[1]})")
+    if M.shape[0] != contexts.size:
+        raise ValueError(f"obs_names ({contexts.size}) != X rows ({M.shape[0]})")
+    return M, genes, contexts
+
+
 def _bootstrap_npmi_for_pairs(
     M_sample: sp.csr_matrix,
     pairs_i: np.ndarray,
@@ -424,8 +447,13 @@ def _bootstrap_npmi_for_pairs(
 
 
 def compute_pmi_bootstrap(
-    df_subset: pd.DataFrame,
+    df_subset: pd.DataFrame | None = None,
     *,
+    counts=None,                      # (X, var_names[, obs_names]) alternative to df
+    bootstrap_kernel: str = "gene_row",
+    gene_order: str = "prob_ascending",
+    gene_batch_peak_gb: float = 16.0,
+    checkpoint_path=None,
     group_key: str = "cell_id",
     feature_col: str = "feature_name",
     min_occurrences_per_context: int = 2,
@@ -537,6 +565,43 @@ def compute_pmi_bootstrap(
 
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+
+    # ------------------------------------------------------------------
+    # Input dispatch: exactly one of `df_subset` (long-form transcripts)
+    # or `counts` (cells × genes count matrix) must be supplied. The
+    # `counts` path binarizes directly into the presence matrix `M` and
+    # routes through `_bootstrap_from_presence`, skipping the long-form
+    # pre-filter pipeline (which is df-only). The df path continues below
+    # and also routes through `_bootstrap_from_presence` after building M.
+    # ------------------------------------------------------------------
+    if (df_subset is None) == (counts is None):
+        raise ValueError("Provide exactly one of `df_subset` or `counts`.")
+    if counts is not None:
+        X = counts[0]; var_names = counts[1]
+        obs_names = counts[2] if len(counts) > 2 else None
+        for bad, name in [(nuclear_only, "nuclear_only"),
+                          (percentile_filter, "percentile_filter"),
+                          (per_gene_percentile_filter, "per_gene_percentile_filter")]:
+            if bad:
+                import warnings
+                warnings.warn(f"{name} ignored for matrix `counts=` input")
+        M, genes, contexts = _presence_from_counts(
+            X, var_names, obs_names,
+            min_occurrences_per_context=min_occurrences_per_context,
+        )
+        # tau parse for the diagnostics passed through to the core.
+        return _bootstrap_from_presence(
+            M, genes,
+            kernel=bootstrap_kernel, gene_order=gene_order,
+            gene_batch_peak_gb=gene_batch_peak_gb, checkpoint_path=checkpoint_path,
+            tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
+            coarse_block=coarse_block, refine_block=refine_block,
+            min_expected_cooccur_for_evidence=min_expected_cooccur_for_evidence,
+            min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
+            min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+            set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
+            persist_ci=persist_ci, subsample_size=subsample_size,
+        )
 
     # ------------------------------------------------------------------
     # Pre-filter pipeline + memory optimization.

@@ -110,3 +110,39 @@ def test_diagnostics_report_n_pairs(bootstrap_result):
         diag.get("n_pos", 0) + diag.get("n_neg", 0) + diag.get("n_neg_one", 0)
     )
     assert n_classified >= 2, f"Expected at least 2 classified pairs, got {n_classified}"
+
+
+def test_counts_matrix_matches_df_presence():
+    """A counts matrix and the equivalent long-form df build the same M."""
+    import numpy as np, scipy.sparse as sp
+    from tracer.metrics import _presence_from_counts, _build_presence_matrix
+    import pandas as pd
+    # 3 cells x 4 genes raw counts
+    X = sp.csr_matrix(np.array([[2, 0, 5, 1],
+                                [3, 2, 0, 0],
+                                [0, 1, 4, 2]], dtype=np.float32))
+    var = np.array(["g0", "g1", "g2", "g3"])
+    obs = np.array(["c0", "c1", "c2"])
+    M, genes, ctx = _presence_from_counts(X, var, obs, min_occurrences_per_context=2)
+    # gene present where count>=2: c0:{g0,g2}, c1:{g0,g1}, c2:{g2,g3}
+    dense = np.asarray(M.todense())
+    gi = {g: i for i, g in enumerate(genes)}
+    assert dense[0, gi["g0"]] == 1 and dense[0, gi["g2"]] == 1
+    assert dense[0, gi["g3"]] == 0  # count 1 < 2
+    assert dense[1, gi["g1"]] == 1 and dense[1, gi["g3"]] == 0
+    assert set(genes) == {"g0", "g1", "g2", "g3"}
+    assert M.dtype == np.int32
+
+
+def test_counts_xor_df_required():
+    import numpy as np, scipy.sparse as sp, pytest
+    from tracer.metrics import compute_pmi_bootstrap
+    X = sp.csr_matrix(np.array([[2, 2], [2, 2]], dtype=np.float32))
+    var = np.array(["a", "b"])
+    with pytest.raises(ValueError, match="exactly one"):
+        compute_pmi_bootstrap(None, counts=None)            # neither
+    # counts path returns a result without raising
+    res = compute_pmi_bootstrap(None, counts=(X, var), metric="pmi",
+                                min_expected_cooccur_for_evidence=0.5,
+                                bootstrap_kernel="pair_gather", seed=0)
+    assert res.genes.tolist() == ["a", "b"]
