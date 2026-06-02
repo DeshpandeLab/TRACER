@@ -1097,6 +1097,160 @@ def _bootstrap_pairs_gather(
             per_pair_ci_lo, per_pair_ci_hi, per_pair_median, n_done)
 
 
+def _bootstrap_gene_rows(
+    M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
+    *, batches, checkpoint_path, G,
+    tau, ci_level, max_bootstraps, coarse_block, refine_block,
+    min_samples_for_ci, alpha, metric, seed, show_progress,
+):
+    """Gene-row (resample-multiplicity matvec) bootstrap over owned pairs.
+
+    With ``rc = bincount(resampled cell indices, minlength=C)`` (a per-cell
+    multiplicity vector), the bootstrap co-occurrence of ``(g, h)`` is
+    ``Σ_c rc[c]·M[c,g]·M[c,h]`` and the resampled marginals are ``rc @ M``
+    (length G, computed once per iteration and shared across genes). Gene
+    ``g``'s whole co-occurrence row is ``(rc masked to g's present cells) @ M``,
+    so no per-pair column gather is ever materialized.
+
+    ``batches`` is a list of ``(start, end)`` index ranges into ``order``;
+    each pair is owned (bootstrapped) exactly once via the ``_owned_partners``
+    dedup. Settled pos/neg pairs are emitted with their legacy point-estimate
+    value (``legacy_for_W``), matching ``_bootstrap_pairs_gather``'s settled-pair
+    semantics; the bootstrap CI is used only for the settle decision.
+
+    Returns ``(rows, cols, vals)`` for settled pairs (upper-triangle gene
+    indices). ``checkpoint_path`` is plumbed for a later task; with
+    ``checkpoint_path=None`` (the only path exercised here) it is a no-op.
+    """
+    tau_arr = np.atleast_1d(np.asarray(tau, dtype=float))
+    if tau_arr.size == 1:
+        tau_low = tau_high = float(tau_arr[0])
+    else:
+        tau_low = float(tau_arr.min())
+        tau_high = float(tau_arr.max())
+    ci_lo_q = (1.0 - ci_level) / 2.0
+    ci_hi_q = 1.0 - ci_lo_q
+
+    Mcsc = M.tocsc()
+    C = M.shape[0]
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+
+    # Checkpoint helpers land in a later task; guard so the None path
+    # (the only one used here) is a clean no-op.
+    done_batches = 0
+    if checkpoint_path is not None:
+        ck = _read_checkpoint(checkpoint_path)
+        if ck is not None:
+            rows, cols, vals, done_batches = ck
+
+    for b_idx, (bs, be) in enumerate(batches):
+        if b_idx < done_batches:
+            continue
+        rng = np.random.default_rng(None if seed is None else seed + b_idx)
+        batch_genes = order[bs:be]
+
+        # Flatten this batch's owned pairs into contiguous arrays. Each
+        # owned pair gets a flat slot `t`; seg_slices maps a gene to its
+        # contiguous slot range so a single co-row read fills all its pairs.
+        seg = [(int(g),
+                own_partner[own_indptr[g]:own_indptr[g + 1]],
+                own_pairref[own_indptr[g]:own_indptr[g + 1]])
+               for g in batch_genes]
+        n_owned = sum(len(p) for _, p, _ in seg)
+        if n_owned == 0:
+            if checkpoint_path is not None:
+                _write_checkpoint(checkpoint_path, rows, cols, vals, G, b_idx + 1)
+            continue
+
+        sample_lists: list[list[float]] = [[] for _ in range(n_owned)]
+        nsamp = np.zeros(n_owned, dtype=np.int32)
+        unsettled = np.ones(n_owned, dtype=bool)
+        kind = np.zeros(n_owned, dtype=np.int8)
+        flat_g = np.empty(n_owned, dtype=np.int64)
+        flat_h = np.empty(n_owned, dtype=np.int64)
+        flat_legacy = np.empty(n_owned, dtype=np.float64)
+        t = 0
+        seg_slices = []
+        for (g, partners, refs) in seg:
+            s = slice(t, t + len(partners))
+            seg_slices.append((g, partners, s))
+            flat_g[s] = g
+            flat_h[s] = partners
+            flat_legacy[s] = legacy_for_W[refs]
+            t += len(partners)
+
+        n_done = 0
+        while n_done < max_bootstraps and unsettled.any():
+            block = coarse_block if n_done == 0 else refine_block
+            block = min(block, max_bootstraps - n_done)
+            for _ in range(block):
+                draw = rng.integers(0, C, size=C)
+                rc = np.bincount(draw, minlength=C).astype(np.float64)
+                marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
+                N_b = float(C)
+                for (g, partners, s) in seg_slices:
+                    if not unsettled[s].any():
+                        continue
+                    col = Mcsc.getcol(g)
+                    gc = col.indices                 # cells where g present
+                    w = np.zeros(C)
+                    w[gc] = rc[gc]
+                    co_row = np.asarray(w @ M).ravel()   # co(g, :) under resample
+                    co = co_row[partners]
+                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        pmi = np.log(Pij / (Pi * Pj))
+                        val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
+                    loc = np.arange(s.start, s.stop)
+                    for li, vv in zip(loc, val):
+                        if unsettled[li] and np.isfinite(vv):
+                            sample_lists[li].append(float(vv))
+                            nsamp[li] += 1
+            n_done += block
+            for li in np.flatnonzero(unsettled):
+                if nsamp[li] < min_samples_for_ci:
+                    continue
+                kd, _lo, _hi, _med = _classify_ci(
+                    sample_lists[li], tau_low, tau_high, ci_lo_q, ci_hi_q)
+                if kd != 0:
+                    unsettled[li] = False
+                    kind[li] = kd
+                    sample_lists[li] = []   # release memory
+
+        # Post-budget classification for any still-unsettled pairs with
+        # enough samples (mirrors the pair_gather final-CI pass; here we use
+        # the same strong/strong-/tight_null kinds the in-loop test emits).
+        for li in np.flatnonzero(unsettled):
+            if nsamp[li] >= min_samples_for_ci:
+                kd, _lo, _hi, _med = _classify_ci(
+                    sample_lists[li], tau_low, tau_high, ci_lo_q, ci_hi_q)
+                kind[li] = kd
+
+        # Emit settled pos/neg pairs (kind == 1 / -1) with their LEGACY point
+        # estimate. tight_null (kind == 3) and unsettled (kind == 0) do NOT
+        # enter W, matching pair_gather.
+        sett = np.flatnonzero((kind == 1) | (kind == -1))
+        for li in sett:
+            gi = int(flat_g[li])
+            hj = int(flat_h[li])
+            a, c = (gi, hj) if gi < hj else (hj, gi)
+            v = float(flat_legacy[li])
+            if np.isfinite(v):
+                rows.append(a)
+                cols.append(c)
+                vals.append(v)
+        if show_progress:
+            print(f"[gene_row] batch {b_idx + 1}/{len(batches)} genes={be - bs} "
+                  f"owned={n_owned} settled={sett.size}")
+        if checkpoint_path is not None:
+            _write_checkpoint(checkpoint_path, rows, cols, vals, G, b_idx + 1)
+    return rows, cols, vals
+
+
 def _bootstrap_from_presence(
     M,
     genes,
@@ -1401,12 +1555,77 @@ def _bootstrap_from_presence(
             )
         )
     elif kernel == "gene_row":
-        raise NotImplementedError(
-            "bootstrap_kernel='gene_row' is not implemented yet "
-            "(lands in a later task); use bootstrap_kernel='pair_gather'."
-        )
+        # Resample-multiplicity matvec kernel. Genes are processed in a fixed
+        # order; each pair is owned (bootstrapped) once by its earlier-in-order
+        # endpoint (the dedup triangle). The kernel emits settled pos/neg pairs
+        # directly with their legacy point-estimate value.
+        k = np.asarray(M.sum(0)).ravel().astype(np.float64)
+        legacy_l1 = None
+        stopping = None
+        if gene_order == "l1_pmi":
+            legacy_l1 = np.zeros(G)
+            absv = np.abs(legacy_for_W[can_bootstrap])
+            np.add.at(legacy_l1, obs_i[can_bootstrap], absv)
+            np.add.at(legacy_l1, obs_j[can_bootstrap], absv)
+        if gene_order == "stopping_mass":
+            tl = tau_low
+            w = (1.0 / ((np.abs(legacy_for_W[can_bootstrap]) - tl) ** 2 + 1e-6)
+                 / np.maximum(obs_k[can_bootstrap].astype(float), 1.0))
+            stopping = np.zeros(G)
+            np.add.at(stopping, obs_i[can_bootstrap], w)
+            np.add.at(stopping, obs_j[can_bootstrap], w)
+        order = _gene_processing_order(gene_order, k=k, legacy_l1=legacy_l1,
+                                       stopping_mass=stopping)
+        pos = np.empty(order.size, dtype=np.int64)
+        pos[order] = np.arange(order.size)
+        own_indptr, own_partner, own_pairref = _owned_partners(
+            obs_i, obs_j, can_bootstrap, pos)
+        # Task 4: single batch (memory-budgeted batching lands in a later task).
+        batches = [(0, order.size)]
+        rows4, cols4, vals4 = _bootstrap_gene_rows(
+            M, order, own_indptr, own_partner, own_pairref, legacy_for_W,
+            batches=batches, checkpoint_path=checkpoint_path, G=G,
+            tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
+            coarse_block=coarse_block, refine_block=refine_block,
+            min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+            seed=seed, show_progress=show_progress)
+        out_rows.extend(rows4)
+        out_cols.extend(cols4)
+        out_vals.extend(vals4)
     else:
         raise ValueError(f"unknown bootstrap_kernel {kernel!r}")
+
+    if kernel == "gene_row":
+        # The gene-row kernel already emitted settled W entries above and does
+        # not expose the per-pair settled_kind/CI bookkeeping that pair_gather
+        # uses for diagnostics and pair_ci. Assemble W and a minimal diagnostics
+        # block here, then return.
+        W_sparse = sp.coo_matrix(
+            (out_vals, (out_rows, out_cols)),
+            shape=(G, G),
+            dtype=np.float32,
+        ).tocsr()
+        diagnostics = {
+            "n_neg_one": n_neg_one,
+            "n_indeterminate": n_indeterminate,
+            "n_low_evidence": n_low_evidence,
+            "n_legacy_only": n_legacy_only,
+            "n_can_bootstrap": n_can_bootstrap,
+            "subsample_size": iter_size,
+            "min_expected_cooccur_for_evidence": thr,
+            "metric": metric,
+            "tau_low": tau_low,
+            "tau_high": tau_high,
+            "is_dual_tau": _is_dual_tau,
+            "kernel": "gene_row",
+            "gene_order": gene_order,
+            "pre_filter": pre_filter_diag,
+        }
+        pair_ci_df = _ci_records_to_df(ci_records) if ci_records is not None else None
+        return PmiBootstrapResult(
+            W_sparse=W_sparse, genes=genes,
+            diagnostics=diagnostics, pair_ci=pair_ci_df,
+        )
 
     n_pos_strong = int((settled_kind == 1).sum())
     n_pos_weak   = int((settled_kind == 2).sum())

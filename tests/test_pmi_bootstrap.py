@@ -169,6 +169,28 @@ def test_pair_gather_kernel_matches_legacy_output():
     assert res.diagnostics["n_neg_one"] >= 1
 
 
+def test_gene_row_kernel_parity_with_pair_gather():
+    """gene_row settles the same pair SET as pair_gather; values within tol."""
+    import numpy as np
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, M = make_synthetic_npmi_panel()
+    common = dict(group_key="cell_id", feature_col="feature_name",
+                  metric="npmi", seed=0, show_progress=False)
+    a = compute_pmi_bootstrap(df, bootstrap_kernel="pair_gather", **common)
+    b = compute_pmi_bootstrap(df, bootstrap_kernel="gene_row", **common)
+    Wa = {(int(i), int(j)) for i, j in zip(*a.W_sparse.nonzero())}
+    Wb = {(int(i), int(j)) for i, j in zip(*b.W_sparse.nonzero())}
+    # neg_one + clearly-settled pairs must match exactly
+    assert (0, 1) in Wb and (2, 3) in Wb and (8, 9) in Wb
+    assert b.W_sparse.tocsr()[8, 9] == -1.0
+    # sign agreement on the strong pairs
+    assert b.W_sparse.tocsr()[0, 1] > 0.1
+    assert b.W_sparse.tocsr()[2, 3] < -0.1
+    # broad set agreement (allow tiny boundary differences from RNG stream)
+    assert len(Wa ^ Wb) <= 2
+
+
 def test_gene_order_prob_ascending():
     import numpy as np
     from tracer.metrics import _gene_processing_order
