@@ -44,6 +44,12 @@ METRIC = "pmi"
 MIN_OCCURRENCES_PER_CONTEXT = 2     # gene present in a cell when count >= 2
 MIN_EXPECTED_COOCCUR_FOR_EVIDENCE = 10.0
 SEED = 0
+# Bootstrap iteration ceiling (gene-row mode). The default (10000) makes
+# low-support near-tau pairs iterate to the cap, dominating wall-clock on a
+# whole-transcriptome reference. 1000 is a 10x cut: pairs that haven't settled
+# by 1000 iters are the near-tau "dead-zone" ones whose exact CI barely matters
+# (they classify as unsettled -> absent from W either way).
+MAX_BOOTSTRAPS = 1000
 # Output filename prefix is chosen per --mode in main() and passed to
 # _write_outputs(): "legacy_pmi" (legacy) or "bootstrap_pmi" (gene-row bootstrap).
 
@@ -195,7 +201,7 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
     print(f"[info] running compute_pmi_bootstrap (gene-row BOOTSTRAP) "
           f"metric={METRIC!r}, min_occ={MIN_OCCURRENCES_PER_CONTEXT}, "
           f"min_expected_cooccur={MIN_EXPECTED_COOCCUR_FOR_EVIDENCE}, "
-          f"checkpoint={ckpt!r}, seed={SEED}")
+          f"max_bootstraps={MAX_BOOTSTRAPS}, checkpoint={ckpt!r}, seed={SEED}")
     result = metrics.compute_pmi_bootstrap(
         None,
         counts=(X, a.var_names.astype(str).to_numpy(), a.obs_names.astype(str).to_numpy()),
@@ -204,6 +210,7 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
         min_expected_cooccur_for_evidence=MIN_EXPECTED_COOCCUR_FOR_EVIDENCE,
         bootstrap_kernel="gene_row", gene_order="prob_ascending",
         gene_batch_peak_gb=16.0, checkpoint_path=ckpt,
+        max_bootstraps=MAX_BOOTSTRAPS,
         seed=SEED, show_progress=True,
     )
     _write_outputs(result, "bootstrap_pmi", {
@@ -211,6 +218,7 @@ def run_bootstrap(metrics, no_checkpoint: bool) -> None:
         "n_genes_total": int(a.n_vars),
         "bootstrap_kernel": "gene_row",
         "gene_order": "prob_ascending",
+        "max_bootstraps": MAX_BOOTSTRAPS,
         "checkpoint_path": ckpt,
         "mode": "gene_row_bootstrap",
     })
