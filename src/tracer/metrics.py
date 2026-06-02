@@ -513,6 +513,7 @@ def compute_pmi_bootstrap(
     seed: int | None = None,
     show_progress: bool = False,
     persist_ci: bool = False,
+    ci_accumulator: str = "samples",
     subsample_size: int | None = None,
     metric: str = "npmi",
     expected_cooccur_for_neg_one: float | None = None,  # deprecated alias
@@ -620,6 +621,17 @@ def compute_pmi_bootstrap(
         carrying ``(gene_i, gene_j, kind, median, ci_lo, ci_hi,
         n_bootstraps)``. Useful for sanity-checking the active sampler;
         off by default to keep the result lean.
+    ci_accumulator : {"samples", "counter"}
+        How the gene_row kernel tracks each pair's CI-vs-threshold settle
+        decision. ``"samples"`` (default) stores every finite bootstrap
+        sample per pair and runs a percentile-quantile settle (current
+        behavior). ``"counter"`` keeps only three integers per pair
+        (#samples below ``-tau``, #above ``+tau``, #finite) and settles from
+        those counts — O(1) per-pair state independent of ``max_bootstraps``.
+        ``"counter"`` is exact for the scalar-tau settle decision (modulo a
+        handful of near-threshold boundary pairs, empirical-CDF vs linear-
+        interpolation), is gene_row-only, and is incompatible with
+        ``persist_ci=True`` (no CI magnitudes are retained).
     subsample_size : int or None
         When set, each bootstrap iteration samples this many cells with
         replacement instead of the full ``C``. Subsample bootstrap is
@@ -636,6 +648,19 @@ def compute_pmi_bootstrap(
 
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+    if ci_accumulator not in ("samples", "counter"):
+        raise ValueError(
+            f"ci_accumulator must be 'samples' or 'counter' (got {ci_accumulator!r})"
+        )
+    if ci_accumulator == "counter" and persist_ci:
+        # The counter accumulator keeps only beyond-threshold counts (3 ints
+        # per pair); it cannot reconstruct CI magnitudes or the median, so it
+        # is fundamentally incompatible with persist_ci's per-pair CI output.
+        raise ValueError(
+            "ci_accumulator='counter' is incompatible with persist_ci=True "
+            "(counters store no sample values, so CI bounds/median cannot be "
+            "produced). Use ci_accumulator='samples' to persist CIs."
+        )
 
     # ------------------------------------------------------------------
     # Input dispatch: exactly one of `df_subset` (long-form transcripts)
@@ -670,7 +695,8 @@ def compute_pmi_bootstrap(
             min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
             min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
             set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
-            persist_ci=persist_ci, subsample_size=subsample_size,
+            persist_ci=persist_ci, ci_accumulator=ci_accumulator,
+            subsample_size=subsample_size,
         )
 
     # ------------------------------------------------------------------
@@ -908,7 +934,8 @@ def compute_pmi_bootstrap(
         min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
         min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
         set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
-        persist_ci=persist_ci, subsample_size=subsample_size,
+        persist_ci=persist_ci, ci_accumulator=ci_accumulator,
+        subsample_size=subsample_size,
         pre_filter_diag=pre_filter_diag,
     )
 
@@ -988,6 +1015,49 @@ def _vectorized_settle_inplace(
             # (including kd==0), matching the legacy `kind[li] = kd` which
             # wrote the result unconditionally without clearing `unsettled`.
             kind[grp] = kd
+
+
+def _counter_settle_inplace(
+    elig, cnt_below, cnt_above, nsamp, unsettled, kind,
+    tau_low, tau_high, ci_lo_q, ci_hi_q, *, release,
+):
+    """O(1)-memory counter equivalent of :func:`_vectorized_settle_inplace`.
+
+    Classifies each eligible pair (already gated on ``nsamp >=
+    min_samples_for_ci``) from beyond-threshold COUNTS rather than stored
+    samples. For a percentile CI at quantiles ``ci_lo_q``/``ci_hi_q`` the
+    scalar-tau settle cascade reduces to (empirical-CDF convention):
+
+    * ``pos`` (kind 1)        ⟺ ``cnt_above > ci_hi_q * nsamp``  (Q_lo > tau)
+    * ``neg`` (kind -1)       ⟺ ``cnt_below > ci_hi_q * nsamp``  (Q_hi < -tau)
+    * ``tight_null`` (kind 3) ⟺ ``cnt_below < ci_lo_q * nsamp``
+                                 AND ``cnt_above < ci_lo_q * nsamp``
+    * else unsettled (kind 0).
+
+    ``tau_low``/``tau_high`` are equal in scalar-tau mode (the only mode the
+    gene_row kernel supports); both are accepted to mirror the samples-path
+    signature. Mutates ``unsettled``/``kind`` in place. With ``release=True``
+    (in-loop) only pairs that classified (kind != 0) are settled, leaving the
+    rest to keep iterating; with ``release=False`` (post-budget) the final kind
+    is written to ALL eligible pairs, matching the samples path's two modes.
+    """
+    n = nsamp[elig].astype(np.float64)
+    ca = cnt_above[elig].astype(np.float64)
+    cb = cnt_below[elig].astype(np.float64)
+    kd = np.zeros(elig.size, dtype=np.int8)
+    pos = ca > ci_hi_q * n
+    neg = (~pos) & (cb > ci_hi_q * n)
+    tight = (~pos) & (~neg) & (cb < ci_lo_q * n) & (ca < ci_lo_q * n)
+    kd[pos] = 1
+    kd[neg] = -1
+    kd[tight] = 3
+    if release:
+        settled = kd != 0
+        sg = elig[settled]
+        kind[sg] = kd[settled]
+        unsettled[sg] = False
+    else:
+        kind[elig] = kd
 
 
 def _write_checkpoint(path, rows, cols, vals, G, cursor):
@@ -1240,7 +1310,7 @@ def _bootstrap_gene_rows(
     *, batches, checkpoint_path, G,
     tau, ci_level, max_bootstraps, coarse_block, refine_block,
     min_samples_for_ci, alpha, metric, seed, show_progress,
-    subsample_size=None,
+    subsample_size=None, ci_accumulator="samples",
 ):
     """Gene-row (resample-multiplicity matvec) bootstrap over owned pairs.
 
@@ -1268,6 +1338,22 @@ def _bootstrap_gene_rows(
     dedup. Settled pos/neg pairs are emitted with their legacy point-estimate
     value (``legacy_for_W``), matching ``_bootstrap_pairs_gather``'s settled-pair
     semantics; the bootstrap CI is used only for the settle decision.
+
+    ``ci_accumulator`` selects how each pair's CI-vs-threshold decision is
+    tracked:
+
+    * ``"samples"`` (default): store every finite bootstrap sample per pair and
+      run a percentile-quantile settle (``np.quantile`` linear interpolation).
+      This path is left BITWISE-UNCHANGED.
+    * ``"counter"``: keep only three integers per pair — ``cnt_below`` (#samples
+      ``< -tau_high``), ``cnt_above`` (#samples ``> tau_high``), and ``nsamp``
+      (#finite samples). The settle decision reduces to count tests against the
+      ``ci_lo_q``/``ci_hi_q`` quantile fractions (exact for the scalar-tau
+      pos/neg/tight_null cascade under the empirical-CDF convention):
+      ``pos`` ⟺ ``cnt_above > ci_hi_q*nsamp``; ``neg`` ⟺
+      ``cnt_below > ci_hi_q*nsamp``; ``tight_null`` ⟺ ``cnt_below < ci_lo_q*nsamp
+      AND cnt_above < ci_lo_q*nsamp``. Per-pair state is O(1) in
+      ``max_bootstraps`` — no samples are stored.
 
     Returns ``(rows, cols, vals)`` for settled pairs (upper-triangle gene
     indices). ``checkpoint_path`` is plumbed for a later task; with
@@ -1329,13 +1415,18 @@ def _bootstrap_gene_rows(
                 _write_checkpoint(checkpoint_path, rows, cols, vals, G, b_idx + 1)
             continue
 
-        # Per-pair persistent sample store. ``sample_store[li]`` holds the
-        # finite samples drawn for pair ``li`` so far as a 1-D float64 array
-        # (released to None once the pair settles). The legacy kernel held a
-        # python list per pair and ``.append(float(...))`` per (pair,iter);
-        # we instead accumulate a whole block at once (vectorized) and extend
-        # the store with a single concatenate per unsettled pair per block.
-        sample_store: list = [None] * n_owned
+        # Per-pair persistent sample store (SAMPLES mode only). ``sample_store
+        # [li]`` holds the finite samples drawn for pair ``li`` so far as a 1-D
+        # float64 array (released to None once the pair settles). The legacy
+        # kernel held a python list per pair and ``.append(float(...))`` per
+        # (pair,iter); we instead accumulate a whole block at once (vectorized)
+        # and extend the store with a single concatenate per unsettled pair per
+        # block. In COUNTER mode no samples are stored: only the three int
+        # arrays cnt_below/cnt_above/nsamp track the beyond-threshold counts.
+        counter_mode = ci_accumulator == "counter"
+        sample_store: list = None if counter_mode else [None] * n_owned
+        cnt_below = np.zeros(n_owned, dtype=np.int64) if counter_mode else None
+        cnt_above = np.zeros(n_owned, dtype=np.int64) if counter_mode else None
         nsamp = np.zeros(n_owned, dtype=np.int32)
         unsettled = np.ones(n_owned, dtype=bool)
         kind = np.zeros(n_owned, dtype=np.int8)
@@ -1428,51 +1519,73 @@ def _bootstrap_gene_rows(
                         buf[s, bi] = val
             n_done += block
 
-            # Extend each unsettled pair's sample store with this block's
-            # finite samples (vectorized; one concatenate per pair, not one
-            # python append per sample). The legacy code skipped non-finite
-            # values and did not count them — replicate by masking the row.
             un_idx = np.flatnonzero(unsettled)
             block_rows = buf[un_idx]                      # (n_unsettled, block)
             finite = np.isfinite(block_rows)
-            if finite.all():
-                # Fast path (the only one hit when alpha>0 keeps every value
-                # finite): every unsettled pair gets exactly `block` samples.
-                add_cnt = np.full(un_idx.size, block, dtype=np.int32)
-                for k, li in enumerate(un_idx):
-                    prev = sample_store[li]
-                    sample_store[li] = (block_rows[k] if prev is None
-                                        else np.concatenate((prev, block_rows[k])))
+            if not counter_mode:
+                # SAMPLES path — UNCHANGED. Extend each unsettled pair's sample
+                # store with this block's finite samples (vectorized; one
+                # concatenate per pair, not one python append per sample). The
+                # legacy code skipped non-finite values and did not count them —
+                # replicate by masking the row.
+                if finite.all():
+                    # Fast path (the only one hit when alpha>0 keeps every value
+                    # finite): every unsettled pair gets exactly `block` samples.
+                    add_cnt = np.full(un_idx.size, block, dtype=np.int32)
+                    for k, li in enumerate(un_idx):
+                        prev = sample_store[li]
+                        sample_store[li] = (block_rows[k] if prev is None
+                                            else np.concatenate((prev, block_rows[k])))
+                else:
+                    # Rare correctness fallback: a non-finite value appeared, so
+                    # per-pair sample counts can differ within the block. Drop the
+                    # non-finite entries from each row exactly as the legacy
+                    # `if np.isfinite(vv)` guard did.
+                    add_cnt = finite.sum(axis=1).astype(np.int32)
+                    for k, li in enumerate(un_idx):
+                        fin = block_rows[k][finite[k]]
+                        prev = sample_store[li]
+                        sample_store[li] = (fin if prev is None
+                                            else np.concatenate((prev, fin)))
             else:
-                # Rare correctness fallback: a non-finite value appeared, so
-                # per-pair sample counts can differ within the block. Drop the
-                # non-finite entries from each row exactly as the legacy
-                # `if np.isfinite(vv)` guard did.
-                add_cnt = finite.sum(axis=1).astype(np.int32)
-                for k, li in enumerate(un_idx):
-                    fin = block_rows[k][finite[k]]
-                    prev = sample_store[li]
-                    sample_store[li] = (fin if prev is None
-                                        else np.concatenate((prev, fin)))
+                # COUNTER path. Accumulate only the beyond-threshold counts for
+                # this block (no per-pair sample storage). Non-finite values are
+                # excluded from all three counters exactly as the samples path's
+                # finite mask drops them. `finite & (block_rows > tau_high)` is
+                # implicit: non-finite comparisons are False, so a plain
+                # `> tau_high` already excludes them; nsamp uses the finite mask.
+                add_cnt = (finite.sum(axis=1).astype(np.int32)
+                           if not finite.all()
+                           else np.full(un_idx.size, block, dtype=np.int32))
+                # Comparisons on NaN are False, so non-finite entries never
+                # increment cnt_above/cnt_below.
+                cnt_above[un_idx] += (block_rows > tau_high).sum(axis=1)
+                cnt_below[un_idx] += (block_rows < -tau_high).sum(axis=1)
             nsamp[un_idx] += add_cnt
 
-            # Vectorized in-loop settle. All currently-unsettled pairs that
-            # cleared `min_samples_for_ci` are classified together with a single
-            # axis-1 quantile call, replacing the per-pair `_classify_ci`. Pairs
-            # below the sample gate are skipped (kept unsettled), matching legacy.
+            # In-loop settle. All currently-unsettled pairs that cleared
+            # `min_samples_for_ci` are classified together. Pairs below the
+            # sample gate are skipped (kept unsettled), matching legacy.
             elig = un_idx[nsamp[un_idx] >= min_samples_for_ci]
             if elig.size:
-                # Group eligible pairs by their (identical-within-group) store
-                # length so each group can be stacked into a 2-D array for one
-                # quantile call. In the all-finite path every still-unsettled
-                # pair has the same length (== n_done), so this is a single
-                # group; the grouping only branches when non-finite drops made
-                # counts diverge.
-                _vectorized_settle_inplace(
-                    elig, sample_store, nsamp, unsettled, kind,
-                    tau_low, tau_high, ci_lo_q, ci_hi_q,
-                    release=True,
-                )
+                if counter_mode:
+                    _counter_settle_inplace(
+                        elig, cnt_below, cnt_above, nsamp, unsettled, kind,
+                        tau_low, tau_high, ci_lo_q, ci_hi_q,
+                        release=True,
+                    )
+                else:
+                    # Group eligible pairs by their (identical-within-group)
+                    # store length so each group can be stacked into a 2-D array
+                    # for one quantile call. In the all-finite path every
+                    # still-unsettled pair has the same length (== n_done), so
+                    # this is a single group; the grouping only branches when
+                    # non-finite drops made counts diverge.
+                    _vectorized_settle_inplace(
+                        elig, sample_store, nsamp, unsettled, kind,
+                        tau_low, tau_high, ci_lo_q, ci_hi_q,
+                        release=True,
+                    )
 
         # Post-budget classification for any still-unsettled pairs with
         # enough samples (mirrors the pair_gather final-CI pass; here we use
@@ -1480,11 +1593,18 @@ def _bootstrap_gene_rows(
         leftover = np.flatnonzero(unsettled)
         elig = leftover[nsamp[leftover] >= min_samples_for_ci]
         if elig.size:
-            _vectorized_settle_inplace(
-                elig, sample_store, nsamp, unsettled, kind,
-                tau_low, tau_high, ci_lo_q, ci_hi_q,
-                release=False,
-            )
+            if counter_mode:
+                _counter_settle_inplace(
+                    elig, cnt_below, cnt_above, nsamp, unsettled, kind,
+                    tau_low, tau_high, ci_lo_q, ci_hi_q,
+                    release=False,
+                )
+            else:
+                _vectorized_settle_inplace(
+                    elig, sample_store, nsamp, unsettled, kind,
+                    tau_low, tau_high, ci_lo_q, ci_hi_q,
+                    release=False,
+                )
 
         agg_n_pos += int((kind == 1).sum())
         agg_n_neg += int((kind == -1).sum())
@@ -1544,6 +1664,7 @@ def _bootstrap_from_presence(
     seed: int | None = None,
     show_progress: bool = False,
     persist_ci: bool = False,
+    ci_accumulator: str = "samples",
     subsample_size: int | None = None,
     pre_filter_diag: dict | None = None,
 ) -> PmiBootstrapResult:
@@ -1573,6 +1694,15 @@ def _bootstrap_from_presence(
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
     if kernel not in ("pair_gather", "gene_row"):
         raise ValueError(f"unknown bootstrap_kernel {kernel!r}")
+    if ci_accumulator not in ("samples", "counter"):
+        raise ValueError(
+            f"ci_accumulator must be 'samples' or 'counter' (got {ci_accumulator!r})"
+        )
+    if ci_accumulator == "counter" and kernel != "gene_row":
+        raise NotImplementedError(
+            "ci_accumulator='counter' is only implemented for "
+            "bootstrap_kernel='gene_row'."
+        )
 
     C, G = M.shape
 
@@ -1883,7 +2013,7 @@ def _bootstrap_from_presence(
             coarse_block=coarse_block, refine_block=refine_block,
             min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
             seed=seed, show_progress=show_progress,
-            subsample_size=subsample_size)
+            subsample_size=subsample_size, ci_accumulator=ci_accumulator)
         out_rows.extend(rows4)
         out_cols.extend(cols4)
         out_vals.extend(vals4)

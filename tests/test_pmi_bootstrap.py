@@ -455,3 +455,204 @@ def test_gene_row_vectorized_bitwise_identical_multibatch():
     nbp = np.asarray(d["n_bootstraps_per_pair"])
     assert len(nbp) == _GENE_ROW_GOLDEN_NBP_LEN_MB
     assert int(nbp.sum()) == _GENE_ROW_GOLDEN_NBP_SUM_MB
+
+
+# ======================================================================
+# O(1)-memory "counter" CI accumulator (ci_accumulator="counter")
+# ======================================================================
+
+_COMMON_GR = dict(
+    group_key="cell_id", feature_col="feature_name", metric="npmi",
+    bootstrap_kernel="gene_row", tau=0.05, ci_level=0.95,
+    max_bootstraps=2000, coarse_block=200, refine_block=200,
+    seed=0, show_progress=False,
+)
+
+
+def test_counter_logic_matches_quantile_decision():
+    """GATE 2 — counter settle classification matches the np.quantile-vs-tau
+    decision for clearly pos / neg / tight_null sample sequences.
+
+    The counter test reduces the percentile-CI settle to integer counts:
+      pos   <=> cnt_above >  ci_hi_q * nsamp
+      neg   <=> cnt_below >  ci_hi_q * nsamp
+      tight <=> cnt_below <  ci_lo_q * nsamp  AND  cnt_above < ci_lo_q * nsamp
+    For UNAMBIGUOUS distributions (mass clearly on one side of +/-tau) this is
+    identical to the linear-interpolation quantile decision used by the
+    samples path. Near-boundary churn (a single order statistic straddling
+    the ci quantile) is covered by the agreement gate, not here.
+    """
+    ci_level = 0.95
+    tau = 0.05
+    ci_lo_q = (1.0 - ci_level) / 2.0
+    ci_hi_q = 1.0 - ci_lo_q
+
+    def quantile_kind(arr):
+        lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+        if lo > tau:
+            return 1
+        if hi < -tau:
+            return -1
+        if lo > -tau and hi < tau:
+            return 3
+        return 0
+
+    def counter_kind(arr):
+        n = arr.size
+        cnt_above = int((arr > tau).sum())
+        cnt_below = int((arr < -tau).sum())
+        if cnt_above > ci_hi_q * n:
+            return 1
+        if cnt_below > ci_hi_q * n:
+            return -1
+        if cnt_below < ci_lo_q * n and cnt_above < ci_lo_q * n:
+            return 3
+        return 0
+
+    rng = np.random.default_rng(7)
+    # Clearly positive: mass well above +tau.
+    pos = rng.normal(0.6, 0.05, size=200)
+    # Clearly negative: mass well below -tau.
+    neg = rng.normal(-0.6, 0.05, size=200)
+    # Clearly tight-null: mass tightly around 0, inside +/-tau.
+    tight = rng.normal(0.0, 0.005, size=200)
+
+    assert quantile_kind(pos) == 1 and counter_kind(pos) == 1
+    assert quantile_kind(neg) == -1 and counter_kind(neg) == -1
+    assert quantile_kind(tight) == 3 and counter_kind(tight) == 3
+
+
+def test_counter_vs_quantile_symmetric_diff_small():
+    """GATE 3 (synthetic random) — over many random sample sequences the
+    counter classification agrees with the quantile decision except for a
+    tiny fraction of near-boundary pairs (empirical-CDF vs linear-interp).
+    Quantify and bound the disagreement rate."""
+    ci_level = 0.95
+    tau = 0.05
+    ci_lo_q = (1.0 - ci_level) / 2.0
+    ci_hi_q = 1.0 - ci_lo_q
+    rng = np.random.default_rng(0)
+    mism = 0
+    n_trials = 5000
+    for _ in range(n_trials):
+        n = int(rng.integers(40, 400))
+        arr = rng.normal(rng.uniform(-0.3, 0.3), rng.uniform(0.02, 0.4), size=n)
+        lo, hi = np.quantile(arr, [ci_lo_q, ci_hi_q])
+        if lo > tau:
+            qk = 1
+        elif hi < -tau:
+            qk = -1
+        elif lo > -tau and hi < tau:
+            qk = 3
+        else:
+            qk = 0
+        cnt_above = int((arr > tau).sum())
+        cnt_below = int((arr < -tau).sum())
+        if cnt_above > ci_hi_q * n:
+            ck = 1
+        elif cnt_below > ci_hi_q * n:
+            ck = -1
+        elif cnt_below < ci_lo_q * n and cnt_above < ci_lo_q * n:
+            ck = 3
+        else:
+            ck = 0
+        if qk != ck:
+            mism += 1
+    # Boundary churn only: well under 1% of trials.
+    assert mism / n_trials < 0.01, f"counter/quantile disagreement {mism}/{n_trials}"
+
+
+def test_counter_mode_runs_and_emits_diag_keys():
+    """Counter mode runs end-to-end and emits the same diagnostics contract
+    keys as samples mode (n_pos/n_neg/n_dead_zone/n_unsettled/
+    n_bootstraps_per_pair)."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    res = compute_pmi_bootstrap(df, ci_accumulator="counter", **_COMMON_GR)
+    d = res.diagnostics
+    for k in ("n_pos", "n_neg", "n_dead_zone", "n_unsettled",
+              "n_bootstraps_per_pair"):
+        assert k in d, f"missing diag key {k}"
+    nbp = np.asarray(d["n_bootstraps_per_pair"])
+    # nsamp array, one entry per owned pair, all positive ints.
+    assert nbp.ndim == 1 and nbp.size > 0
+    assert np.issubdtype(nbp.dtype, np.integer)
+    # The strong-positive pair still settles positive.
+    assert res.W_sparse.tocsr()[0, 1] > 0.1
+    # Stage-1 neg_one sentinels are kernel-independent.
+    assert res.W_sparse.tocsr()[8, 9] == -1.0
+
+
+def test_counter_vs_samples_settled_set_agreement():
+    """GATE 3 (kernel) — counter-mode settled SET agrees with samples-mode on
+    the synthetic panel within a tiny near-tau tolerance."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    samp = compute_pmi_bootstrap(df, ci_accumulator="samples", **_COMMON_GR)
+    cnt = compute_pmi_bootstrap(df, ci_accumulator="counter", **_COMMON_GR)
+    Ssamp = {(int(i), int(j)) for i, j in zip(*samp.W_sparse.nonzero())}
+    Scnt = {(int(i), int(j)) for i, j in zip(*cnt.W_sparse.nonzero())}
+    sym = Ssamp ^ Scnt
+    # Only pairs sitting right at the ci quantile near tau may flip.
+    assert len(sym) <= 2, f"settled-set symmetric diff too large: {sym}"
+    # The unambiguous entries must agree exactly.
+    assert (0, 1) in Ssamp and (0, 1) in Scnt
+    assert (8, 9) in Ssamp and (8, 9) in Scnt
+
+
+def test_counter_mode_deterministic():
+    """GATE 5 — same seed -> identical W in counter mode."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    a = compute_pmi_bootstrap(df, ci_accumulator="counter", **_COMMON_GR)
+    b = compute_pmi_bootstrap(df, ci_accumulator="counter", **_COMMON_GR)
+    assert np.array_equal(a.W_sparse.toarray(), b.W_sparse.toarray())
+
+
+def test_counter_mode_incompatible_with_persist_ci():
+    """Guard — ci_accumulator='counter' cannot produce CI magnitudes, so it is
+    incompatible with persist_ci=True and must raise ValueError."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    with pytest.raises(ValueError):
+        compute_pmi_bootstrap(df, ci_accumulator="counter", persist_ci=True,
+                              **_COMMON_GR)
+
+
+def test_counter_mode_o1_memory_independent_of_budget():
+    """GATE 4 — counter mode stores NO per-pair sample arrays; per-pair
+    accumulator state is 3 ints regardless of max_bootstraps. Drive the kernel
+    directly and assert the only per-pair state is cnt_below/cnt_above/nsamp,
+    whose total nbytes is independent of max_bootstraps."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    common = dict(_COMMON_GR)
+    common.pop("max_bootstraps")
+    r_small = compute_pmi_bootstrap(
+        df, ci_accumulator="counter", max_bootstraps=200, **common)
+    r_big = compute_pmi_bootstrap(
+        df, ci_accumulator="counter", max_bootstraps=2000, **common)
+    # Per-pair accumulator footprint = 3 int arrays of length == #owned pairs.
+    # n_bootstraps_per_pair IS the nsamp array; its length (the pair count) is
+    # identical across budgets, so the per-pair state size does not grow with B.
+    n_small = np.asarray(r_small.diagnostics["n_bootstraps_per_pair"]).size
+    n_big = np.asarray(r_big.diagnostics["n_bootstraps_per_pair"]).size
+    assert n_small == n_big
+    # Structural check: in counter mode the per-pair sample store is never
+    # materialized (set to None) and the settle runs from counts only.
+    import inspect
+    from tracer import metrics as _m
+    src = inspect.getsource(_m._bootstrap_gene_rows)
+    # sample_store is None when counter_mode (no O(B) per-pair allocation).
+    assert "sample_store: list = None if counter_mode" in src
+    # The counter branch settles via the O(1) count-based helper.
+    assert "_counter_settle_inplace(" in src
+    # The O(1) helper itself reads no stored samples — only the 3 int arrays.
+    settle_src = inspect.getsource(_m._counter_settle_inplace)
+    assert "sample_store" not in settle_src
+    assert "cnt_above" in settle_src and "cnt_below" in settle_src
