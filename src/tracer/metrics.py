@@ -931,6 +931,48 @@ def _classify_ci(arr, tau_low, tau_high, ci_lo_q, ci_hi_q):
     return 0, lo, hi, med
 
 
+def _write_checkpoint(path, rows, cols, vals, G, cursor):
+    """Atomically persist the gene_row kernel's accumulated state.
+
+    Writes the accumulated upper-triangle settled entries (``rows``/``cols``
+    gene indices, ``vals`` legacy point estimates) plus ``cursor`` (the number
+    of batches completed so far) so an interrupted run can resume from the next
+    batch. ``G`` is recorded for diagnostics/sanity only.
+
+    Atomicity: ``np.savez`` writes to a sibling temp file, then ``os.replace``
+    swaps it into ``path`` in one rename so a crash mid-write never leaves a
+    truncated checkpoint. ``np.savez`` appends ``.npz`` to whatever path it is
+    given; ``path`` is required to end in ``.npz`` and the temp file is
+    ``path + ".tmp.npz"`` (already suffixed), so ``os.replace`` finds it.
+    """
+    import os
+    if not str(path).endswith(".npz"):
+        raise ValueError(f"checkpoint path must end in '.npz', got {path!r}")
+    tmp = f"{path}.tmp.npz"   # np.savez sees the '.npz' suffix -> no re-append
+    np.savez(tmp,
+             rows=np.asarray(rows, dtype=np.int64),
+             cols=np.asarray(cols, dtype=np.int64),
+             vals=np.asarray(vals, dtype=np.float64),
+             G=np.int64(G), cursor=np.int64(cursor))
+    os.replace(tmp, path)
+
+
+def _read_checkpoint(path):
+    """Load a gene_row checkpoint, or ``None`` if ``path`` does not exist.
+
+    Returns ``(rows_list, cols_list, vals_list, cursor_int)`` matching what
+    ``_bootstrap_gene_rows`` unpacks (``rows, cols, vals, done_batches = ck``):
+    ``rows``/``cols`` as python ``int`` lists, ``vals`` as ``float`` list (so
+    the kernel can ``.append`` to them directly), and ``cursor`` as an ``int``.
+    """
+    import os
+    if not os.path.exists(path):
+        return None
+    with np.load(path) as d:
+        return (d["rows"].tolist(), d["cols"].tolist(),
+                d["vals"].tolist(), int(d["cursor"]))
+
+
 def _bootstrap_pairs_gather(
     M,
     pairs_i,

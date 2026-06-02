@@ -255,3 +255,32 @@ def test_gene_row_multibatch_matches_singlebatch():
     Sbig = {(int(i), int(j)) for i, j in zip(*big.W_sparse.nonzero())}
     Ssmall = {(int(i), int(j)) for i, j in zip(*small.W_sparse.nonzero())}
     assert len(Sbig ^ Ssmall) <= 2   # same settled set up to boundary RNG
+
+
+def test_checkpoint_roundtrip(tmp_path):
+    import numpy as np
+    from tracer.metrics import _write_checkpoint, _read_checkpoint
+    p = tmp_path / "ck.npz"
+    _write_checkpoint(str(p), [0, 1], [2, 3], [0.5, -0.5], G=4, cursor=2)
+    rows, cols, vals, cursor = _read_checkpoint(str(p))
+    assert rows == [0, 1] and cols == [2, 3]
+    assert vals == [0.5, -0.5] and cursor == 2
+    assert _read_checkpoint(str(tmp_path / "missing.npz")) is None
+
+
+def test_checkpoint_resume_equiv(tmp_path):
+    import numpy as np
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, M = make_synthetic_npmi_panel()
+    common = dict(group_key="cell_id", feature_col="feature_name", metric="npmi",
+                  bootstrap_kernel="gene_row", gene_batch_peak_gb=1e-7, seed=0,
+                  show_progress=False)
+    ck = str(tmp_path / "run.ckpt.npz")
+    full = compute_pmi_bootstrap(df, **common)                  # no checkpoint
+    # write a partial checkpoint by running once with checkpoint, then re-run resumes
+    part = compute_pmi_bootstrap(df, checkpoint_path=ck, **common)
+    resumed = compute_pmi_bootstrap(df, checkpoint_path=ck, **common)  # resumes/no-op
+    Sfull = {(int(i), int(j)) for i, j in zip(*full.W_sparse.nonzero())}
+    Sres = {(int(i), int(j)) for i, j in zip(*resumed.W_sparse.nonzero())}
+    assert Sfull == Sres
