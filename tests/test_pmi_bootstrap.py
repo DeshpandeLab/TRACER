@@ -382,6 +382,57 @@ _GENE_ROW_GOLDEN_NBP_SUM_MB = 264200
 _GENE_ROW_GOLDEN_NBP_LEN_MB = 133
 
 
+def test_gene_row_subsample_runs_and_deterministic():
+    """gene_row with subsample_size=s must run (no NotImplementedError) and be
+    deterministic: same (seed, s) → bit-identical W."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    common = dict(
+        group_key="cell_id", feature_col="feature_name", metric="npmi",
+        bootstrap_kernel="gene_row", tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        subsample_size=400, seed=0, show_progress=False,
+    )
+    a = compute_pmi_bootstrap(df, **common)
+    b = compute_pmi_bootstrap(df, **common)
+    assert a.diagnostics["kernel"] == "gene_row"
+    assert a.diagnostics["subsample_size"] == 400
+    Wa = a.W_sparse.toarray()
+    Wb = b.W_sparse.toarray()
+    assert np.array_equal(Wa, Wb), "same (seed, subsample_size) must give identical W"
+    # The strong positive pair (0,1) still settles positive under subsampling.
+    assert Wa[0, 1] > 0.1
+    # The Stage-1 neg_one sentinels are independent of the bootstrap kernel.
+    assert Wa[8, 9] == -1.0
+
+
+def test_gene_row_subsample_full_count_matches_none():
+    """LARGE-S SANITY: subsample_size == C draws C cells via the subsample path.
+    The RNG consumption differs from the rc-bincount full path, so W need not be
+    bit-identical, but the settled SET must agree within a tiny tolerance."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, M = make_synthetic_npmi_panel()
+    C = M.shape[0]
+    common = dict(
+        group_key="cell_id", feature_col="feature_name", metric="npmi",
+        bootstrap_kernel="gene_row", tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        seed=0, show_progress=False,
+    )
+    full = compute_pmi_bootstrap(df, subsample_size=None, **common)
+    fullc = compute_pmi_bootstrap(df, subsample_size=C, **common)
+    Sfull = {(int(i), int(j)) for i, j in zip(*full.W_sparse.nonzero())}
+    Sfullc = {(int(i), int(j)) for i, j in zip(*fullc.W_sparse.nonzero())}
+    # Settled-set agreement within a small tolerance (boundary RNG differences).
+    assert len(Sfull ^ Sfullc) <= 2
+    # The unambiguous entries must agree exactly.
+    Wc = fullc.W_sparse.tocsr()
+    assert Wc[0, 1] > 0.1
+    assert Wc[8, 9] == -1.0
+
+
 def test_gene_row_vectorized_bitwise_identical_multibatch():
     """The bitwise gate must also hold when the owned pairs are split across
     multiple gene batches (forces the per-batch accumulate/settle path)."""

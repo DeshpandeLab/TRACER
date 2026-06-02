@@ -567,9 +567,11 @@ def compute_pmi_bootstrap(
         Stage-4 kernel. ``"pair_gather"`` is the legacy per-pair column
         gather (bitwise-identical to prior behavior); ``"gene_row"`` (default)
         is the streamed gene-row kernel for whole-transcriptome scale.
-        ``"gene_row"`` supports scalar ``tau`` and full-``C`` resampling only;
-        it raises ``NotImplementedError`` for dual-tau (weak kinds) or
-        ``subsample_size`` — use ``"pair_gather"`` for those.
+        ``"gene_row"`` supports scalar ``tau`` and both full-``C`` resampling
+        (``subsample_size=None``) and per-iteration subsampling
+        (``subsample_size=s`` caps the per-gene matvec at ``min(k_g, s)``); it
+        still raises ``NotImplementedError`` for dual-tau (weak kinds) — use
+        ``"pair_gather"`` for those.
     gene_order : str
         Gene processing order for the ``gene_row`` kernel
         (``"prob_ascending"`` default; also ``"prob_descending"``,
@@ -1238,15 +1240,28 @@ def _bootstrap_gene_rows(
     *, batches, checkpoint_path, G,
     tau, ci_level, max_bootstraps, coarse_block, refine_block,
     min_samples_for_ci, alpha, metric, seed, show_progress,
+    subsample_size=None,
 ):
     """Gene-row (resample-multiplicity matvec) bootstrap over owned pairs.
 
-    With ``rc = bincount(resampled cell indices, minlength=C)`` (a per-cell
-    multiplicity vector), the bootstrap co-occurrence of ``(g, h)`` is
-    ``Σ_c rc[c]·M[c,g]·M[c,h]`` and the resampled marginals are ``rc @ M``
-    (length G, computed once per iteration and shared across genes). Gene
-    ``g``'s whole co-occurrence row is ``(rc masked to g's present cells) @ M``,
-    so no per-pair column gather is ever materialized.
+    Two per-iteration paths, selected by ``subsample_size``:
+
+    * ``subsample_size is None`` (FULL path): resample all ``C`` cells.
+      With ``rc = bincount(resampled cell indices, minlength=C)`` (a per-cell
+      multiplicity vector), the bootstrap co-occurrence of ``(g, h)`` is
+      ``Σ_c rc[c]·M[c,g]·M[c,h]`` and the resampled marginals are ``rc @ M``
+      (length G, computed once per iteration and shared across genes). Gene
+      ``g``'s whole co-occurrence row is ``(rc masked to g's present cells) @ M``,
+      so no per-pair column gather is ever materialized. ``N_b = C``.
+
+    * ``subsample_size = s`` (SUBSAMPLE path): draw ``s`` cells (with
+      replacement) per iteration and slice ``M_samp = M[draw]`` (an ``s``-row
+      CSR; replacement duplicates ARE the bootstrap multiplicity). The
+      resampled marginals are ``M_samp.sum(0)`` and gene ``g``'s co-row is
+      ``M_samp[rows where g present].sum(0)``, so the per-gene matvec costs
+      ``min(k_g, s)`` instead of full ``k_g`` — capping high-detection genes.
+      ``N_b = s``. The alpha-smoothed PMI/NPMI formula and the settle cascade
+      are identical to the full path.
 
     ``batches`` is a list of ``(start, end)`` index ranges into ``order``;
     each pair is owned (bootstrapped) exactly once via the ``_owned_partners``
@@ -1269,6 +1284,11 @@ def _bootstrap_gene_rows(
 
     Mcsc = M.tocsc()
     C = M.shape[0]
+    # subsample=False → FULL path (resample all C cells, rc-multiplicity matvec,
+    # bitwise-identical to the pre-change kernel). subsample=True → draw `s`
+    # cells/iteration and cap the per-gene matvec at min(k_g, s).
+    subsample = subsample_size is not None
+    s_cells = int(subsample_size) if subsample else C
     rows: list[int] = []
     cols: list[int] = []
     vals: list[float] = []
@@ -1336,7 +1356,7 @@ def _bootstrap_gene_rows(
             flat_legacy[s] = legacy_for_W[refs]
             t += len(partners)
 
-        N_b = float(C)
+        N_b = float(s_cells) if subsample else float(C)
         n_done = 0
         while n_done < max_bootstraps and unsettled.any():
             block = coarse_block if n_done == 0 else refine_block
@@ -1351,28 +1371,61 @@ def _bootstrap_gene_rows(
             # replacing the per-(pair,iter) python append.
             buf = np.empty((n_owned, block), dtype=np.float64)
             for bi in range(block):
-                draw = rng.integers(0, C, size=C)
-                rc = np.bincount(draw, minlength=C).astype(np.float64)
-                marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
-                for (g, partners, s, gc) in seg_slices:
-                    if not unsettled[s].any():
-                        continue
-                    # Row-restricted co-occurrence: only touch g's present cells
-                    # (O(nnz of those rows)) instead of `w @ M` which iterates
-                    # every nonzero of M. Mathematically identical: each present
-                    # cell's M-row is weighted by its resample multiplicity rc[c]
-                    # then summed to the length-G co-occurrence row.
-                    co_row = np.asarray(
-                        M[gc].multiply(rc[gc][:, None]).sum(axis=0)
-                    ).ravel()
-                    co = co_row[partners]
-                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
-                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
-                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        pmi = np.log(Pij / (Pi * Pj))
-                        val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
-                    buf[s, bi] = val
+                # RNG discipline: exactly one `rng.integers(0, C, size=iter_size)`
+                # per iteration in BOTH paths (iter_size == C in the full path,
+                # == s_cells in the subsample path) so the draw order is fixed.
+                if not subsample:
+                    # FULL path — UNCHANGED. Resample all C cells; co-occurrence
+                    # via the rc-multiplicity matvec on g's hoisted present cells.
+                    draw = rng.integers(0, C, size=C)
+                    rc = np.bincount(draw, minlength=C).astype(np.float64)
+                    marg = np.asarray(rc @ M).ravel()   # length-G resampled marginals
+                    for (g, partners, s, gc) in seg_slices:
+                        if not unsettled[s].any():
+                            continue
+                        # Row-restricted co-occurrence: only touch g's present cells
+                        # (O(nnz of those rows)) instead of `w @ M` which iterates
+                        # every nonzero of M. Mathematically identical: each present
+                        # cell's M-row is weighted by its resample multiplicity rc[c]
+                        # then summed to the length-G co-occurrence row.
+                        co_row = np.asarray(
+                            M[gc].multiply(rc[gc][:, None]).sum(axis=0)
+                        ).ravel()
+                        co = co_row[partners]
+                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            pmi = np.log(Pij / (Pi * Pj))
+                            val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
+                        buf[s, bi] = val
+                else:
+                    # SUBSAMPLE path. Draw s cells WITH replacement; slice an
+                    # s-row CSR (replacement duplicates are the bootstrap
+                    # multiplicity). The bootstrap co-occurrence of (g, h) over
+                    # the s drawn cells is Σ_{drawn c} M[c,g]·M[c,h], which equals
+                    # M_samp[rows where g present].sum(0)[h] (verified by the
+                    # co-count identity). Marginals are M_samp.sum(0). N_b = s.
+                    draw = rng.integers(0, C, size=s_cells)
+                    M_samp = M[draw]
+                    marg = np.asarray(M_samp.sum(axis=0)).ravel()  # length-G
+                    M_samp_csc = M_samp.tocsc()
+                    for (g, partners, s, gc) in seg_slices:
+                        if not unsettled[s].any():
+                            continue
+                        # Rows of M_samp where g is present (≤ s). Per-gene matvec
+                        # now scales with min(k_g, s), not full k_g.
+                        gc_s = M_samp_csc.indices[
+                            M_samp_csc.indptr[g]:M_samp_csc.indptr[g + 1]]
+                        co_row = np.asarray(M_samp[gc_s].sum(axis=0)).ravel()
+                        co = co_row[partners]
+                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            pmi = np.log(Pij / (Pi * Pj))
+                            val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
+                        buf[s, bi] = val
             n_done += block
 
             # Extend each unsettled pair's sample store with this block's
@@ -1505,7 +1558,9 @@ def _bootstrap_from_presence(
 
     ``kernel="pair_gather"`` runs the original per-pair column-gather while
     loop (bitwise-identical to the pre-refactor behavior). ``kernel="gene_row"``
-    is implemented in a later task and currently raises ``NotImplementedError``.
+    runs the resample-multiplicity matvec kernel; it honors ``subsample_size``
+    (``None`` → full-``C`` resampling; ``s`` → per-iteration cell cap) and
+    raises ``NotImplementedError`` only for dual-tau (weak kinds).
 
     The ``gene_order`` / ``gene_batch_peak_gb`` / ``checkpoint_path`` params are
     plumbed through for the gene-row kernel and are unused by ``pair_gather``.
@@ -1784,20 +1839,17 @@ def _bootstrap_from_presence(
         # directly with their legacy point-estimate value.
         #
         # The gene-row settle logic (`_classify_ci`) implements the scalar-tau
-        # cascade (pos_strong / neg_strong / tight_null) and resamples the full
-        # C cells per iteration. Dual-tau "weak" kinds and `subsample_size` are
-        # NOT supported here — fail loud rather than silently diverge from
-        # `pair_gather`, which does support them.
+        # cascade (pos_strong / neg_strong / tight_null). With
+        # ``subsample_size=None`` it resamples the full C cells per iteration
+        # (rc-multiplicity matvec); with ``subsample_size=s`` it draws s cells
+        # per iteration and caps the per-gene matvec at min(k_g, s). Dual-tau
+        # "weak" kinds are still NOT supported here — fail loud rather than
+        # silently diverge from `pair_gather`, which does support them.
         if _is_dual_tau:
             raise NotImplementedError(
                 "bootstrap_kernel='gene_row' supports scalar `tau` only "
                 "(no dual-tau weak kinds). Use bootstrap_kernel='pair_gather' "
                 "for a (tau_low, tau_high) sequence."
-            )
-        if subsample_size is not None:
-            raise NotImplementedError(
-                "bootstrap_kernel='gene_row' does not support `subsample_size`. "
-                "Use bootstrap_kernel='pair_gather'."
             )
         k = np.asarray(M.sum(0)).ravel().astype(np.float64)
         legacy_l1 = None
@@ -1830,7 +1882,8 @@ def _bootstrap_from_presence(
             tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
             coarse_block=coarse_block, refine_block=refine_block,
             min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
-            seed=seed, show_progress=show_progress)
+            seed=seed, show_progress=show_progress,
+            subsample_size=subsample_size)
         out_rows.extend(rows4)
         out_cols.extend(cols4)
         out_vals.extend(vals4)
