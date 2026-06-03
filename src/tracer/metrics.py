@@ -427,6 +427,7 @@ def _bootstrap_npmi_for_pairs(
     pairs_j: np.ndarray,
     alpha: float = 0.0,
     metric: str = "npmi",
+    pmi_formula: str = "jeffreys",
 ):
     """Vectorized PMI or NPMI for the given upper-triangle pair list on
     a bootstrap-sampled presence matrix.
@@ -438,28 +439,53 @@ def _bootstrap_npmi_for_pairs(
     Parameters
     ----------
     alpha : float
-        Beta(alpha, alpha) Jeffreys-style additive smoothing. ``alpha=0``
-        is the unsmoothed estimator: pairs with ``k_ij=0`` in this
-        bootstrap iteration return NaN (the caller filters these). With
-        ``alpha>0`` (e.g. 0.5 for Jeffreys), smoothed probabilities are
-        ``(k + alpha) / (N + 2 * alpha)``; every pair returns a finite
-        value (no filtering needed). Smoothing eliminates the "log of
-        zero" iter dropping, which biases the bootstrap median upward
-        (less negative) for pairs with k_ij_full=1 by removing the most-
-        negative iters from the sample.
+        Additive smoothing. Interpretation depends on ``pmi_formula``:
+
+        * ``"jeffreys"`` (default): Beta(alpha, alpha) Jeffreys-style
+          additive smoothing on BOTH joint and marginals,
+          ``(k + alpha) / (N + 2 * alpha)``.
+        * ``"epsilon"``: numerator-only smoothing — ``alpha`` is added to
+          the joint count only (``(k + alpha) / N``); marginals are
+          unsmoothed. Equivalently ``P_ij + eps`` where ``eps = alpha/N``.
     metric : {"npmi", "pmi"}
         Which scale to return. Affects per-iteration return value AND
         therefore the downstream bootstrap median/CI. tau thresholds in
         the parent ``compute_pmi_bootstrap`` are interpreted in this
         same metric.
+    pmi_formula : {"jeffreys", "epsilon"}
+        Smoothing formula. See ``alpha`` above. The ``"jeffreys"`` path is
+        bitwise-unchanged from earlier code; ``"epsilon"`` is the unified
+        formula matched by the Stage 1 (neg_one) and Stage 2 (legacy)
+        builders when the parent passes ``pmi_formula="epsilon"``.
     """
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+    if pmi_formula not in ("jeffreys", "epsilon"):
+        raise ValueError(
+            f"pmi_formula must be 'jeffreys' or 'epsilon' (got {pmi_formula!r})"
+        )
     N_b = M_sample.shape[0]
     marg = np.asarray(M_sample.sum(axis=0)).ravel().astype(np.int64)
     Mi = M_sample[:, pairs_i]
     Mj = M_sample[:, pairs_j]
     co = np.asarray(Mi.multiply(Mj).sum(axis=0)).ravel().astype(np.int64)
+
+    if pmi_formula == "epsilon" and alpha > 0:
+        # Numerator-only smoothing: marginals are unsmoothed; only the
+        # joint gets an alpha bump. P_ij = (k + alpha) / N_b is always > 0
+        # so no `valid` mask is needed. Pi/Pj > 0 whenever the pair came
+        # from observed-cooccur data; if either marginal is zero we still
+        # NaN (no filtering — np.log(0) → -inf, divide produces NaN).
+        Pij = (co + alpha) / N_b
+        Pi = marg[pairs_i] / N_b
+        Pj = marg[pairs_j] / N_b
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.log(Pij / (Pi * Pj))
+            if metric == "pmi":
+                out = pmi
+            else:
+                out = pmi / (-np.log(Pij))
+        return out
 
     if alpha > 0:
         # Jeffreys-style additive smoothing — all probabilities > 0, no
@@ -518,6 +544,7 @@ def compute_pmi_bootstrap(
     metric: str = "npmi",
     expected_cooccur_for_neg_one: float | None = None,  # deprecated alias
     alpha: float = 0.1,
+    pmi_formula: str = "jeffreys",
     min_expected_cooccur_for_bootstrap: float | None = None,
     set_neg_one: bool = True,
     nuclear_only: bool = False,
@@ -648,6 +675,10 @@ def compute_pmi_bootstrap(
 
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+    if pmi_formula not in ("jeffreys", "epsilon"):
+        raise ValueError(
+            f"pmi_formula must be 'jeffreys' or 'epsilon' (got {pmi_formula!r})"
+        )
     if ci_accumulator not in ("samples", "counter"):
         raise ValueError(
             f"ci_accumulator must be 'samples' or 'counter' (got {ci_accumulator!r})"
@@ -693,7 +724,8 @@ def compute_pmi_bootstrap(
             coarse_block=coarse_block, refine_block=refine_block,
             min_expected_cooccur_for_evidence=min_expected_cooccur_for_evidence,
             min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
-            min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+            min_samples_for_ci=min_samples_for_ci, alpha=alpha,
+            pmi_formula=pmi_formula, metric=metric,
             set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
             persist_ci=persist_ci, ci_accumulator=ci_accumulator,
             subsample_size=subsample_size,
@@ -932,7 +964,8 @@ def compute_pmi_bootstrap(
         coarse_block=coarse_block, refine_block=refine_block,
         min_expected_cooccur_for_evidence=min_expected_cooccur_for_evidence,
         min_expected_cooccur_for_bootstrap=min_expected_cooccur_for_bootstrap,
-        min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+        min_samples_for_ci=min_samples_for_ci, alpha=alpha,
+        pmi_formula=pmi_formula, metric=metric,
         set_neg_one=set_neg_one, seed=seed, show_progress=show_progress,
         persist_ci=persist_ci, ci_accumulator=ci_accumulator,
         subsample_size=subsample_size,
@@ -1121,6 +1154,7 @@ def _bootstrap_pairs_gather(
     metric,
     persist_ci,
     show_progress,
+    pmi_formula: str = "jeffreys",
 ):
     """Per-pair column-gather active-sampling bootstrap (Stage 4).
 
@@ -1176,6 +1210,7 @@ def _bootstrap_pairs_gather(
             M_b = M[sample_idx]
             npmi_block = _bootstrap_npmi_for_pairs(
                 M_b, i_un, j_un, alpha=alpha, metric=metric,
+                pmi_formula=pmi_formula,
             )
             for kk, gk in enumerate(un_idx):
                 v = npmi_block[kk]
@@ -1311,6 +1346,7 @@ def _bootstrap_gene_rows(
     tau, ci_level, max_bootstraps, coarse_block, refine_block,
     min_samples_for_ci, alpha, metric, seed, show_progress,
     subsample_size=None, ci_accumulator="samples",
+    pmi_formula: str = "jeffreys",
 ):
     """Gene-row (resample-multiplicity matvec) bootstrap over owned pairs.
 
@@ -1483,9 +1519,15 @@ def _bootstrap_gene_rows(
                             M[gc].multiply(rc[gc][:, None]).sum(axis=0)
                         ).ravel()
                         co = co_row[partners]
-                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
-                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
-                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                        if pmi_formula == "epsilon":
+                            # Numerator-only smoothing; marginals unsmoothed.
+                            Pij = (co + alpha) / N_b
+                            Pi = marg[g] / N_b
+                            Pj = marg[partners] / N_b
+                        else:
+                            Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                            Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                            Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
                         with np.errstate(divide="ignore", invalid="ignore"):
                             pmi = np.log(Pij / (Pi * Pj))
                             val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
@@ -1510,9 +1552,14 @@ def _bootstrap_gene_rows(
                             M_samp_csc.indptr[g]:M_samp_csc.indptr[g + 1]]
                         co_row = np.asarray(M_samp[gc_s].sum(axis=0)).ravel()
                         co = co_row[partners]
-                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
-                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
-                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                        if pmi_formula == "epsilon":
+                            Pij = (co + alpha) / N_b
+                            Pi = marg[g] / N_b
+                            Pj = marg[partners] / N_b
+                        else:
+                            Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                            Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                            Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
                         with np.errstate(divide="ignore", invalid="ignore"):
                             pmi = np.log(Pij / (Pi * Pj))
                             val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
@@ -1647,6 +1694,7 @@ def _bootstrap_gene_rows_counter(
     *, G, tau, ci_level, max_bootstraps, coarse_block, refine_block,
     min_samples_for_ci, alpha, metric, seed, show_progress,
     subsample_size=None,
+    pmi_formula: str = "jeffreys",
 ):
     """SINGLE-PASS counter-mode gene-row bootstrap over ALL owned pairs.
 
@@ -1753,9 +1801,14 @@ def _bootstrap_gene_rows_counter(
                         M[gc].multiply(rc[gc][:, None]).sum(axis=0)
                     ).ravel()
                     co = co_row[partners]
-                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
-                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
-                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                    if pmi_formula == "epsilon":
+                        Pij = (co + alpha) / N_b
+                        Pi = marg[g] / N_b
+                        Pj = marg[partners] / N_b
+                    else:
+                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
                     with np.errstate(divide="ignore", invalid="ignore"):
                         pmi = np.log(Pij / (Pi * Pj))
                         val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
@@ -1781,9 +1834,14 @@ def _bootstrap_gene_rows_counter(
                         M_samp_csc.indptr[g]:M_samp_csc.indptr[g + 1]]
                     co_row = np.asarray(M_samp[gc_s].sum(axis=0)).ravel()
                     co = co_row[partners]
-                    Pij = (co + alpha) / (N_b + 2.0 * alpha)
-                    Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
-                    Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
+                    if pmi_formula == "epsilon":
+                        Pij = (co + alpha) / N_b
+                        Pi = marg[g] / N_b
+                        Pj = marg[partners] / N_b
+                    else:
+                        Pij = (co + alpha) / (N_b + 2.0 * alpha)
+                        Pi = (marg[g] + alpha) / (N_b + 2.0 * alpha)
+                        Pj = (marg[partners] + alpha) / (N_b + 2.0 * alpha)
                     with np.errstate(divide="ignore", invalid="ignore"):
                         pmi = np.log(Pij / (Pi * Pj))
                         val = pmi if metric == "pmi" else pmi / (-np.log(Pij))
@@ -1863,6 +1921,7 @@ def _bootstrap_from_presence(
     min_expected_cooccur_for_bootstrap: float | None = None,
     min_samples_for_ci: int = 30,
     alpha: float = 0.1,
+    pmi_formula: str = "jeffreys",
     metric: str = "npmi",
     set_neg_one: bool = True,
     seed: int | None = None,
@@ -1896,6 +1955,10 @@ def _bootstrap_from_presence(
     """
     if metric not in ("npmi", "pmi"):
         raise ValueError(f"metric must be 'npmi' or 'pmi' (got {metric!r})")
+    if pmi_formula not in ("jeffreys", "epsilon"):
+        raise ValueError(
+            f"pmi_formula must be 'jeffreys' or 'epsilon' (got {pmi_formula!r})"
+        )
     if kernel not in ("pair_gather", "gene_row"):
         raise ValueError(f"unknown bootstrap_kernel {kernel!r}")
     if ci_accumulator not in ("samples", "counter"):
@@ -1984,14 +2047,42 @@ def _bootstrap_from_presence(
             E_full = float(E_full_all[idx])
             if E_full >= thr and set_neg_one:
                 # k=0 with high expected count → mutual exclusion.
-                # NPMI sentinel = -1 (perfect avoidance limit).
-                # PMI sentinel  = -log(E_full)  (the PMI you'd see at k=1, the
-                # smallest possible non-zero cooccur — a finite proxy for -∞).
+                # JEFFREYS path (default): emit sentinel values.
+                #   NPMI sentinel = -1 (perfect avoidance limit).
+                #   PMI sentinel  = -log(E_full) (the PMI you'd see at k=1,
+                #   a finite proxy for -∞).
+                # EPSILON path: fold k=0 into the unified formula
+                #   PMI = log((alpha/C) / (p_i * p_j))
+                #       = log(alpha) - log(p_i * p_j * C)
+                #       = log(alpha) - log(E_full)
+                #   NPMI = PMI / -log(alpha/C). Note NPMI is no longer
+                #   exactly -1 under epsilon — it's alpha-dependent.
                 # When set_neg_one=False, this branch is skipped and the
                 # pair falls through to the "indeterminate" classification
                 # below — matches the legacy compute_npmi default.
-                npmi_sentinel = -1.0
-                pmi_sentinel = float(-np.log(E_full)) if E_full > 0 else np.nan
+                if pmi_formula == "epsilon":
+                    eps = float(alpha) / float(C)
+                    if eps <= 0.0:
+                        # Degenerate: alpha=0 means the unified formula
+                        # diverges for k=0. Fall back to the jeffreys
+                        # sentinel rather than emitting -inf / NaN.
+                        npmi_sentinel = -1.0
+                        pmi_sentinel = (float(-np.log(E_full))
+                                        if E_full > 0 else np.nan)
+                    else:
+                        # p_i * p_j > 0 by virtue of E_full > 0.
+                        p_i = float(p_global[i])
+                        p_j = float(p_global[j])
+                        denom = p_i * p_j
+                        if denom > 0:
+                            pmi_sentinel = float(np.log(eps / denom))
+                            npmi_sentinel = float(pmi_sentinel / (-np.log(eps)))
+                        else:
+                            npmi_sentinel = -1.0
+                            pmi_sentinel = np.nan
+                else:
+                    npmi_sentinel = -1.0
+                    pmi_sentinel = float(-np.log(E_full)) if E_full > 0 else np.nan
                 w_value = pmi_sentinel if metric == "pmi" else npmi_sentinel
                 out_rows.append(i); out_cols.append(j); out_vals.append(w_value)
                 n_neg_one += 1
@@ -2030,12 +2121,23 @@ def _bootstrap_from_presence(
     p_ij_full = obs_k.astype(np.float64) / C
     legacy_npmi = np.full(obs_i.size, np.nan, dtype=np.float64)
     legacy_pmi = np.full(obs_i.size, np.nan, dtype=np.float64)
-    valid = (p_ij_full > 0) & (p_i_obs > 0) & (p_j_obs > 0)
-    if valid.any():
+    if pmi_formula == "epsilon" and float(alpha) > 0:
+        # Epsilon path: numerator-only smoothing. P_ij + eps = (k + alpha)/C
+        # is always > 0 so no `valid` mask is needed. Marginals are unsmoothed;
+        # rows here come from observed cooccur so p_i_obs/p_j_obs > 0.
+        eps = float(alpha) / float(C)
+        p_ij_eps = p_ij_full + eps
         with np.errstate(divide="ignore", invalid="ignore"):
-            pmi_v = np.log(p_ij_full[valid] / (p_i_obs[valid] * p_j_obs[valid]))
-            legacy_pmi[valid] = pmi_v
-            legacy_npmi[valid] = pmi_v / (-np.log(p_ij_full[valid]))
+            pmi_v = np.log(p_ij_eps / (p_i_obs * p_j_obs))
+            legacy_pmi[:] = pmi_v
+            legacy_npmi[:] = pmi_v / (-np.log(p_ij_eps))
+    else:
+        valid = (p_ij_full > 0) & (p_i_obs > 0) & (p_j_obs > 0)
+        if valid.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pmi_v = np.log(p_ij_full[valid] / (p_i_obs[valid] * p_j_obs[valid]))
+                legacy_pmi[valid] = pmi_v
+                legacy_npmi[valid] = pmi_v / (-np.log(p_ij_full[valid]))
 
     # Which of the two is the canonical W value depends on `metric`.
     legacy_for_W = legacy_pmi if metric == "pmi" else legacy_npmi
@@ -2162,7 +2264,8 @@ def _bootstrap_from_presence(
                 tau_low=tau_low, tau_high=tau_high, ci_level=ci_level,
                 max_bootstraps=max_bootstraps, coarse_block=coarse_block,
                 refine_block=refine_block, min_samples_for_ci=min_samples_for_ci,
-                alpha=alpha, metric=metric, persist_ci=persist_ci,
+                alpha=alpha, pmi_formula=pmi_formula,
+                metric=metric, persist_ci=persist_ci,
                 show_progress=show_progress,
             )
         )
@@ -2232,6 +2335,7 @@ def _bootstrap_from_presence(
                 G=G, tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
                 coarse_block=coarse_block, refine_block=refine_block,
                 min_samples_for_ci=min_samples_for_ci, alpha=alpha,
+                pmi_formula=pmi_formula,
                 metric=metric, seed=seed, show_progress=show_progress,
                 subsample_size=subsample_size)
         else:
@@ -2244,7 +2348,9 @@ def _bootstrap_from_presence(
                 batches=batches, checkpoint_path=checkpoint_path, G=G,
                 tau=tau, ci_level=ci_level, max_bootstraps=max_bootstraps,
                 coarse_block=coarse_block, refine_block=refine_block,
-                min_samples_for_ci=min_samples_for_ci, alpha=alpha, metric=metric,
+                min_samples_for_ci=min_samples_for_ci, alpha=alpha,
+                pmi_formula=pmi_formula,
+                metric=metric,
                 seed=seed, show_progress=show_progress,
                 subsample_size=subsample_size, ci_accumulator=ci_accumulator)
         out_rows.extend(rows4)

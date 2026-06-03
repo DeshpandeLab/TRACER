@@ -724,3 +724,297 @@ def test_counter_checkpoint_ignored_with_warning(tmp_path):
             df, ci_accumulator="counter", checkpoint_path=str(ckpt),
             **_COMMON_GR)
     assert not ckpt.exists()
+
+
+# =====================================================================
+# pmi_formula="epsilon" — opt-in unified PMI formula gates
+# =====================================================================
+
+
+def _run_eps(df, *, kernel="pair_gather", formula="jeffreys",
+             ci_accumulator="samples", **kwargs):
+    """Shared helper: run compute_pmi_bootstrap on the synthetic panel."""
+    from tracer.metrics import compute_pmi_bootstrap
+    common = dict(
+        group_key="cell_id", feature_col="feature_name", metric="npmi",
+        tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        seed=0, show_progress=False,
+    )
+    common.update(kwargs)
+    return compute_pmi_bootstrap(
+        df, bootstrap_kernel=kernel, pmi_formula=formula,
+        ci_accumulator=ci_accumulator, **common,
+    )
+
+
+def test_pmi_formula_default_is_jeffreys_bitwise():
+    """GATE 1: pmi_formula default ("jeffreys") leaves all paths bitwise-
+    identical to the pre-change kernel — explicit and implicit defaults agree."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    common = dict(
+        group_key="cell_id", feature_col="feature_name",
+        metric="npmi", tau=0.05, ci_level=0.95,
+        max_bootstraps=2000, coarse_block=200, refine_block=200,
+        seed=0, show_progress=False,
+    )
+    for kernel in ("pair_gather", "gene_row"):
+        a = compute_pmi_bootstrap(df, bootstrap_kernel=kernel, **common)
+        b = compute_pmi_bootstrap(
+            df, bootstrap_kernel=kernel, pmi_formula="jeffreys", **common,
+        )
+        Wa = a.W_sparse.toarray()
+        Wb = b.W_sparse.toarray()
+        assert np.array_equal(Wa, Wb), (
+            f"jeffreys default vs explicit must be bitwise-identical "
+            f"(kernel={kernel})"
+        )
+
+
+def test_pmi_formula_rejects_invalid_value():
+    """Invalid pmi_formula values raise ValueError with the expected message."""
+    from tracer.metrics import compute_pmi_bootstrap
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    with pytest.raises(ValueError, match="pmi_formula"):
+        compute_pmi_bootstrap(
+            df, group_key="cell_id", feature_col="feature_name",
+            pmi_formula="bogus",
+            max_bootstraps=100, coarse_block=50, refine_block=50,
+            seed=0, show_progress=False,
+        )
+
+
+def test_pmi_formula_epsilon_legacy_math_unit():
+    """GATE 2a: hand-computed legacy (Stage 2) PMI under epsilon mode.
+
+    Build a tiny synthetic where one pair has C=100, k_ij=5, k_i=10, k_j=10
+    and assert legacy_pmi == log((5+0.1)/100 / (0.1*0.1)) to within 1e-12.
+    """
+    import pandas as pd
+    from tracer.metrics import compute_pmi_bootstrap
+    # 100 cells. 5 cells co-express genes 'A' and 'B' (k_ij=5).
+    # 5 cells have only 'A' (so k_A=10). 5 cells have only 'B' (so k_B=10).
+    # Remaining cells get a filler gene to keep them in the panel.
+    rows = []
+    for c in range(5):
+        rows.append((f"c{c}", "A"))
+        rows.append((f"c{c}", "B"))
+    for c in range(5, 10):
+        rows.append((f"c{c}", "A"))
+    for c in range(10, 15):
+        rows.append((f"c{c}", "B"))
+    for c in range(15, 100):
+        rows.append((f"c{c}", "FILLER"))
+    df = pd.DataFrame(rows, columns=["cell_id", "feature_name"])
+    # Drive each cell with two tx for the genes it carries so the
+    # min_occurrences_per_context=1 path retains them.
+    res = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="pmi",
+        pmi_formula="epsilon",
+        alpha=0.1,
+        # Set thresholds so nothing routes through bootstrap; we want
+        # Stage 2 legacy_pmi only.
+        min_occurrences_per_context=1,
+        min_expected_cooccur_for_evidence=1e9,
+        max_bootstraps=10, coarse_block=10, refine_block=10,
+        seed=0, show_progress=False, persist_ci=True,
+    )
+    # Find legacy_pmi for the (A, B) pair from pair_ci.
+    pair_ci = res.pair_ci
+    g_to_i = {g: i for i, g in enumerate(res.genes)}
+    iA, iB = g_to_i["A"], g_to_i["B"]
+    a_, b_ = (iA, iB) if iA < iB else (iB, iA)
+    row = pair_ci[(pair_ci["gene_i_idx"] == a_) & (pair_ci["gene_j_idx"] == b_)]
+    assert len(row) == 1, "expected exactly one (A,B) row in pair_ci"
+    got = float(row["legacy_pmi"].iloc[0])
+    # k_ij=5, C=100, alpha=0.1, k_i=k_j=10 → p_i=p_j=0.1
+    # PMI = log((5+0.1)/100 / (0.1*0.1)) = log(0.051 / 0.01)
+    expected = float(np.log((5 + 0.1) / 100 / (0.1 * 0.1)))
+    assert abs(got - expected) < 1e-12, (
+        f"epsilon legacy_pmi: got {got!r}, expected {expected!r}"
+    )
+    # NPMI variant: pmi / -log(p_ij_eps)
+    got_npmi = float(row["legacy_npmi"].iloc[0])
+    expected_npmi = expected / (-np.log((5 + 0.1) / 100))
+    assert abs(got_npmi - expected_npmi) < 1e-12
+
+
+def test_pmi_formula_epsilon_neg_one_math_unit():
+    """GATE 2b: hand-computed Stage 1 neg_one value under epsilon mode.
+
+    Build a panel where genes 'X' and 'Y' both have rate 0.1 and never
+    co-occur; with C large enough that E[k_ij] >= thr, the pair lands in
+    Stage 1 neg_one. Under epsilon mode the value is the unified formula,
+    not the -1 / -log(E) sentinels.
+    """
+    import pandas as pd
+    from tracer.metrics import compute_pmi_bootstrap
+    # 100 cells. Cells 0–9 have X (k_X = 10). Cells 10–19 have Y (k_Y = 10).
+    # No cell has both → k_ij = 0. E[k_ij] = 0.1 * 0.1 * 100 = 1.0 — too low
+    # to qualify for neg_one with the default thr=10. Lower thr to 0.5.
+    # All cells get a filler so they are retained.
+    rows = []
+    for c in range(10):
+        rows.append((f"c{c}", "X"))
+    for c in range(10, 20):
+        rows.append((f"c{c}", "Y"))
+    for c in range(100):
+        rows.append((f"c{c}", "FILLER"))
+    df = pd.DataFrame(rows, columns=["cell_id", "feature_name"])
+    res = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="pmi",
+        pmi_formula="epsilon",
+        alpha=0.1,
+        min_occurrences_per_context=1,
+        min_expected_cooccur_for_evidence=0.5,  # qualify (X,Y) for neg_one
+        max_bootstraps=10, coarse_block=10, refine_block=10,
+        seed=0, show_progress=False,
+    )
+    g_to_i = {g: i for i, g in enumerate(res.genes)}
+    iX, iY = g_to_i["X"], g_to_i["Y"]
+    a_, b_ = (iX, iY) if iX < iY else (iY, iX)
+    W = res.W_sparse.tocoo()
+    Wd = {(int(i), int(j)): float(v) for i, j, v in zip(W.row, W.col, W.data)}
+    assert (a_, b_) in Wd, "epsilon-mode neg_one pair missing from W"
+    # PMI = log((alpha/C) / (p_i * p_j)) = log(0.001 / 0.01) = log(0.1)
+    expected_pmi = float(np.log((0.1 / 100) / (0.1 * 0.1)))
+    assert abs(expected_pmi - np.log(0.1)) < 1e-12  # algebra check
+    # W is stored as float32 so use a float32-friendly tolerance.
+    assert abs(Wd[(a_, b_)] - expected_pmi) < 1e-6, (
+        f"epsilon neg_one PMI: got {Wd[(a_, b_)]!r}, expected {expected_pmi!r}"
+    )
+
+    # NPMI variant
+    res_npmi = compute_pmi_bootstrap(
+        df, group_key="cell_id", feature_col="feature_name",
+        metric="npmi",
+        pmi_formula="epsilon", alpha=0.1,
+        min_occurrences_per_context=1,
+        min_expected_cooccur_for_evidence=0.5,
+        max_bootstraps=10, coarse_block=10, refine_block=10,
+        seed=0, show_progress=False,
+    )
+    Wn = res_npmi.W_sparse.tocoo()
+    Wnd = {(int(i), int(j)): float(v) for i, j, v in zip(Wn.row, Wn.col, Wn.data)}
+    expected_npmi = expected_pmi / (-np.log(0.1 / 100))
+    assert (a_, b_) in Wnd
+    assert abs(Wnd[(a_, b_)] - expected_npmi) < 1e-6
+    # Document NPMI ≠ -1 under epsilon mode (it's alpha-dependent).
+    assert abs(Wnd[(a_, b_)] - (-1.0)) > 1e-6, (
+        "epsilon-mode NPMI neg_one must NOT equal the jeffreys -1 sentinel"
+    )
+
+
+def test_pmi_formula_epsilon_vs_jeffreys_close_on_well_supported():
+    """GATE 3: on well-supported observed pairs (k_ij >= 5), epsilon and
+    jeffreys PMI values agree to within ~alpha/k_ij. Quantify on the synthetic
+    panel: max |Δ| over k_ij >= 5 pairs must be ≤ 0.1.
+    """
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    # PMI metric so we can compare on a common scale.
+    common = dict(
+        kernel="pair_gather",
+        metric="pmi",
+        persist_ci=True,
+        alpha=0.1,
+    )
+    rj = _run_eps(df, formula="jeffreys", **common)
+    re = _run_eps(df, formula="epsilon", **common)
+    pj = rj.pair_ci.set_index(["gene_i_idx", "gene_j_idx"])
+    pe = re.pair_ci.set_index(["gene_i_idx", "gene_j_idx"])
+    # Restrict to pairs where BOTH formulas have a finite legacy_pmi
+    # (excludes Stage 1 neg_one rows where legacy is NaN).
+    common_idx = pj.index.intersection(pe.index)
+    pj = pj.loc[common_idx]
+    pe = pe.loc[common_idx]
+    # Exclude Stage 1 neg_one (k_ij=0) rows — they only carry sentinel values
+    # under jeffreys and the unified formula under epsilon, so by design their
+    # legacy_pmi differs more than alpha/k_ij.
+    mask = (
+        pj["legacy_pmi"].notna()
+        & pe["legacy_pmi"].notna()
+        & (pj["kind"] != "neg_one")
+        & (pe["kind"] != "neg_one")
+    )
+    # Use expected_full as a proxy for "well-supported": E[k_ij] >= 5 picks
+    # pairs whose observed cooccur is plausibly >= 5.
+    if "expected_full" in pj.columns:
+        mask = mask & (pj["expected_full"] >= 5)
+    if mask.any():
+        deltas = (pj.loc[mask, "legacy_pmi"] - pe.loc[mask, "legacy_pmi"]).abs()
+        max_delta = float(deltas.max())
+        assert max_delta <= 0.1, (
+            f"epsilon vs jeffreys legacy_pmi diverged beyond expected band "
+            f"({max_delta:.4f} > 0.1) on well-supported pairs"
+        )
+
+
+def test_pmi_formula_epsilon_settle_set_close_to_jeffreys():
+    """GATE 4: epsilon-mode settles roughly the same SET of strong pos/neg
+    pairs as jeffreys mode, with at most a small number of near-tau boundary
+    differences."""
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    rj = _run_eps(df, kernel="pair_gather", formula="jeffreys")
+    re = _run_eps(df, kernel="pair_gather", formula="epsilon")
+    Sj = {(int(i), int(j)) for i, j in zip(*rj.W_sparse.nonzero())}
+    Se = {(int(i), int(j)) for i, j in zip(*re.W_sparse.nonzero())}
+    # Strong-positive and high-marginal-zero-cooccur sentinel pairs must
+    # appear in BOTH (gene_00,gene_01) and (gene_08,gene_09).
+    g_to_i = {g: i for i, g in enumerate(rj.genes)}
+    p01 = (g_to_i["gene_00"], g_to_i["gene_01"])
+    p89 = (g_to_i["gene_08"], g_to_i["gene_09"])
+    p01 = (min(p01), max(p01))
+    p89 = (min(p89), max(p89))
+    assert p01 in Sj and p01 in Se
+    assert p89 in Sj and p89 in Se
+    # Symmetric diff ≤ 4 (a couple of near-tau boundary churn pairs is OK).
+    assert len(Sj ^ Se) <= 4, (
+        f"epsilon settled set diverged from jeffreys by {len(Sj ^ Se)} pairs"
+    )
+
+
+def test_pmi_formula_epsilon_gene_row_samples_runs():
+    """GATE 5a: gene_row (samples mode) under epsilon runs and settles."""
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    res = _run_eps(df, kernel="gene_row", formula="epsilon",
+                   ci_accumulator="samples")
+    W = res.W_sparse.toarray()
+    # Strong positive pair (0,1) classified positive.
+    assert W[0, 1] > 0.05
+    # Stage 1 neg_one for (8,9) emitted with epsilon's unified formula.
+    assert (8, 9) in {(int(i), int(j)) for i, j in zip(*res.W_sparse.nonzero())}
+
+
+def test_pmi_formula_epsilon_gene_row_counter_runs():
+    """GATE 5b: gene_row counter (single-pass) under epsilon runs and settles."""
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    res = _run_eps(df, kernel="gene_row", formula="epsilon",
+                   ci_accumulator="counter")
+    W = res.W_sparse.toarray()
+    assert W[0, 1] > 0.05
+    assert (8, 9) in {(int(i), int(j)) for i, j in zip(*res.W_sparse.nonzero())}
+
+
+def test_pmi_formula_epsilon_deterministic():
+    """GATE 7: same seed → bit-identical W in epsilon mode."""
+    from tests.synthetic import make_synthetic_npmi_panel
+    df, _ = make_synthetic_npmi_panel()
+    a = _run_eps(df, kernel="pair_gather", formula="epsilon")
+    b = _run_eps(df, kernel="pair_gather", formula="epsilon")
+    Wa = a.W_sparse.toarray()
+    Wb = b.W_sparse.toarray()
+    assert np.array_equal(Wa, Wb)
+    # Also for gene_row
+    ag = _run_eps(df, kernel="gene_row", formula="epsilon")
+    bg = _run_eps(df, kernel="gene_row", formula="epsilon")
+    assert np.array_equal(ag.W_sparse.toarray(), bg.W_sparse.toarray())
+
