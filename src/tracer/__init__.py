@@ -4,19 +4,11 @@ Convenience exports for commonly used functions and metadata.
 """
 
 __all__ = [
-    "metis_partition_cells",
-    "build_metis_partition_hulls",
-    "plot_metis_partitions",
-    "plot_metis_hulls",
-    "chunk_transcripts",
     "get_confident_nuclei_transcripts",
     # `compute_npmi` retired. The production tutorial caller
     # (process_melanoma_data.py) calls `compute_pmi_bootstrap`
     # directly; the unused imports in 2 other notebooks
-    # (lung_cancer/mouse_ileum metrics_umap.ipynb) were stripped. The
-    # 33-GB-blow-up dense implementation is preserved under
-    # `tracer.metrics._legacy_dense_compute_npmi` for one-off
-    # comparisons only.
+    # (lung_cancer/mouse_ileum metrics_umap.ipynb) were stripped.
     "compute_pmi_bootstrap",
     "PmiBootstrapResult",
     "build_cell_gene_matrix",
@@ -48,10 +40,6 @@ __all__ = [
     "signal_strength",
     "deltaC",
     "compute_housekeeping_mask",
-    "coherence_C_from_genes",
-    "coherence_C_from_genes_relu",
-    "deltaC_between_clusters",
-    "deltaC_between_clusters_relu",
     "compute_deltaC_stitch",
     "stitch_connected_components",
     "build_dense_pmi_matrix_small_panel",
@@ -85,19 +73,9 @@ __version__ = "0.1.1"
 __author__ = "Long Yuan <lyuan13@jhmi.edu>"
 __license__ = "MIT"
 
-from .tiling import (
-    metis_partition_cells,
-    build_metis_partition_hulls,
-    plot_metis_partitions,
-    plot_metis_hulls,
-    chunk_transcripts,
-)
 
 from .metrics import (
     get_confident_nuclei_transcripts,
-    # `compute_npmi` retired — production callers migrated to
-    # `compute_pmi_bootstrap`. Dense 33 GB blow-up implementation
-    # preserved at `_legacy_dense_compute_npmi` for explicit imports.
     compute_pmi_bootstrap,
     PmiBootstrapResult,
     build_cell_gene_matrix,
@@ -131,10 +109,6 @@ from .core import (
     signal_strength,
     deltaC,
     compute_housekeeping_mask,
-    coherence_C_from_genes,
-    coherence_C_from_genes_relu,
-    deltaC_between_clusters,
-    deltaC_between_clusters_relu,
     compute_deltaC_stitch,
     stitch_connected_components,
     build_dense_pmi_matrix_small_panel,
