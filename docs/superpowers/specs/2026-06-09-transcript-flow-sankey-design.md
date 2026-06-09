@@ -59,6 +59,18 @@ Snapshot columns *always* store full 5-class resolution; `class_grouping="five"`
 re-renders without re-running. The classifier is a single vectorized helper
 `_classify_etype_vec(id_series, etype_series) -> np.ndarray[int8]`.
 
+**Empirical note (2026-06-09, PDAC 500 µm ROI):** The modern SEG pipeline
+does not emit `component` (`UNASSIGNED_*` group entities are absorbed back
+into partials/mains by Stitch + Final-Rescue) and does not emit `dropped`
+at finalize (leftover `-1` tx are routed into the nearest entity rather
+than getting a `DROP` sentinel). Their bands therefore render as
+zero-height on SEG plots. The five-class vocabulary is kept anyway because
+(a) older saved runs may still contain these classes, (b) NOSEG cascade
+can still mint components in some configurations, and (c) the default
+3-class grouping collapses both into adjacent bands so the empty buckets
+are visually invisible. If a future SEG variant reintroduces them, no
+code change is needed — they appear automatically.
+
 ## 5. Logging hook
 
 ### 5.1 Snapshot helper + phase tiers
