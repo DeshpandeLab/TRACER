@@ -97,3 +97,48 @@ class TestPrepareFlowData:
                    (tidy["phase_to"] == "rescue")]
         edges = {(r.class_from, r.class_to): r.n for r in sub.itertuples()}
         assert (sl.CLASS_UNASSIGNED, sl.CLASS_DROPPED) not in edges
+
+
+class TestResolveView:
+    def test_seg_default(self):
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
+        phases = fp._resolve_view(df_cols, pipeline="seg", view="default")
+        assert phases == sl.PHASE_KEYS_SEG_DEFAULT
+
+    def test_noseg_default(self):
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_NOSEG_DEFAULT}
+        phases = fp._resolve_view(df_cols, pipeline="noseg", view="default")
+        assert phases == sl.PHASE_KEYS_NOSEG_DEFAULT
+
+    def test_auto_detects_seg(self):
+        # Presence of phase1 column → SEG
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
+        phases = fp._resolve_view(df_cols, pipeline="auto", view="default")
+        assert phases == sl.PHASE_KEYS_SEG_DEFAULT
+
+    def test_auto_detects_noseg(self):
+        # Presence of cascade column → NOSEG
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_NOSEG_DEFAULT}
+        phases = fp._resolve_view(df_cols, pipeline="auto", view="default")
+        assert phases == sl.PHASE_KEYS_NOSEG_DEFAULT
+
+    def test_seg_collapsed_returns_source_columns(self):
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
+        phases = fp._resolve_view(df_cols, pipeline="seg", view="collapsed")
+        # Collapsed view maps to TIER B SOURCE columns:
+        # input, rescue, post_group_rescue, final_rescue, finalize
+        assert phases == ["input", "rescue", "post_group_rescue",
+                          "final_rescue", "finalize"]
+
+    def test_verbose_missing_raises(self):
+        df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
+        with pytest.raises(KeyError, match="verbose"):
+            fp._resolve_view(df_cols, pipeline="seg", view="verbose")
+
+    def test_optional_phase_skipped(self):
+        # mid_qc absent → drop it from the resolved list
+        cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT
+                if p != "mid_qc"}  # mid_qc not in default anyway but keep test
+        phases = fp._resolve_view(cols, pipeline="seg", view="default")
+        assert "mid_qc" not in phases
+        assert "phase1" in phases  # other required ones still present

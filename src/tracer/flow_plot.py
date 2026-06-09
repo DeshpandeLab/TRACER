@@ -31,6 +31,60 @@ def _collapse_classes(codes: np.ndarray, grouping: str) -> np.ndarray:
     raise ValueError(f"class_grouping must be 'three' or 'five', got {grouping!r}")
 
 
+def _detect_pipeline(df_cols: set) -> str:
+    """Detect 'seg' vs 'noseg' from which snapshot columns are present."""
+    if "etype_at_phase1" in df_cols or "etype_at_prune" in df_cols:
+        return "seg"
+    if "etype_at_cascade" in df_cols:
+        return "noseg"
+    # Fallback: assume SEG (the more common pipeline)
+    return "seg"
+
+
+def _resolve_view(
+    df_cols: set,
+    *,
+    pipeline: str = "auto",
+    view: str = "default",
+) -> list[str]:
+    """Resolve a phase-key list given the snapshot columns present in df.
+
+    Filters out phase keys whose snapshot column isn't in df (optional or
+    skipped phases). Raises KeyError if a *required* column for the
+    requested view is missing.
+    """
+    if pipeline == "auto":
+        pipeline = _detect_pipeline(df_cols)
+
+    if view == "verbose":
+        keys = (sl.PHASE_KEYS_SEG_VERBOSE if pipeline == "seg"
+                else sl.PHASE_KEYS_NOSEG_VERBOSE)
+        # For verbose, require at least one verbose-only column (e.g. prune)
+        if pipeline == "seg" and "etype_at_prune" not in df_cols:
+            raise KeyError(
+                "view='verbose' requested but no verbose snapshot columns "
+                "found (e.g. etype_at_prune). Re-run pipeline with "
+                "snapshot_level='verbose'."
+            )
+    elif view == "collapsed":
+        # Map collapsed groups to their END-OF-GROUP source columns
+        collapse = (sl.COLLAPSE_SEG if pipeline == "seg"
+                    else sl.COLLAPSE_NOSEG)
+        collapsed_keys = (sl.PHASE_KEYS_SEG_COLLAPSED if pipeline == "seg"
+                          else sl.PHASE_KEYS_NOSEG_COLLAPSED)
+        keys = []
+        for k in collapsed_keys:
+            keys.append(collapse.get(k, k))
+    elif view == "default":
+        keys = (sl.PHASE_KEYS_SEG_DEFAULT if pipeline == "seg"
+                else sl.PHASE_KEYS_NOSEG_DEFAULT)
+    else:
+        raise ValueError(f"view must be 'default'|'collapsed'|'verbose', got {view!r}")
+
+    # Drop phases whose snapshot is absent (optional / skipped)
+    return [k for k in keys if f"etype_at_{k}" in df_cols]
+
+
 def _check_valid_codes(codes: np.ndarray, phase_name: str) -> None:
     """Raise ValueError if any code is outside the valid 5-class range."""
     valid = {sl.CLASS_MAIN, sl.CLASS_PARTIAL, sl.CLASS_COMPONENT,
