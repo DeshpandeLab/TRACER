@@ -250,10 +250,86 @@ def _palette_for(class_grouping: str, override: Optional[dict]) -> dict:
     return base
 
 
-# ─── plotly backend (stub — implemented in Task 6) ──────────────────────
-def _render_plotly(*args, **kwargs):
-    """Stub — implemented in Task 6."""
-    raise NotImplementedError("_render_plotly is added in Task 6")
+# ─── plotly backend (lazy import) ──────────────────────────────────────
+def _render_plotly(
+    tidy: pd.DataFrame,
+    phases: Sequence[str],
+    *,
+    title: Optional[str],
+    class_grouping: str,
+    palette: Optional[dict],
+    color_by: str,
+):
+    """Plotly Sankey — interactive HTML, hover tooltips."""
+    try:
+        import plotly.graph_objects as go
+    except ImportError as e:
+        raise ImportError(
+            "plotly is required for backend='plotly'. "
+            "Install via `pip install plotly` or use backend='matplotlib'."
+        ) from e
+
+    palette = _palette_for(class_grouping, palette)
+
+    # Build node list: one per (phase, class). Node index = phase_idx * K + class_idx
+    classes = sorted(palette.keys())
+    class_idx = {c: i for i, c in enumerate(classes)}
+    K = len(classes)
+
+    node_labels = []
+    node_colors = []
+    for p in phases:
+        ph_label = sl.PHASE_DISPLAY_LABELS.get(p, p)
+        for c in classes:
+            node_labels.append(f"{ph_label}: {sl.CLASS_NAMES.get(c, str(c))}")
+            node_colors.append(palette[c])
+
+    def _idx(phase_pos: int, c: int) -> int:
+        return phase_pos * K + class_idx[c]
+
+    phase_pos = {p: i for i, p in enumerate(phases)}
+
+    src, tgt, val, link_colors, hover = [], [], [], [], []
+    total_tx = int(tidy["n"].sum()) or 1
+    # Per-boundary totals to compute fraction; use to_class incoming total
+    for _, r in tidy.iterrows():
+        i_from = phase_pos[r["phase_from"]]
+        i_to = phase_pos[r["phase_to"]]
+        src.append(_idx(i_from, r["class_from"]))
+        tgt.append(_idx(i_to, r["class_to"]))
+        val.append(int(r["n"]))
+        color_class = (r["class_from"] if color_by == "source"
+                       else r["class_to"])
+        # Translucent hex w/ alpha — use rgba string
+        hex_ = palette[color_class].lstrip("#")
+        rr, gg, bb = (int(hex_[i:i+2], 16) for i in (0, 2, 4))
+        link_colors.append(f"rgba({rr},{gg},{bb},0.45)")
+        pct = 100 * r["n"] / total_tx
+        hover.append(
+            f"{r['phase_from']} → {r['phase_to']}<br>"
+            f"{sl.CLASS_NAMES.get(int(r['class_from']),'?')} → "
+            f"{sl.CLASS_NAMES.get(int(r['class_to']),'?')}<br>"
+            f"{int(r['n']):,} transcripts ({pct:.2f}%)"
+        )
+
+    sankey = go.Sankey(
+        node=dict(
+            pad=15, thickness=18,
+            line=dict(color="black", width=0.3),
+            label=node_labels, color=node_colors,
+        ),
+        link=dict(
+            source=src, target=tgt, value=val,
+            color=link_colors, customdata=hover,
+            hovertemplate="%{customdata}<extra></extra>",
+        ),
+    )
+    fig = go.Figure(data=[sankey])
+    fig.update_layout(
+        title_text=title or "Transcript-assignment flow through pipeline phases",
+        font_size=11, margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
 
 
 # ─── matplotlib backend ─────────────────────────────────────────────────

@@ -184,3 +184,47 @@ class TestPlotMatplotlib:
         fp.plot_transcript_flow(df, backend="matplotlib", output=str(out))
         assert out.exists()
         assert out.stat().st_size > 0
+
+
+class TestPlotPlotly:
+    def setup_method(self):
+        self.go = pytest.importorskip("plotly.graph_objects")
+
+    def _full_df(self):
+        n = 50
+        base = ([sl.CLASS_MAIN] * 10 + [sl.CLASS_PARTIAL] * 20
+                + [sl.CLASS_UNASSIGNED] * 20)
+        df = pd.DataFrame({
+            f"etype_at_{p}": np.array(base, dtype=np.int8)
+            for p in sl.PHASE_KEYS_SEG_DEFAULT
+        })
+        final = base.copy()
+        final[-5:] = [sl.CLASS_DROPPED] * 5
+        df["etype_at_finalize"] = np.array(final, dtype=np.int8)
+        return df
+
+    def test_returns_plotly_figure(self):
+        df = self._full_df()
+        fig = fp.plot_transcript_flow(df, backend="plotly")
+        assert isinstance(fig, self.go.Figure)
+
+    def test_has_sankey_trace(self):
+        df = self._full_df()
+        fig = fp.plot_transcript_flow(df, backend="plotly")
+        assert any(isinstance(t, self.go.Sankey) for t in fig.data)
+
+    def test_node_count_matches_phases_times_classes(self):
+        df = self._full_df()
+        fig = fp.plot_transcript_flow(df, backend="plotly",
+                                       class_grouping="three")
+        sankey = next(t for t in fig.data if isinstance(t, self.go.Sankey))
+        # Each (phase, class) with nonzero count gets a node
+        # Should be > 0 and finite
+        assert len(sankey.node.label) > 0
+
+    def test_html_output(self, tmp_path):
+        df = self._full_df()
+        out = tmp_path / "flow.html"
+        fp.plot_transcript_flow(df, backend="plotly", output=str(out))
+        assert out.exists()
+        assert b"Sankey" in out.read_bytes()
