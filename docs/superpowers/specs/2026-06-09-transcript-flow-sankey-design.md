@@ -116,10 +116,43 @@ def snapshot_phase(df: pd.DataFrame, phase: str, *, id_col: str) -> None:
         df[id_col].values,
         df["_etype"].values if "_etype" in df.columns else None,
     )
+
+# Display labels — internal keys stay terse for code/columns; user-facing
+# Sankey nodes render the values from this map. Tier B's "phase1" displays
+# as "Prune" since pruning is the headline Phase-1 operation. Tier C's
+# verbose `prune` sub-step also renders as "Prune" — no collision because
+# the two never appear in the same view.
+PHASE_DISPLAY_LABELS = {
+    # Tier B (default)
+    "input":              "Input",
+    "phase1":             "Prune",
+    "rescue":             "Rescue",
+    "group":              "Group",
+    "post_group_rescue":  "Post-Group Rescue",
+    "stitch":             "Stitch",
+    "demote":             "Demote",
+    "final_rescue":       "Final Rescue",
+    "finalize":           "Finalize",
+    # Tier C verbose extras (SEG only)
+    "prune":              "Prune",
+    "reassign_1c":        "Reassign 1c",
+    "split_p1":           "Split P1",
+    "rerank":             "Rerank",
+    "qc_p1":              "QC P1",
+    "maha_remerge":       "Maha Remerge",
+    "mid_qc":             "Mid QC",
+    # NOSEG
+    "cascade":            "Cascade",
+    # Tier A collapsed groups (display-only)
+    "phase1+rescue":            "Prune + Rescue",
+    "group+rescue":             "Group + Rescue",
+    "stitch+demote+rescue":     "Stitch + Demote + Rescue",
+    "cascade+rescue":           "Cascade + Rescue",
+}
 ```
 
-Snapshot-time tiers are controlled by the runner; display tiers are controlled
-by `plot_transcript_flow`.
+Snapshot-time tiers are controlled by the runner; display tiers and labels
+are controlled by `plot_transcript_flow`.
 
 `id_col` is `tracer_id` for phases 1-10 (SEG) / 1-4 (NOSEG) and `stitched`
 from Stitch onward. A central phase-config table maps each key to
