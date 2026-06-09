@@ -160,32 +160,44 @@ from Stitch onward. A central phase-config table maps each key to
 
 ### 5.2 Hook insertion sites
 
+This codebase has **no central pipeline runner** — each tutorial driver
+(`tutorials/lung_cancer/run_lung_cancer.py`,
+`tutorials/mouse_ileum/run_mouse_ileum.py`, etc.) composes phases by hand
+from primitives in `spatial.py` / `pruning.py` / `stitching.py`. The
+snapshot is therefore inserted **at the call-site in each driver**, not
+inside the library functions. `snapshot_phase` is a public helper users
+plug into their own drivers.
+
+Canonical demo driver for SEG: `tutorials/lung_cancer/run_lung_cancer.py`.
+Canonical demo driver for NOSEG: `tutorials/lung_cancer/noseg_workflow.ipynb`
+(notebook — pattern documented but not TDD-tested by this plan).
+
 Tier column: `D` = snapshot at default level; `V` = snapshot only at
 `snapshot_level="verbose"`; `–` = no hook in that pipeline.
 
-| Phase key            | Tier | SEG insert site (file:fn)                                                 | NOSEG insert site                          |
-|----------------------|------|---------------------------------------------------------------------------|--------------------------------------------|
-| `input`              | D    | start of `run_pipeline` (after df construction)                           | start of `run_noseg_pipeline`              |
-| `prune`              | V    | after `prune_transcripts_nuclear_seed`                                    | —                                          |
-| `reassign_1c`        | V    | after `_reassign_nuclear_post_1c_etype` (optional)                        | —                                          |
-| `split_p1`           | V    | after `_spatial_split_phase1_entities`                                    | —                                          |
-| `rerank`             | V    | after `_phase1_rerank_within_parent_etype` (optional)                     | —                                          |
-| `qc_p1`              | V    | after `_qc_demote_small_phase1_entities`                                  | —                                          |
-| `maha_remerge`       | V    | after `phase1_maha_remerge` (optional)                                    | —                                          |
-| `phase1`             | D    | after the last Phase-1 sub-step (whichever ran last: maha_remerge / qc_p1) | —                                          |
-| `rescue`             | D    | after Rescue loop (all passes)                                            | —                                          |
-| `cascade`            | D    | —                                                                         | after `cascade_as_residual_handler`        |
-| `group`              | D    | after `annotate_unassigned_components_fast`                               | (cascade also performs grouping; skip)     |
-| `mid_qc`             | D    | after Mid-QC if it ran                                                    | after Mid-QC if it ran                     |
-| `post_group_rescue`  | D    | after Post-Group-Rescue loop                                              | after Post-Group-Rescue loop               |
-| `stitch`             | D    | after `apply_stitching_to_transcripts_memory_efficient` (id_col=`stitched`) | same                                     |
-| `demote`             | D    | after `demote_small_entities`                                             | same                                       |
-| `final_rescue`       | D    | after Final-Rescue loop                                                   | same                                       |
-| `finalize`           | D    | after `finalize_unassigned`                                               | same                                       |
+| Phase key            | Tier | After which primitive (SEG)                                       | After which primitive (NOSEG)               |
+|----------------------|------|-------------------------------------------------------------------|---------------------------------------------|
+| `input`              | D    | df construction                                                   | df construction                             |
+| `prune`              | V    | `prune_transcripts_fast` / nuclear-seed prune                     | —                                           |
+| `reassign_1c`        | V    | `_reassign_nuclear_post_1c_etype` (optional)                      | —                                           |
+| `split_p1`           | V    | `_spatial_split_phase1_entities` (optional)                       | —                                           |
+| `rerank`             | V    | `_phase1_rerank_within_parent_etype` (optional)                   | —                                           |
+| `qc_p1`              | V    | `_qc_demote_small_phase1_entities` (optional)                     | —                                           |
+| `maha_remerge`       | V    | `phase1_maha_remerge` (optional)                                  | —                                           |
+| `phase1`             | D    | last Phase-1 primitive (typically `prune_transcripts_fast`)       | —                                           |
+| `rescue`             | D    | `pre_stage2_rescue` loop                                          | —                                           |
+| `cascade`            | D    | —                                                                 | `cascade_as_residual_handler`               |
+| `group`              | D    | `annotate_unassigned_components_fast`                             | (cascade performs grouping; skip)           |
+| `mid_qc`             | D    | mid-QC step if present                                            | mid-QC step if present                      |
+| `post_group_rescue`  | D    | second `pre_stage2_rescue` loop                                   | second `pre_stage2_rescue` loop             |
+| `stitch`             | D    | `apply_stitching_to_transcripts_memory_efficient` (id_col=`stitched`) | same                                    |
+| `demote`             | D    | `demote_small_entities`                                           | same                                        |
+| `final_rescue`       | D    | `reassign_unassigned_grid_pool` loop                              | same                                        |
+| `finalize`           | D    | `finalize_unassigned`                                             | same                                        |
 
 The `phase1` snapshot is the same data as the verbose-tier final Phase-1
-snapshot — implementation just emits both column names when
-`snapshot_level="verbose"` so default-view code keeps working unchanged.
+snapshot — implementation emits both column names in verbose mode so
+default-view plotting keeps working unchanged.
 
 Optional phases that skip leave the column **absent** (sentinel for
 "phase did not execute"). The plot's data-prep treats missing-column ==
@@ -297,17 +309,23 @@ downstream tooling can ingest both.
 ## 8. File layout
 
 ```
-src/tracer/sankey_log.py        # NEW — phase-key tables + snapshot_phase + classifier
-src/tracer/plot.py              # EXTENDED — add plot_transcript_flow
-src/tracer/_pipeline_runner.py  # EDITED — insert snapshot_phase calls
-src/tracer/spatial.py           # EDITED — snapshot_phase calls in run_noseg_pipeline
-tests/test_sankey_log.py        # NEW — snapshot + classifier + conservation tests
-tests/test_plot_flow.py         # NEW — backend smoke + tidy-df shape
+src/tracer/sankey_log.py                   # NEW — phase-key tables + snapshot_phase + classifier + display labels
+src/tracer/flow_plot.py                    # NEW — plot_transcript_flow + data-prep + backends
+src/tracer/__init__.py                     # EDITED — export plot_transcript_flow, snapshot_phase
+src/tracer/plot.py                         # EDITED — single-line re-export of plot_transcript_flow
+tutorials/lung_cancer/run_lung_cancer.py   # EDITED — insert snapshot_phase calls (SEG demo)
+tests/test_sankey_log.py                   # NEW — classifier + snapshot + conservation tests
+tests/test_flow_plot.py                    # NEW — data-prep + view resolution + backend smoke
 ```
 
-`plot_transcript_flow` is exported from `tracer.__init__`. `sankey_log` is
-internal but `snapshot_phase` is part of the public hook contract — third-
-party pipelines (e.g. branches under development) can call it directly.
+`plot_transcript_flow` and `snapshot_phase` are both public. `sankey_log`'s
+phase-key tables and `PHASE_DISPLAY_LABELS` are also public so users
+plumbing snapshots into their own drivers can import them.
+
+NOSEG snapshots: the pattern is documented in the spec but inserting the
+calls into `tutorials/lung_cancer/noseg_workflow.ipynb` is deferred
+(notebook diffs are hard to TDD-test). Users can follow the SEG demo
+verbatim.
 
 ## 9. Scope boundaries (recap)
 
