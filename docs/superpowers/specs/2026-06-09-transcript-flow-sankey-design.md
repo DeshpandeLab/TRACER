@@ -61,18 +61,53 @@ re-renders without re-running. The classifier is a single vectorized helper
 
 ## 5. Logging hook
 
-### 5.1 Snapshot helper
+### 5.1 Snapshot helper + phase tiers
+
+Three nested phase-key tiers. The default Sankey shows Tier B; Tier A is a
+display-time collapse of Tier B; Tier C unlocks the Phase-1 internals for
+debugging.
 
 ```python
 # src/tracer/sankey_log.py (new module)
-PHASE_KEYS_SEG = [
+
+# Tier B — DEFAULT: 9 SEG phases, 8 NOSEG phases. Hooks run at these
+# boundaries by default. Phase-1 sub-mutations are folded into one "phase1"
+# snapshot.
+PHASE_KEYS_SEG_DEFAULT = [
+    "input", "phase1", "rescue", "group", "post_group_rescue",
+    "stitch", "demote", "final_rescue", "finalize",
+]
+PHASE_KEYS_NOSEG_DEFAULT = [
+    "input", "cascade", "mid_qc", "post_group_rescue",
+    "stitch", "demote", "final_rescue", "finalize",
+]
+
+# Tier C — VERBOSE: 14 SEG phases. Hooks run at these only when
+# snapshot_level="verbose". NOSEG verbose == default (no Phase-1 to expand).
+PHASE_KEYS_SEG_VERBOSE = [
     "input", "prune", "reassign_1c", "split_p1", "rerank", "qc_p1",
     "maha_remerge", "rescue", "group", "mid_qc", "post_group_rescue",
     "stitch", "demote", "final_rescue", "finalize",
 ]
-PHASE_KEYS_NOSEG = [
-    "input", "cascade", "mid_qc", "post_group_rescue",
-    "stitch", "demote", "final_rescue", "finalize",
+PHASE_KEYS_NOSEG_VERBOSE = PHASE_KEYS_NOSEG_DEFAULT
+
+# Tier A — COLLAPSED: 5 SEG nodes / 4 NOSEG nodes. Display-only. No new
+# snapshot columns; nodes are sourced from existing Tier B columns at the
+# end-of-group boundary.
+COLLAPSE_SEG = {
+    "phase1+rescue":         "rescue",            # source column at group end
+    "group+rescue":          "post_group_rescue",
+    "stitch+demote+rescue":  "final_rescue",
+}
+PHASE_KEYS_SEG_COLLAPSED = [
+    "input", "phase1+rescue", "group+rescue", "stitch+demote+rescue", "finalize",
+]
+COLLAPSE_NOSEG = {
+    "cascade+rescue":        "post_group_rescue",
+    "stitch+demote+rescue":  "final_rescue",
+}
+PHASE_KEYS_NOSEG_COLLAPSED = [
+    "input", "cascade+rescue", "stitch+demote+rescue", "finalize",
 ]
 
 def snapshot_phase(df: pd.DataFrame, phase: str, *, id_col: str) -> None:
@@ -83,30 +118,41 @@ def snapshot_phase(df: pd.DataFrame, phase: str, *, id_col: str) -> None:
     )
 ```
 
+Snapshot-time tiers are controlled by the runner; display tiers are controlled
+by `plot_transcript_flow`.
+
 `id_col` is `tracer_id` for phases 1-10 (SEG) / 1-4 (NOSEG) and `stitched`
 from Stitch onward. A central phase-config table maps each key to
 `{long_label, optional, id_col, expected_in_pipeline: {"seg", "noseg"}}`.
 
 ### 5.2 Hook insertion sites
 
-| Phase key            | SEG insert site (file:fn)                                           | NOSEG insert site                          |
-|----------------------|---------------------------------------------------------------------|--------------------------------------------|
-| `input`              | start of `run_pipeline` (after df construction)                     | start of `run_noseg_pipeline`              |
-| `prune`              | after `prune_transcripts_nuclear_seed`                              | —                                          |
-| `reassign_1c`        | after `_reassign_nuclear_post_1c_etype` (optional)                  | —                                          |
-| `split_p1`           | after `_spatial_split_phase1_entities`                              | —                                          |
-| `rerank`             | after `_phase1_rerank_within_parent_etype` (optional)               | —                                          |
-| `qc_p1`              | after `_qc_demote_small_phase1_entities`                            | —                                          |
-| `maha_remerge`       | after `phase1_maha_remerge` (optional)                              | —                                          |
-| `rescue`             | after Rescue loop (all passes)                                      | —                                          |
-| `cascade`            | —                                                                   | after `cascade_as_residual_handler`        |
-| `group`              | after `annotate_unassigned_components_fast`                         | (cascade also performs grouping; skip)     |
-| `mid_qc`             | after Mid-QC if it ran                                              | after Mid-QC if it ran                     |
-| `post_group_rescue`  | after Post-Group-Rescue loop                                        | after Post-Group-Rescue loop               |
-| `stitch`             | after `apply_stitching_to_transcripts_memory_efficient` (id_col=`stitched`) | same                              |
-| `demote`             | after `demote_small_entities`                                       | same                                       |
-| `final_rescue`       | after Final-Rescue loop                                             | same                                       |
-| `finalize`           | after `finalize_unassigned`                                         | same                                       |
+Tier column: `D` = snapshot at default level; `V` = snapshot only at
+`snapshot_level="verbose"`; `–` = no hook in that pipeline.
+
+| Phase key            | Tier | SEG insert site (file:fn)                                                 | NOSEG insert site                          |
+|----------------------|------|---------------------------------------------------------------------------|--------------------------------------------|
+| `input`              | D    | start of `run_pipeline` (after df construction)                           | start of `run_noseg_pipeline`              |
+| `prune`              | V    | after `prune_transcripts_nuclear_seed`                                    | —                                          |
+| `reassign_1c`        | V    | after `_reassign_nuclear_post_1c_etype` (optional)                        | —                                          |
+| `split_p1`           | V    | after `_spatial_split_phase1_entities`                                    | —                                          |
+| `rerank`             | V    | after `_phase1_rerank_within_parent_etype` (optional)                     | —                                          |
+| `qc_p1`              | V    | after `_qc_demote_small_phase1_entities`                                  | —                                          |
+| `maha_remerge`       | V    | after `phase1_maha_remerge` (optional)                                    | —                                          |
+| `phase1`             | D    | after the last Phase-1 sub-step (whichever ran last: maha_remerge / qc_p1) | —                                          |
+| `rescue`             | D    | after Rescue loop (all passes)                                            | —                                          |
+| `cascade`            | D    | —                                                                         | after `cascade_as_residual_handler`        |
+| `group`              | D    | after `annotate_unassigned_components_fast`                               | (cascade also performs grouping; skip)     |
+| `mid_qc`             | D    | after Mid-QC if it ran                                                    | after Mid-QC if it ran                     |
+| `post_group_rescue`  | D    | after Post-Group-Rescue loop                                              | after Post-Group-Rescue loop               |
+| `stitch`             | D    | after `apply_stitching_to_transcripts_memory_efficient` (id_col=`stitched`) | same                                     |
+| `demote`             | D    | after `demote_small_entities`                                             | same                                       |
+| `final_rescue`       | D    | after Final-Rescue loop                                                   | same                                       |
+| `finalize`           | D    | after `finalize_unassigned`                                               | same                                       |
+
+The `phase1` snapshot is the same data as the verbose-tier final Phase-1
+snapshot — implementation just emits both column names when
+`snapshot_level="verbose"` so default-view code keeps working unchanged.
 
 Optional phases that skip leave the column **absent** (sentinel for
 "phase did not execute"). The plot's data-prep treats missing-column ==
@@ -121,8 +167,11 @@ which phase leaked.
 
 ### 5.4 Cost
 
-`int8 × n_phases × n_tx` = 14 × 10 MB = **140 MB** at 10 M tx (SEG) or 80 MB
-(NOSEG). Wall-clock < 2 %: each snapshot is one vectorized categorical map.
+`int8 × n_phases × n_tx`:
+- **Default** (Tier B, 9 SEG / 8 NOSEG): ~90 MB SEG / ~80 MB NOSEG at 10 M tx
+- **Verbose** (Tier C, 14 SEG): ~140 MB SEG at 10 M tx
+
+Wall-clock < 2 %: each snapshot is one vectorized categorical map.
 Snapshots ride the existing parquet write at the end of the pipeline; no
 new file format.
 
@@ -134,6 +183,7 @@ def plot_transcript_flow(
     transcripts: pd.DataFrame,
     *,
     pipeline: Literal["seg", "noseg", "auto"] = "auto",
+    view: Literal["default", "collapsed", "verbose"] = "default",
     phases: list[str] | None = None,
     drop_unchanged: bool = True,
     min_flow_frac: float = 0.001,
@@ -151,10 +201,18 @@ def plot_transcript_flow(
 ### 6.1 Parameters
 
 - `pipeline`: `"auto"` detects which `etype_at_*` columns are present.
-- `phases`: subset / reorder; defaults to `PHASE_KEYS_<mode>` filtered to
-  what's present.
+- `view`: which phase tier to render.
+  - `"default"` (Tier B, 9 SEG / 8 NOSEG)
+  - `"collapsed"` (Tier A, 5 SEG / 4 NOSEG): groups `phase1+rescue`,
+    `group+rescue`, `stitch+demote+rescue` into single columns. Sourced from
+    the same Tier-B snapshots — needs no `snapshot_level="verbose"` run.
+  - `"verbose"` (Tier C, 14 SEG): requires the pipeline to have been run with
+    `snapshot_level="verbose"`; raises a clear error if those columns are
+    absent.
+- `phases`: explicit override (subset or reorder); when given,
+  takes precedence over `view`.
 - `drop_unchanged`: collapse a phase that moved zero transcripts (e.g.
-  optional `maha_remerge` that was disabled).
+  optional `maha_remerge` that was disabled in a verbose run).
 - `min_flow_frac`: ribbons below this fraction of total tx are hidden
   (default 0.001 = 0.1 %).
 - `class_grouping`: `"three"` (default) or `"five"` (see §4).
@@ -220,8 +278,8 @@ party pipelines (e.g. branches under development) can call it directly.
 
 ## 9. Scope boundaries (recap)
 
-In: 14/8 canonical phases, 5-class vocabulary collapsible to 3, plotly +
-matplotlib, persist to existing parquet.
+In: three nested phase tiers (collapsed/default/verbose), 5-class vocabulary
+collapsible to 3, plotly + matplotlib, persist to existing parquet.
 
 Out: per-gene Sankey, per-tile Sankey, animation, refactoring
 `entity_type_stage_counts.py`.
@@ -234,3 +292,6 @@ Out: per-gene Sankey, per-tile Sankey, animation, refactoring
   `unassigned/dropped`, lossy for `main/partial/component`).
 - Default `min_flow_frac` — 0.1 % keeps the plot readable on 10 M tx but
   hides the very tail. Make it user-tunable; document in plot docstring.
+- Runner kwarg name for snapshot tier: `snapshot_level` vs `verbose` vs a
+  generic `transcript_flow_log={"off","default","verbose"}` — defer to plan
+  phase. Default is `"default"`.
