@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import matplotlib
+matplotlib.use("Agg")  # headless
+
 try:
     from tracer import flow_plot as fp
     from tracer import sankey_log as sl
@@ -142,3 +145,42 @@ class TestResolveView:
         phases = fp._resolve_view(cols, pipeline="seg", view="default")
         assert "mid_qc" not in phases
         assert "phase1" in phases  # other required ones still present
+
+
+class TestPlotMatplotlib:
+    def _full_df(self):
+        """Toy SEG-shaped df with all 9 default-tier snapshot columns."""
+        n = 50
+        base = ([sl.CLASS_MAIN] * 10 + [sl.CLASS_PARTIAL] * 20
+                + [sl.CLASS_UNASSIGNED] * 20)
+        df = pd.DataFrame({
+            f"etype_at_{p}": np.array(base, dtype=np.int8)
+            for p in sl.PHASE_KEYS_SEG_DEFAULT
+        })
+        # Simulate final_rescue moving 5 unassigned → dropped
+        final = base.copy()
+        final[-5:] = [sl.CLASS_DROPPED] * 5
+        df["etype_at_finalize"] = np.array(final, dtype=np.int8)
+        return df
+
+    def test_returns_figure(self):
+        df = self._full_df()
+        fig = fp.plot_transcript_flow(df, backend="matplotlib")
+        import matplotlib.figure
+        assert isinstance(fig, matplotlib.figure.Figure)
+
+    def test_return_data_tuple(self):
+        df = self._full_df()
+        fig, tidy = fp.plot_transcript_flow(
+            df, backend="matplotlib", return_data=True
+        )
+        assert isinstance(tidy, pd.DataFrame)
+        assert set(tidy.columns) >= {"phase_from", "phase_to",
+                                     "class_from", "class_to", "n"}
+
+    def test_output_file_png(self, tmp_path):
+        df = self._full_df()
+        out = tmp_path / "flow.png"
+        fp.plot_transcript_flow(df, backend="matplotlib", output=str(out))
+        assert out.exists()
+        assert out.stat().st_size > 0
