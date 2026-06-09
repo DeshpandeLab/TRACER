@@ -98,3 +98,56 @@ class TestConstants:
 
     def test_phase1_displays_as_prune(self):
         assert sl.PHASE_DISPLAY_LABELS["phase1"] == "Prune"
+
+
+class TestSnapshotPhase:
+    def _toy_df(self):
+        return pd.DataFrame({
+            "tracer_id": ["cell_1", "cell_1-1", "UNASSIGNED_b", "-1", "DROP"],
+            "_etype": ["cell", "partial", "component", "unknown", "unknown"],
+        })
+
+    def test_writes_int8_column(self):
+        df = self._toy_df()
+        sl.snapshot_phase(df, "phase1", id_col="tracer_id")
+        col = df["etype_at_phase1"]
+        assert col.dtype == np.int8
+        assert list(col) == [sl.CLASS_MAIN, sl.CLASS_PARTIAL,
+                             sl.CLASS_COMPONENT, sl.CLASS_UNASSIGNED,
+                             sl.CLASS_DROPPED]
+
+    def test_inplace(self):
+        df = self._toy_df()
+        ret = sl.snapshot_phase(df, "rescue", id_col="tracer_id")
+        assert ret is None
+        assert "etype_at_rescue" in df.columns
+
+    def test_missing_id_col_raises(self):
+        df = self._toy_df()
+        with pytest.raises(KeyError, match="id_col"):
+            sl.snapshot_phase(df, "stitch", id_col="stitched")
+
+    def test_no_etype_column(self):
+        df = pd.DataFrame({"tracer_id": ["cell_1", "-1", "DROP"]})
+        sl.snapshot_phase(df, "input", id_col="tracer_id")
+        # Sentinels still classify correctly; "cell_1" falls back to partial
+        assert list(df["etype_at_input"]) == [sl.CLASS_PARTIAL,
+                                              sl.CLASS_UNASSIGNED,
+                                              sl.CLASS_DROPPED]
+
+
+class TestConservation:
+    def test_size_preserved_across_two_snapshots(self):
+        df = pd.DataFrame({"tracer_id": ["cell_1", "-1", "DROP"] * 100,
+                           "_etype": ["cell", "unknown", "unknown"] * 100})
+        sl.snapshot_phase(df, "input", id_col="tracer_id")
+        df["tracer_id"] = df["tracer_id"].replace({"-1": "cell_99"})
+        # Caller would refresh _etype too; for the test, also flip etype
+        df.loc[df["tracer_id"] == "cell_99", "_etype"] = "cell"
+        sl.snapshot_phase(df, "rescue", id_col="tracer_id")
+        # Total rows unchanged
+        assert df["etype_at_input"].size == df["etype_at_rescue"].size
+        # Conservation: sum of class counts equal between snapshots
+        c_in = pd.Series(df["etype_at_input"]).value_counts().sort_index()
+        c_out = pd.Series(df["etype_at_rescue"]).value_counts().sort_index()
+        assert c_in.sum() == c_out.sum() == 300
