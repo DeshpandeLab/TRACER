@@ -228,3 +228,19 @@ class TestPlotPlotly:
         fp.plot_transcript_flow(df, backend="plotly", output=str(out))
         assert out.exists()
         assert b"Sankey" in out.read_bytes()
+
+
+class TestPublicAPI:
+    def test_plot_transcript_flow_importable(self):
+        # Skip if standalone-load fallback was used
+        try:
+            import tracer
+        except ImportError:
+            pytest.skip("full tracer import unavailable in this env")
+        # conftest installs a minimal stub `tracer` namespace when the full
+        # package can't be imported (no geopandas/torch/open3d). That stub
+        # lacks __version__; the real __init__.py sets it.
+        if not hasattr(tracer, "__version__"):
+            pytest.skip("standalone-load fallback in use; full tracer unavailable")
+        assert hasattr(tracer, "plot_transcript_flow")
+        assert hasattr(tracer, "snapshot_phase")
