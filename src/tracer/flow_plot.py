@@ -376,12 +376,9 @@ def _render_plotly(
             line=dict(color="black", width=0.3),
             label=node_labels, color=node_colors,
             # Pin x so columns stay aligned with the header annotations.
-            # Do NOT pin y — empty (phase, class) cells would force plotly
-            # to allocate vertical slots for zero-width bands, breaking
-            # flow conservation in the link allocator and leaving visible
-            # gaps (e.g. a main band whose outgoing mass to unassigned
-            # doesn't appear). Letting plotly auto-balance y per column
-            # makes the bands snap to actual flow.
+            # Don't pin y — mass-weighted pinning broke flow conservation
+            # on real data; let plotly auto-balance y per column. (Tradeoff:
+            # plotly may not respect class_order in HTML; matplotlib does.)
             x=[max(0.001, min(0.999, phase_pos[p] / max(1, len(phases) - 1)))
                for p in phases for _ in classes],
         ),
@@ -503,10 +500,25 @@ def _draw_ribbons_mpl(
     from matplotlib.patches import PathPatch
     from matplotlib.path import Path
 
+    # Map class code → its top-to-bottom rank in `classes`. Lower rank ==
+    # higher in the column.
+    class_pos = {c: i for i, c in enumerate(classes)}
+
     for i in range(len(phases) - 1):
         p_from, p_to = phases[i], phases[i + 1]
         sub = tidy[(tidy["phase_from"] == p_from) &
                    (tidy["phase_to"] == p_to)]
+        # Vertical-order-preserving stacking: order ribbons by (src_pos,
+        # tgt_pos) so within each source node, outgoing ribbons going to
+        # top-of-column targets emerge from the top; symmetrically,
+        # incoming ribbons at each target stack in their source's
+        # vertical-position order. Without this, ribbons to a top target
+        # (e.g. neighboring_cell) emerge from the bottom of their source
+        # and bend awkwardly across the column.
+        sub = sub.assign(
+            _src_pos=sub["class_from"].map(class_pos),
+            _tgt_pos=sub["class_to"].map(class_pos),
+        ).sort_values(["_src_pos", "_tgt_pos"])
         # Track running y-offsets at each node so stacked ribbons don't overlap
         from_offset = {c: 0.0 for c in classes}
         to_offset = {c: 0.0 for c in classes}
