@@ -163,6 +163,7 @@ def plot_transcript_flow(
     drop_unchanged: bool = True,
     min_flow_frac: float = 0.001,
     class_grouping: str = "three",
+    class_order: Optional[Sequence[int]] = None,
     color_by: str = "source",
     palette: Optional[dict] = None,
     title: Optional[str] = None,
@@ -174,6 +175,17 @@ def plot_transcript_flow(
 
     See docs/superpowers/specs/2026-06-09-transcript-flow-sankey-design.md
     for the full design.
+
+    Parameters
+    ----------
+    class_order : list of int, optional
+        Top-to-bottom visual order of class codes within each column. By
+        default classes are sorted ascending by integer code (which matches
+        the semantic order of the 5-class vocabulary: main → partial →
+        component → unassigned → dropped). Override with a custom list to
+        place extended codes (e.g. ``main_neighbor``) next to their semantic
+        sibling. Every code in the list must be in ``palette``; codes in
+        ``palette`` not listed are appended at the bottom.
     """
     df_cols = set(transcripts.columns)
 
@@ -218,10 +230,12 @@ def plot_transcript_flow(
     if backend == "matplotlib":
         fig = _render_matplotlib(tidy, phases, display_labels=display_labels,
                                  title=title, class_grouping=class_grouping,
+                                 class_order=class_order,
                                  palette=palette, color_by=color_by)
     elif backend == "plotly":
         fig = _render_plotly(tidy, phases, display_labels=display_labels,
                              title=title, class_grouping=class_grouping,
+                             class_order=class_order,
                              palette=palette, color_by=color_by)
     else:
         raise ValueError(
@@ -251,6 +265,29 @@ _DEFAULT_PALETTE_3 = {
 }
 
 
+def _resolve_class_order(palette: dict,
+                         class_order: Optional[Sequence[int]]) -> list[int]:
+    """Resolve top-to-bottom visual class ordering.
+
+    Default (None): ascending by class code (matches semantic order of the
+    5-class vocabulary). With a user-supplied list: validate all codes are
+    in the palette, then append any palette codes the user omitted at the
+    bottom (so they're still drawn — silent loss would be worse).
+    """
+    if class_order is None:
+        return sorted(palette.keys())
+    palette_keys = set(palette.keys())
+    bad = [c for c in class_order if c not in palette_keys]
+    if bad:
+        raise ValueError(
+            f"class_order contains codes not in palette: {bad}; "
+            f"palette has {sorted(palette_keys)}"
+        )
+    seen = set(class_order)
+    leftover = [c for c in sorted(palette_keys) if c not in seen]
+    return list(class_order) + leftover
+
+
 def _palette_for(class_grouping: str, override: Optional[dict]) -> dict:
     base = (_DEFAULT_PALETTE_5 if class_grouping == "five"
             else _DEFAULT_PALETTE_3)
@@ -267,6 +304,7 @@ def _render_plotly(
     display_labels: Optional[Sequence[str]] = None,
     title: Optional[str],
     class_grouping: str,
+    class_order: Optional[Sequence[int]] = None,
     palette: Optional[dict],
     color_by: str,
 ):
@@ -282,7 +320,7 @@ def _render_plotly(
     palette = _palette_for(class_grouping, palette)
 
     # Build node list: one per (phase, class). Node index = phase_idx * K + class_idx
-    classes = sorted(palette.keys())
+    classes = _resolve_class_order(palette, class_order)
     class_idx = {c: i for i, c in enumerate(classes)}
     K = len(classes)
     if display_labels is None:
@@ -519,6 +557,7 @@ def _render_matplotlib(
     display_labels: Optional[Sequence[str]] = None,
     title: Optional[str],
     class_grouping: str,
+    class_order: Optional[Sequence[int]] = None,
     palette: Optional[dict],
     color_by: str,
 ):
@@ -528,7 +567,7 @@ def _render_matplotlib(
 
     palette = _palette_for(class_grouping, palette)
     n_phases = len(phases)
-    classes = sorted(palette.keys())
+    classes = _resolve_class_order(palette, class_order)
     if display_labels is None:
         display_labels = [sl.PHASE_DISPLAY_LABELS.get(p, p) for p in phases]
 

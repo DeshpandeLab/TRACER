@@ -102,6 +102,38 @@ class TestPrepareFlowData:
         assert (sl.CLASS_UNASSIGNED, sl.CLASS_DROPPED) not in edges
 
 
+class TestResolveClassOrder:
+    def _toy_palette(self):
+        return {
+            sl.CLASS_MAIN: "#1f77b4",
+            sl.CLASS_PARTIAL: "#2ca02c",
+            sl.CLASS_UNASSIGNED: "#7f7f7f",
+            5: "#ff7f0e",  # main_neighbor
+        }
+
+    def test_default_is_sorted_by_code(self):
+        out = fp._resolve_class_order(self._toy_palette(), None)
+        assert out == [sl.CLASS_MAIN, sl.CLASS_PARTIAL, sl.CLASS_UNASSIGNED, 5]
+
+    def test_explicit_order_is_respected(self):
+        custom = [sl.CLASS_MAIN, 5, sl.CLASS_PARTIAL, sl.CLASS_UNASSIGNED]
+        out = fp._resolve_class_order(self._toy_palette(), custom)
+        assert out == custom
+
+    def test_omitted_codes_appended(self):
+        # User specifies only top two; the other palette keys must still
+        # appear (in sorted order) at the bottom so they're not silently dropped.
+        custom = [sl.CLASS_MAIN, 5]
+        out = fp._resolve_class_order(self._toy_palette(), custom)
+        assert out[:2] == custom
+        assert set(out[2:]) == {sl.CLASS_PARTIAL, sl.CLASS_UNASSIGNED}
+
+    def test_unknown_code_raises(self):
+        with pytest.raises(ValueError, match="not in palette"):
+            fp._resolve_class_order(self._toy_palette(),
+                                    [sl.CLASS_MAIN, 99])
+
+
 class TestResolveView:
     def test_seg_default(self):
         df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
