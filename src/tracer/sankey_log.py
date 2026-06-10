@@ -102,13 +102,20 @@ def _classify_etype_vec(
 
 
 # ─── phase tiers ───────────────────────────────────────────────────────
+# The runner's `Finalize` step is just defensive normalization (collapses
+# lingering -1 / DROP / demote_rejected / UNASSIGNED_* tokens into the
+# canonical "UNASSIGNED"). On modern SEG runs the `final_rescue` and
+# `finalize` snapshots are bit-identical at the classifier level, so the
+# default view skips the redundant `finalize` column and treats
+# `final_rescue` as the effective output. (Verbose tier keeps `finalize`
+# for explicit inspection of the no-op step.)
 PHASE_KEYS_SEG_DEFAULT = [
     "input", "phase1", "rescue", "group", "post_group_rescue",
-    "stitch", "demote", "final_rescue", "finalize",
+    "stitch", "demote", "final_rescue",
 ]
 PHASE_KEYS_NOSEG_DEFAULT = [
     "input", "cascade", "mid_qc", "post_group_rescue",
-    "stitch", "demote", "final_rescue", "finalize",
+    "stitch", "demote", "final_rescue",
 ]
 
 PHASE_KEYS_SEG_VERBOSE = [
@@ -116,7 +123,10 @@ PHASE_KEYS_SEG_VERBOSE = [
     "maha_remerge", "rescue", "group", "mid_qc", "post_group_rescue",
     "stitch", "demote", "final_rescue", "finalize",
 ]
-PHASE_KEYS_NOSEG_VERBOSE = list(PHASE_KEYS_NOSEG_DEFAULT)
+# NOSEG verbose mirrors default + the runner's `finalize` step (which is
+# the no-op defensive normalization on NOSEG too, kept here for explicit
+# inspection — same rationale as SEG verbose).
+PHASE_KEYS_NOSEG_VERBOSE = list(PHASE_KEYS_NOSEG_DEFAULT) + ["finalize"]
 
 # Tier A — display-time collapse. Value is the source column at the end
 # of the collapsed group (i.e. take the snapshot at that boundary).
@@ -126,14 +136,14 @@ COLLAPSE_SEG = {
     "stitch+demote+rescue":  "final_rescue",
 }
 PHASE_KEYS_SEG_COLLAPSED = [
-    "input", "phase1+rescue", "group+rescue", "stitch+demote+rescue", "finalize",
+    "input", "phase1+rescue", "group+rescue", "stitch+demote+rescue",
 ]
 COLLAPSE_NOSEG = {
     "cascade+rescue":        "post_group_rescue",
     "stitch+demote+rescue":  "final_rescue",
 }
 PHASE_KEYS_NOSEG_COLLAPSED = [
-    "input", "cascade+rescue", "stitch+demote+rescue", "finalize",
+    "input", "cascade+rescue", "stitch+demote+rescue",
 ]
 
 
@@ -175,16 +185,38 @@ _INVERSE_COLLAPSE_SEG = {v: k for k, v in COLLAPSE_SEG.items()}
 _INVERSE_COLLAPSE_NOSEG = {v: k for k, v in COLLAPSE_NOSEG.items()}
 
 
+# Column-only label overrides — used by `display_label_for` (which labels
+# columns / states), NOT by the stage-label resolver (which labels ribbons
+# / actions). This is how the same phase key can have different labels
+# depending on whether it's labeling the post-stage STATE or the STAGE
+# itself.
+#   `final_rescue`  stage label (ribbon)  → "Final Rescue"  (the action)
+#                   state label (column)  → "Finalize"      (the canonical
+#                                                            end state, since
+#                                                            the runner's
+#                                                            Finalize step
+#                                                            is a no-op)
+_PHASE_COLUMN_OVERRIDES = {
+    "final_rescue": "Finalize",
+}
+
+
 def display_label_for(phase_key: str, *, pipeline: str = "seg",
                       view: str = "default") -> str:
-    """Look up the user-facing label for a phase. For Tier A (collapsed),
-    inverts the COLLAPSE map so a source column like 'rescue' is shown as
-    'Prune' rather than 'Rescue'."""
+    """Look up the user-facing column label for a phase. For Tier A
+    (collapsed), inverts the COLLAPSE map so a source column like 'rescue'
+    is shown as 'Prune' rather than 'Rescue'. Applies any column-only
+    overrides from `_PHASE_COLUMN_OVERRIDES`."""
     if view == "collapsed":
         inverse = (_INVERSE_COLLAPSE_SEG if pipeline == "seg"
                    else _INVERSE_COLLAPSE_NOSEG)
         key = inverse.get(phase_key, phase_key)
+        # Apply override on the source key too (e.g. `final_rescue` → "Finalize")
+        if key in _PHASE_COLUMN_OVERRIDES:
+            return _PHASE_COLUMN_OVERRIDES[key]
         return PHASE_DISPLAY_LABELS.get(key, key)
+    if phase_key in _PHASE_COLUMN_OVERRIDES:
+        return _PHASE_COLUMN_OVERRIDES[phase_key]
     return PHASE_DISPLAY_LABELS.get(phase_key, phase_key)
 
 

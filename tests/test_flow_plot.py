@@ -171,10 +171,12 @@ class TestResolveView:
     def test_seg_collapsed_returns_source_columns(self):
         df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}
         phases = fp._resolve_view(df_cols, pipeline="seg", view="collapsed")
-        # Collapsed view maps to TIER B SOURCE columns:
-        # input, rescue, post_group_rescue, final_rescue, finalize
+        # Tier A collapsed maps each compound group to its end-of-group
+        # source column. After dropping the redundant Finalize column from
+        # the default tier, Tier A ends at `final_rescue` (rendered as
+        # "Finalize" via the column-label override).
         assert phases == ["input", "rescue", "post_group_rescue",
-                          "final_rescue", "finalize"]
+                          "final_rescue"]
 
     def test_verbose_missing_raises(self):
         df_cols = {f"etype_at_{p}" for p in sl.PHASE_KEYS_SEG_DEFAULT}

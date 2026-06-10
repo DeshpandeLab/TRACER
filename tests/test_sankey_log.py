@@ -73,15 +73,33 @@ class TestConstants:
 
     def test_seg_default_phases(self):
         assert sl.PHASE_KEYS_SEG_DEFAULT[0] == "input"
-        assert sl.PHASE_KEYS_SEG_DEFAULT[-1] == "finalize"
+        # `finalize` is dropped from the default tier — the runner's
+        # Finalize step is a no-op on classification, so `final_rescue`
+        # is the effective output column.
+        assert sl.PHASE_KEYS_SEG_DEFAULT[-1] == "final_rescue"
+        assert "finalize" not in sl.PHASE_KEYS_SEG_DEFAULT
         assert "phase1" in sl.PHASE_KEYS_SEG_DEFAULT
-        assert len(sl.PHASE_KEYS_SEG_DEFAULT) == 9
+        assert len(sl.PHASE_KEYS_SEG_DEFAULT) == 8
 
     def test_noseg_default_phases(self):
         assert sl.PHASE_KEYS_NOSEG_DEFAULT[0] == "input"
-        assert sl.PHASE_KEYS_NOSEG_DEFAULT[-1] == "finalize"
+        assert sl.PHASE_KEYS_NOSEG_DEFAULT[-1] == "final_rescue"
+        assert "finalize" not in sl.PHASE_KEYS_NOSEG_DEFAULT
         assert "cascade" in sl.PHASE_KEYS_NOSEG_DEFAULT
-        assert len(sl.PHASE_KEYS_NOSEG_DEFAULT) == 8
+        assert len(sl.PHASE_KEYS_NOSEG_DEFAULT) == 7
+
+    def test_finalize_still_in_verbose_tier(self):
+        # Verbose users can still see the runner's defensive Finalize step
+        assert "finalize" in sl.PHASE_KEYS_SEG_VERBOSE
+        assert "finalize" in sl.PHASE_KEYS_NOSEG_VERBOSE
+
+    def test_final_rescue_column_reads_finalize(self):
+        # Column override: state-after-final_rescue is the canonical
+        # output, labeled "Finalize". Stage (ribbon) keeps "Final Rescue".
+        assert sl.display_label_for("final_rescue", pipeline="seg") == "Finalize"
+        assert sl.display_label_for("final_rescue", pipeline="noseg") == "Finalize"
+        # Stage label (raw) still reads the action name
+        assert sl.PHASE_DISPLAY_LABELS["final_rescue"] == "Final Rescue"
 
     def test_seg_verbose_superset_of_default(self):
         # phase1 collapses to (prune + sub-steps) in verbose
