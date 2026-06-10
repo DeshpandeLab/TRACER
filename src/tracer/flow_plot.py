@@ -373,7 +373,10 @@ def _render_plotly(
     phase_pos = {p: i for i, p in enumerate(phases)}
 
     src, tgt, val, link_colors, hover = [], [], [], [], []
-    total_tx = int(tidy["n"].sum()) or 1
+    # Total tx = mass in any one column (conserved). `tidy["n"].sum()`
+    # would multiply this by the number of boundaries, giving percentages
+    # ~Nboundaries× too small.
+    total_tx = int(tidy[tidy["phase_from"] == phases[0]]["n"].sum()) or 1
     for _, r in tidy.iterrows():
         i_from = phase_pos[r["phase_from"]]
         i_to = phase_pos[r["phase_to"]]
