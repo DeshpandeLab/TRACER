@@ -402,7 +402,11 @@ def _render_plotly(
             font=dict(size=12), xanchor="center",
         ))
 
-    # Legend via invisible scatter traces (one per class).
+    # Legend via invisible scatter traces — auto-filtered to classes that
+    # actually appear in tidy (otherwise dead swatches appear for codes the
+    # data never produces, e.g. component/dropped on modern SEG runs).
+    present = set(tidy["class_from"]) | set(tidy["class_to"])
+    legend_classes = [c for c in classes if c in present]
     legend_traces = [
         go.Scatter(
             x=[None], y=[None], mode="markers",
@@ -410,7 +414,7 @@ def _render_plotly(
             name=sl.CLASS_NAMES.get(c, str(c)),
             showlegend=True, hoverinfo="skip",
         )
-        for c in classes
+        for c in legend_classes
     ]
 
     fig = go.Figure(data=[sankey, *legend_traces])
@@ -601,16 +605,20 @@ def _render_matplotlib(
         ax.spines[spine].set_visible(False)
     ax.tick_params(axis="x", length=0, pad=4)
 
-    # Legend for entity classes
+    # Legend for entity classes — auto-filter to classes that actually
+    # appear in tidy (otherwise the legend shows dead swatches for codes
+    # the data never produces, e.g. component/dropped on modern SEG runs).
+    present = set(tidy["class_from"]) | set(tidy["class_to"])
+    legend_classes = [c for c in classes if c in present]
     legend_handles = [
         Patch(facecolor=palette[c], edgecolor="none",
               label=sl.CLASS_NAMES.get(c, str(c)))
-        for c in classes
+        for c in legend_classes
     ]
     ax.legend(
         handles=legend_handles,
         loc="upper center", bbox_to_anchor=(0.5, -0.18),
-        ncol=len(classes), frameon=False, fontsize=10,
+        ncol=max(1, len(legend_classes)), frameon=False, fontsize=10,
         title="Entity class", title_fontsize=10,
     )
 
