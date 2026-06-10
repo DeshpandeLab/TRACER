@@ -39,6 +39,22 @@ CLASS_COLLAPSE_3 = {
     CLASS_DROPPED: CLASS_UNASSIGNED,
 }
 
+# Canonical top-to-bottom visual order. Read as a confidence/state
+# gradient: high-confidence assigned (main) at the top, terminal eviction
+# (dropped) at the bottom. The 5 canonical codes (0..4) coincidentally
+# happen to be assigned in this order, but the order is semantic, not
+# numeric — extended palettes (e.g. main_neighbor=5) should pass an
+# explicit class_order to plot_transcript_flow to place new codes near
+# their semantic sibling. Codes absent from this list fall back to
+# sorted-by-code at the bottom.
+CLASS_SEMANTIC_ORDER = [
+    CLASS_MAIN,
+    CLASS_PARTIAL,
+    CLASS_COMPONENT,
+    CLASS_UNASSIGNED,
+    CLASS_DROPPED,
+]
+
 # Sentinel id strings
 _UNASSIGNED_SENTINELS = frozenset({"-1"})
 _DROPPED_SENTINELS = frozenset({"DROP", "demote_rejected"})

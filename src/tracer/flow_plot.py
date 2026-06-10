@@ -269,14 +269,22 @@ def _resolve_class_order(palette: dict,
                          class_order: Optional[Sequence[int]]) -> list[int]:
     """Resolve top-to-bottom visual class ordering.
 
-    Default (None): ascending by class code (matches semantic order of the
-    5-class vocabulary). With a user-supplied list: validate all codes are
-    in the palette, then append any palette codes the user omitted at the
-    bottom (so they're still drawn — silent loss would be worse).
+    Default (None): the semantic order defined in `sl.CLASS_SEMANTIC_ORDER`
+    (main → partial → component → unassigned → dropped), filtered to codes
+    present in `palette`. Palette codes outside that list are appended at
+    the bottom, sorted ascending — extended palettes (e.g. main_neighbor=5)
+    should pass an explicit `class_order` to slot new codes near their
+    semantic sibling rather than landing at the bottom by default.
+
+    With a user-supplied list: validate all codes are in the palette, then
+    append any palette codes the user omitted at the bottom (so they're
+    still drawn — silent loss would be worse).
     """
-    if class_order is None:
-        return sorted(palette.keys())
     palette_keys = set(palette.keys())
+    if class_order is None:
+        in_canonical = [c for c in sl.CLASS_SEMANTIC_ORDER if c in palette_keys]
+        leftover = sorted(palette_keys - set(in_canonical))
+        return in_canonical + leftover
     bad = [c for c in class_order if c not in palette_keys]
     if bad:
         raise ValueError(

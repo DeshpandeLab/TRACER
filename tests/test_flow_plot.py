@@ -108,12 +108,23 @@ class TestResolveClassOrder:
             sl.CLASS_MAIN: "#1f77b4",
             sl.CLASS_PARTIAL: "#2ca02c",
             sl.CLASS_UNASSIGNED: "#7f7f7f",
-            5: "#ff7f0e",  # main_neighbor
+            5: "#ff7f0e",  # extended code (e.g. main_neighbor)
         }
 
-    def test_default_is_sorted_by_code(self):
+    def test_default_follows_canonical_semantic_order(self):
+        # Canonical codes (0..4) in palette → semantic order
+        # (main → partial → unassigned for this 3-canonical subset).
+        # Extended code 5 has no canonical position → appended at the bottom.
         out = fp._resolve_class_order(self._toy_palette(), None)
         assert out == [sl.CLASS_MAIN, sl.CLASS_PARTIAL, sl.CLASS_UNASSIGNED, 5]
+
+    def test_default_matches_semantic_order_for_full_5(self):
+        full_palette = {
+            sl.CLASS_MAIN: "a", sl.CLASS_PARTIAL: "b",
+            sl.CLASS_COMPONENT: "c", sl.CLASS_UNASSIGNED: "d",
+            sl.CLASS_DROPPED: "e",
+        }
+        assert fp._resolve_class_order(full_palette, None) == list(sl.CLASS_SEMANTIC_ORDER)
 
     def test_explicit_order_is_respected(self):
         custom = [sl.CLASS_MAIN, 5, sl.CLASS_PARTIAL, sl.CLASS_UNASSIGNED]
