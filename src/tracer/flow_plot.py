@@ -168,6 +168,7 @@ def plot_transcript_flow(
     palette: Optional[dict] = None,
     title: Optional[str] = None,
     backend: str = "plotly",
+    label_target: str = "columns",
     output=None,
     return_data: bool = False,
 ):
@@ -186,6 +187,17 @@ def plot_transcript_flow(
         place extended codes (e.g. ``main_neighbor``) next to their semantic
         sibling. Every code in the list must be in ``palette``; codes in
         ``palette`` not listed are appended at the bottom.
+    label_target : {"columns", "ribbons", "both"}, default "columns"
+        Where to place phase labels.
+        - ``"columns"``: state labels under each column (current default).
+        - ``"ribbons"``: stage labels at midpoints between columns, above
+          the ribbons. Conceptually correct since ribbons ARE the stages
+          (a column is the state after its preceding stage ran).
+        - ``"both"``: state labels at columns AND stage labels above ribbons.
+        Stage labels bypass any ``column_label_prefix`` the caller may
+        have set via patching ``sl.display_label_for`` — they use the raw
+        ``PHASE_DISPLAY_LABELS`` lookup. matplotlib backend only for now;
+        plotly currently ignores ``label_target``.
     """
     df_cols = set(transcripts.columns)
 
@@ -226,9 +238,22 @@ def plot_transcript_flow(
         sl.display_label_for(p, pipeline=resolved_pipeline, view=view)
         for p in phases
     ]
+    # Stage labels for the ribbons (action names) — bypass any caller
+    # column-label prefix by looking up PHASE_DISPLAY_LABELS directly,
+    # with the same Tier-A inverse-collapse logic as display_label_for.
+    def _raw_stage_label(phase_key: str) -> str:
+        if view == "collapsed":
+            inverse = (sl._INVERSE_COLLAPSE_SEG if resolved_pipeline == "seg"
+                       else sl._INVERSE_COLLAPSE_NOSEG)
+            key = inverse.get(phase_key, phase_key)
+            return sl.PHASE_DISPLAY_LABELS.get(key, key)
+        return sl.PHASE_DISPLAY_LABELS.get(phase_key, phase_key)
+    stage_labels = [_raw_stage_label(p) for p in phases[1:]]
 
     if backend == "matplotlib":
         fig = _render_matplotlib(tidy, phases, display_labels=display_labels,
+                                 stage_labels=stage_labels,
+                                 label_target=label_target,
                                  title=title, class_grouping=class_grouping,
                                  class_order=class_order,
                                  palette=palette, color_by=color_by)
@@ -580,6 +605,8 @@ def _render_matplotlib(
     phases: Sequence[str],
     *,
     display_labels: Optional[Sequence[str]] = None,
+    stage_labels: Optional[Sequence[str]] = None,
+    label_target: str = "columns",
     title: Optional[str],
     class_grouping: str,
     class_order: Optional[Sequence[int]] = None,
@@ -595,6 +622,10 @@ def _render_matplotlib(
     classes = _resolve_class_order(palette, class_order)
     if display_labels is None:
         display_labels = [sl.PHASE_DISPLAY_LABELS.get(p, p) for p in phases]
+    if stage_labels is None:
+        stage_labels = [sl.PHASE_DISPLAY_LABELS.get(p, p) for p in phases[1:]]
+    if label_target not in {"columns", "ribbons", "both"}:
+        raise ValueError(f"label_target must be 'columns'|'ribbons'|'both', got {label_target!r}")
 
     fig, ax = plt.subplots(figsize=(max(9, 1.8 * n_phases), 6.5))
     x_pos = np.linspace(0, 1, n_phases)
@@ -606,17 +637,28 @@ def _render_matplotlib(
         ax, tidy, phases, x_pos, node_y_top, total_tx, palette, classes, color_by,
     )
 
-    # Phase labels on the X axis (xticks), not in-situ text
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(display_labels, fontsize=10, fontweight="bold",
-                       rotation=20, ha="right")
+    # Column (state) labels on the X axis
+    if label_target in {"columns", "both"}:
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(display_labels, fontsize=10, fontweight="bold",
+                           rotation=20, ha="right")
+    else:
+        ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlim(-0.05, 1.05)
-    ax.set_ylim(0.0, 1.02)
-    # Hide top/right spines; keep bottom for the axis labels
+    # Reserve extra headroom when ribbon labels are placed above ribbons
+    top_ylim = 1.12 if label_target in {"ribbons", "both"} else 1.02
+    ax.set_ylim(0.0, top_ylim)
     for spine in ("top", "right", "left"):
         ax.spines[spine].set_visible(False)
     ax.tick_params(axis="x", length=0, pad=4)
+
+    # Stage (action) labels above the ribbons, at midpoints between columns
+    if label_target in {"ribbons", "both"}:
+        for i, lbl in enumerate(stage_labels):
+            x_mid = (x_pos[i] + x_pos[i + 1]) / 2
+            ax.text(x_mid, 1.04, lbl, ha="center", va="bottom",
+                    fontsize=10, fontweight="bold", style="italic")
 
     # Legend for entity classes — auto-filter to classes that actually
     # appear in tidy (otherwise the legend shows dead swatches for codes

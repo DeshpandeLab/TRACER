@@ -52,6 +52,17 @@ class TestClassifyEtypeVec:
         etypes = np.array(["cell"], dtype=object)
         assert sl._classify_etype_vec(ids, etypes)[0] == sl.CLASS_UNASSIGNED
 
+    def test_post_finalize_unassigned_token(self):
+        # After finalize_unassigned, leftover -1 tx get id "UNASSIGNED"
+        # (the canonical pipeline-output sentinel). Must still classify as
+        # CLASS_UNASSIGNED — earlier the classifier missed this and the
+        # tx fell through to CLASS_PARTIAL.
+        ids = np.array(["UNASSIGNED", "nan",
+                        "prune_rejected", "group_rejected"], dtype=object)
+        etypes = np.array(["unknown"] * 4, dtype=object)
+        out = sl._classify_etype_vec(ids, etypes)
+        assert (out == sl.CLASS_UNASSIGNED).all()
+
 
 class TestConstants:
     def test_class_codes_unique(self):

@@ -55,8 +55,16 @@ CLASS_SEMANTIC_ORDER = [
     CLASS_DROPPED,
 ]
 
-# Sentinel id strings
-_UNASSIGNED_SENTINELS = frozenset({"-1"})
+# Sentinel id strings — must mirror tracer.spatial.UNASSIGNED_LABELS so
+# pre- and post-finalize tx classify consistently. After finalize_unassigned
+# the leftover -1 tx are normalized to "UNASSIGNED"; mid-pipeline stage-
+# rejection tokens (prune_rejected / group_rejected) also live in the
+# unassigned class. "DROP" and "demote_rejected" survive separately as
+# "dropped" since older runs emitted them as distinct terminal states.
+_UNASSIGNED_SENTINELS = frozenset({
+    "-1", "UNASSIGNED", "nan",
+    "prune_rejected", "group_rejected",
+})
 _DROPPED_SENTINELS = frozenset({"DROP", "demote_rejected"})
 
 
