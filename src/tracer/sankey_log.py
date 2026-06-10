@@ -135,12 +135,33 @@ PHASE_DISPLAY_LABELS = {
     "mid_qc":             "Mid QC",
     # NOSEG
     "cascade":            "Cascade",
-    # Tier A collapsed (both pipelines)
-    "phase1+rescue":            "Prune + Rescue",
-    "group+rescue":             "Group + Rescue",
-    "stitch+demote+rescue":     "Stitch + Demote + Rescue",
-    "cascade+rescue":           "Cascade + Rescue",
+    # Tier A collapsed (both pipelines) — name after the principal earlier
+    # stage; the post-stage rescues / demotes are folded silently.
+    "phase1+rescue":            "Prune",
+    "group+rescue":             "Group",
+    "stitch+demote+rescue":     "Stitch",
+    "cascade+rescue":           "Cascade",
 }
+
+
+# Inverse-collapse maps — given a source snapshot column (the end-of-group
+# column the data is actually drawn from), look up the collapsed display key
+# whose label should appear above that column in Tier A.
+_INVERSE_COLLAPSE_SEG = {v: k for k, v in COLLAPSE_SEG.items()}
+_INVERSE_COLLAPSE_NOSEG = {v: k for k, v in COLLAPSE_NOSEG.items()}
+
+
+def display_label_for(phase_key: str, *, pipeline: str = "seg",
+                      view: str = "default") -> str:
+    """Look up the user-facing label for a phase. For Tier A (collapsed),
+    inverts the COLLAPSE map so a source column like 'rescue' is shown as
+    'Prune' rather than 'Rescue'."""
+    if view == "collapsed":
+        inverse = (_INVERSE_COLLAPSE_SEG if pipeline == "seg"
+                   else _INVERSE_COLLAPSE_NOSEG)
+        key = inverse.get(phase_key, phase_key)
+        return PHASE_DISPLAY_LABELS.get(key, key)
+    return PHASE_DISPLAY_LABELS.get(phase_key, phase_key)
 
 
 # ─── snapshot helper ───────────────────────────────────────────────────

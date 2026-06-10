@@ -206,13 +206,22 @@ def plot_transcript_flow(
                 axis=1
             )].reset_index(drop=True)
 
+    # Resolve display labels per phase (Tier A inverts COLLAPSE maps so a
+    # source column like `rescue` shows as `Prune`, not `Rescue`).
+    resolved_pipeline = (_detect_pipeline(df_cols) if pipeline == "auto"
+                        else pipeline)
+    display_labels = [
+        sl.display_label_for(p, pipeline=resolved_pipeline, view=view)
+        for p in phases
+    ]
+
     if backend == "matplotlib":
-        fig = _render_matplotlib(tidy, phases, title=title,
-                                 class_grouping=class_grouping,
+        fig = _render_matplotlib(tidy, phases, display_labels=display_labels,
+                                 title=title, class_grouping=class_grouping,
                                  palette=palette, color_by=color_by)
     elif backend == "plotly":
-        fig = _render_plotly(tidy, phases, title=title,
-                             class_grouping=class_grouping,
+        fig = _render_plotly(tidy, phases, display_labels=display_labels,
+                             title=title, class_grouping=class_grouping,
                              palette=palette, color_by=color_by)
     else:
         raise ValueError(
@@ -255,6 +264,7 @@ def _render_plotly(
     tidy: pd.DataFrame,
     phases: Sequence[str],
     *,
+    display_labels: Optional[Sequence[str]] = None,
     title: Optional[str],
     class_grouping: str,
     palette: Optional[dict],
@@ -275,13 +285,15 @@ def _render_plotly(
     classes = sorted(palette.keys())
     class_idx = {c: i for i, c in enumerate(classes)}
     K = len(classes)
+    if display_labels is None:
+        display_labels = [sl.PHASE_DISPLAY_LABELS.get(p, p) for p in phases]
 
+    # Node labels show only the class (column header carries the phase).
     node_labels = []
     node_colors = []
-    for p in phases:
-        ph_label = sl.PHASE_DISPLAY_LABELS.get(p, p)
+    for _ in phases:
         for c in classes:
-            node_labels.append(f"{ph_label}: {sl.CLASS_NAMES.get(c, str(c))}")
+            node_labels.append(sl.CLASS_NAMES.get(c, str(c)))
             node_colors.append(palette[c])
 
     def _idx(phase_pos: int, c: int) -> int:
@@ -291,7 +303,6 @@ def _render_plotly(
 
     src, tgt, val, link_colors, hover = [], [], [], [], []
     total_tx = int(tidy["n"].sum()) or 1
-    # Per-boundary totals to compute fraction; use to_class incoming total
     for _, r in tidy.iterrows():
         i_from = phase_pos[r["phase_from"]]
         i_to = phase_pos[r["phase_to"]]
@@ -300,23 +311,32 @@ def _render_plotly(
         val.append(int(r["n"]))
         color_class = (r["class_from"] if color_by == "source"
                        else r["class_to"])
-        # Translucent hex w/ alpha — use rgba string
         hex_ = palette[color_class].lstrip("#")
         rr, gg, bb = (int(hex_[i:i+2], 16) for i in (0, 2, 4))
         link_colors.append(f"rgba({rr},{gg},{bb},0.45)")
         pct = 100 * r["n"] / total_tx
+        # Use display labels in hover too.
         hover.append(
-            f"{r['phase_from']} → {r['phase_to']}<br>"
+            f"{display_labels[i_from]} → {display_labels[i_to]}<br>"
             f"{sl.CLASS_NAMES.get(int(r['class_from']),'?')} → "
             f"{sl.CLASS_NAMES.get(int(r['class_to']),'?')}<br>"
             f"{int(r['n']):,} transcripts ({pct:.2f}%)"
         )
 
     sankey = go.Sankey(
+        arrangement="snap",  # respect node.x positions
         node=dict(
             pad=15, thickness=18,
             line=dict(color="black", width=0.3),
             label=node_labels, color=node_colors,
+            # Pin each node to its phase column so column-header annotations
+            # align with the actual node positions.
+            x=[max(0.001, min(0.999, phase_pos[p] / max(1, len(phases) - 1)))
+               for p in phases for _ in classes],
+            # Force y to a stable value per class so colors stack identically
+            # across columns (avoids plotly auto-shuffling).
+            y=[max(0.001, min(0.999, (class_idx[c] + 0.5) / K))
+               for _ in phases for c in classes],
         ),
         link=dict(
             source=src, target=tgt, value=val,
@@ -324,10 +344,42 @@ def _render_plotly(
             hovertemplate="%{customdata}<extra></extra>",
         ),
     )
-    fig = go.Figure(data=[sankey])
+
+    # Column-header annotations along the X axis (top of the figure).
+    n_phases = len(phases)
+    annotations = []
+    for i, lbl in enumerate(display_labels):
+        xref_val = (i / max(1, n_phases - 1)) if n_phases > 1 else 0.5
+        annotations.append(dict(
+            x=xref_val, y=1.06, xref="paper", yref="paper",
+            text=f"<b>{lbl}</b>", showarrow=False,
+            font=dict(size=12), xanchor="center",
+        ))
+
+    # Legend via invisible scatter traces (one per class).
+    legend_traces = [
+        go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=12, color=palette[c]),
+            name=sl.CLASS_NAMES.get(c, str(c)),
+            showlegend=True, hoverinfo="skip",
+        )
+        for c in classes
+    ]
+
+    fig = go.Figure(data=[sankey, *legend_traces])
     fig.update_layout(
         title_text=title or "Transcript-assignment flow through pipeline phases",
-        font_size=11, margin=dict(l=20, r=20, t=50, b=20),
+        font_size=11,
+        margin=dict(l=20, r=20, t=80, b=40),
+        annotations=annotations,
+        legend=dict(
+            title="Entity class",
+            orientation="h", x=0.5, y=-0.08,
+            xanchor="center", yanchor="top",
+        ),
+        xaxis=dict(visible=False, range=[0, 1]),
+        yaxis=dict(visible=False, range=[0, 1]),
     )
     return fig
 
@@ -345,14 +397,26 @@ def _layout_nodes_mpl(
     - node_y_top: dict[(phase, class)] -> (y_top, y_bot)
     - total_tx: int (total transcripts in the first phase)
     """
-    # 1) Compute per-phase per-class totals from tidy
+    # 1) Compute per-phase per-class totals from tidy.
+    #    Use BOTH incoming and outgoing edges so a phase that lost an
+    #    entire incoming boundary to `drop_unchanged` (because it was
+    #    pure identity) still gets a complete node layout sourced from
+    #    its outgoing-edge mass.
     per_phase_totals = {}
+    n_phases = len(phases)
     for i, p in enumerate(phases):
-        if i == 0:
-            grp = tidy[tidy["phase_from"] == p].groupby("class_from")["n"].sum()
-        else:
-            grp = tidy[tidy["phase_to"] == p].groupby("class_to")["n"].sum()
-        per_phase_totals[p] = grp.to_dict()
+        grp_in = (tidy[tidy["phase_to"] == p]
+                  .groupby("class_to")["n"].sum() if i > 0
+                  else pd.Series(dtype="int64"))
+        grp_out = (tidy[tidy["phase_from"] == p]
+                   .groupby("class_from")["n"].sum() if i < n_phases - 1
+                   else pd.Series(dtype="int64"))
+        # Either direction is a valid total (they agree when nothing was
+        # dropped). When drop_unchanged ate one side, use the other.
+        totals: dict[int, int] = {}
+        for c in set(grp_in.index) | set(grp_out.index):
+            totals[int(c)] = int(max(grp_in.get(c, 0), grp_out.get(c, 0)))
+        per_phase_totals[p] = totals
     total_tx = sum(per_phase_totals[phases[0]].values()) or 1
 
     # 2) Draw vertical node bars and record y-extents
@@ -452,6 +516,7 @@ def _render_matplotlib(
     tidy: pd.DataFrame,
     phases: Sequence[str],
     *,
+    display_labels: Optional[Sequence[str]] = None,
     title: Optional[str],
     class_grouping: str,
     palette: Optional[dict],
@@ -459,12 +524,15 @@ def _render_matplotlib(
 ):
     """Hand-rolled flow polygons with matplotlib. No hover; PNG-friendly."""
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     palette = _palette_for(class_grouping, palette)
     n_phases = len(phases)
     classes = sorted(palette.keys())
+    if display_labels is None:
+        display_labels = [sl.PHASE_DISPLAY_LABELS.get(p, p) for p in phases]
 
-    fig, ax = plt.subplots(figsize=(max(8, 1.6 * n_phases), 6))
+    fig, ax = plt.subplots(figsize=(max(9, 1.8 * n_phases), 6.5))
     x_pos = np.linspace(0, 1, n_phases)
 
     node_y_top, total_tx = _layout_nodes_mpl(
@@ -474,17 +542,34 @@ def _render_matplotlib(
         ax, tidy, phases, x_pos, node_y_top, total_tx, palette, classes, color_by,
     )
 
-    # Phase labels at top
-    for i, p in enumerate(phases):
-        ax.text(x_pos[i], 1.04, sl.PHASE_DISPLAY_LABELS.get(p, p),
-                ha="center", va="bottom", fontsize=10, fontweight="bold")
-
+    # Phase labels on the X axis (xticks), not in-situ text
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(display_labels, fontsize=10, fontweight="bold",
+                       rotation=20, ha="right")
+    ax.set_yticks([])
     ax.set_xlim(-0.05, 1.05)
-    ax.set_ylim(0.0, 1.1)
-    ax.set_axis_off()
+    ax.set_ylim(0.0, 1.02)
+    # Hide top/right spines; keep bottom for the axis labels
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(axis="x", length=0, pad=4)
+
+    # Legend for entity classes
+    legend_handles = [
+        Patch(facecolor=palette[c], edgecolor="none",
+              label=sl.CLASS_NAMES.get(c, str(c)))
+        for c in classes
+    ]
+    ax.legend(
+        handles=legend_handles,
+        loc="upper center", bbox_to_anchor=(0.5, -0.18),
+        ncol=len(classes), frameon=False, fontsize=10,
+        title="Entity class", title_fontsize=10,
+    )
+
     if title:
-        fig.suptitle(title, fontsize=12)
-    fig.tight_layout()
+        fig.suptitle(title, fontsize=12, y=0.98)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.96))
     return fig
 
 
