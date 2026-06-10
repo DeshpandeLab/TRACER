@@ -375,14 +375,15 @@ def _render_plotly(
             pad=15, thickness=18,
             line=dict(color="black", width=0.3),
             label=node_labels, color=node_colors,
-            # Pin each node to its phase column so column-header annotations
-            # align with the actual node positions.
+            # Pin x so columns stay aligned with the header annotations.
+            # Do NOT pin y — empty (phase, class) cells would force plotly
+            # to allocate vertical slots for zero-width bands, breaking
+            # flow conservation in the link allocator and leaving visible
+            # gaps (e.g. a main band whose outgoing mass to unassigned
+            # doesn't appear). Letting plotly auto-balance y per column
+            # makes the bands snap to actual flow.
             x=[max(0.001, min(0.999, phase_pos[p] / max(1, len(phases) - 1)))
                for p in phases for _ in classes],
-            # Force y to a stable value per class so colors stack identically
-            # across columns (avoids plotly auto-shuffling).
-            y=[max(0.001, min(0.999, (class_idx[c] + 0.5) / K))
-               for _ in phases for c in classes],
         ),
         link=dict(
             source=src, target=tgt, value=val,
