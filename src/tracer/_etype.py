@@ -169,3 +169,62 @@ def infer_entity_type_etype(
     Series with the same vocabulary as the legacy helper.
     """
     return df[type_col].astype(str)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Post-merge etype homogenization
+#
+# Any pipeline stage that merges entities (Phase1-Maha-Remerge, Stitch,
+# anything else that calls a DSU union and remaps `entity_col`) must
+# leave the resulting entity with a single `_etype` value across all
+# its rows. Without this invariant, `df.groupby(...)["_etype"].first()`
+# in `build_entity_table` and downstream is non-deterministic, which
+# can silently misclassify a merged entity and break the cell-cell
+# merge gate (`stitching.can_merge`).
+#
+# Convention: when multiple etypes are present, the highest-priority
+# one wins. The order reflects the value of the assignment as
+# evidence for the entity's identity — a real cell beats a partial
+# sub-program; a component beats a partial; demoted/unknown trails
+# everything.
+#
+# Use `homogenize_etype_for_entity` per affected root after each
+# union — O(merges) work, not O(N entities).
+# ─────────────────────────────────────────────────────────────────────
+_ETYPE_PRIORITY = {
+    "cell": 0,       # strongest evidence — full nuclear-anchored cell
+    "partial": 1,    # sub-partition of a real cell, also nuclear-anchored
+    "component": 2,  # UNASSIGNED_* group — clustered residual tx
+    "drop": 3,       # explicitly demoted
+    "unknown": 4,    # unclassified / sentinel
+}
+
+
+def homogenize_etype_for_entity(
+    df: pd.DataFrame,
+    entity_label: str,
+    *,
+    entity_col: str = "tracer_id",
+    etype_col: str = "_etype",
+) -> None:
+    """In-place: ensure every row of ``entity_label`` shares a single
+    ``_etype`` value (the highest-priority etype present in the group).
+
+    No-op when:
+      - ``etype_col`` is not in df
+      - no row matches ``entity_label``
+      - the entity is already homogeneous
+
+    Designed to be called right after a DSU union + entity_col remap
+    by the stage that did the merge. Cheap and idempotent.
+    """
+    if etype_col not in df.columns:
+        return
+    mask = df[entity_col].astype(str).to_numpy() == str(entity_label)
+    if not mask.any():
+        return
+    present = pd.unique(df.loc[mask, etype_col].astype(str))
+    if len(present) <= 1:
+        return
+    winner = min(present, key=lambda e: _ETYPE_PRIORITY.get(e, 99))
+    df.loc[mask, etype_col] = winner

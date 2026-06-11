@@ -2760,7 +2760,10 @@ def apply_stitching_to_transcripts_memory_efficient(
             df_out[out_col] = pd.Categorical.from_codes(out_codes, categories=new_categories)
         if debug_stages and debug_legacy_col != out_col:
             df_out[debug_legacy_col] = df_out[out_col].copy()
-        return df_out, entity_to_stitched
+        # Fall through to the shared homogenize block below — do NOT
+        # early-return; otherwise the categorical fast path skips the
+        # _etype homogenization and downstream `.first()` becomes
+        # non-deterministic.
     elif map_mode == "chunked":
         ent_str = ent.astype(str)
         df_out[out_col] = ent_str
@@ -2787,44 +2790,38 @@ def apply_stitching_to_transcripts_memory_efficient(
     if debug_stages and debug_legacy_col != out_col:
         df_out[debug_legacy_col] = df_out[out_col].copy()
 
-    # Propagate `_etype` to match the post-stitch labels. `summary`
-    # carries one etype per original entity; the merge target's etype
-    # is what survives. Build a label→etype map from summary and
-    # remap. Without this, tx of merged-in entities keep their
-    # original (now-stale) etype, which can bias downstream
-    # entity-level classification (the `.first()` aggregation in
-    # build_entity_table picks non-deterministic etype within the
-    # merged entity).
-    if "_etype" in df_out.columns and "etype" in summary.columns:
-        # summary has entity_id (original) and etype. Map original →
-        # stitched label, then dedupe by stitched label (winning etype
-        # is one of the merged-set etypes; pick the first per stitched-
-        # label group, which corresponds to the stitch target's etype
-        # since stitch targets retain their own ID).
-        s_label = pd.Series(summary["etype"].to_numpy(),
-                             index=summary["entity_id"].astype(str))
-        # Map each original entity to its stitched label
-        stitched_label = pd.Series(
-            {k: entity_to_stitched.get(k, k) for k in s_label.index},
-            index=s_label.index,
+    # Homogenize `_etype` on every stitched label that ended up
+    # heterogeneous. Without this, rows of merged-in entities keep their
+    # original (now-stale) etype, and downstream
+    # `df.groupby(entity_col)["_etype"].first()` becomes non-deterministic
+    # — silently miscoding a merged entity and breaking the cell-cell
+    # merge gate in any subsequent stitch pass.
+    #
+    # NOTE on scope: summary uses `etype_filter=("cell",)` by default, so
+    # non-cell pre-stitch entities (partials/components) never appear in
+    # entity_to_stitched. They keep their original tracer_id as the
+    # stitched label, and their rows can still end up grouped with cell
+    # rows under the same stitched label (when a cell entity's id equals
+    # a partial's parent prefix). So we homogenize all heterogeneous
+    # stitched labels rather than only those reachable via summary —
+    # still O(heterogeneous labels), not O(N). See `tracer._etype.
+    # homogenize_etype_for_entity` for the priority rule.
+    if "_etype" in df_out.columns:
+        from ._etype import homogenize_etype_for_entity
+        # Find stitched labels whose rows have heterogeneous _etype.
+        _SENT = {"-1", "DROP", "UNASSIGNED", "nan"}
+        labels = df_out[out_col].astype(str)
+        sub_mask = ~labels.isin(_SENT)
+        het_labels = (
+            df_out.loc[sub_mask, [out_col, "_etype"]]
+            .astype({out_col: str, "_etype": str})
+            .groupby(out_col)["_etype"].nunique()
         )
-        # For each stitched label, prefer the etype of the entity whose
-        # ID equals the stitched label itself (the merge target).
-        target_etype: dict[str, str] = {}
-        for orig, stitched in stitched_label.items():
-            if orig == stitched:
-                target_etype[stitched] = str(s_label.loc[orig])
-        # For entities that didn't survive but whose target wasn't in
-        # the summary (shouldn't happen but defensive), fall back to
-        # the original etype.
-        for orig, stitched in stitched_label.items():
-            target_etype.setdefault(stitched, str(s_label.loc[orig]))
-        new_labels = df_out[out_col].astype(str)
-        new_etype = new_labels.map(target_etype)
-        # Where the new label has no entry in the map (e.g.,
-        # unassigned), keep the existing _etype value.
-        keep_existing = new_etype.isna()
-        if (~keep_existing).any():
-            df_out.loc[~keep_existing, "_etype"] = new_etype[~keep_existing].astype(str).to_numpy()
+        het_labels = het_labels[het_labels > 1].index.tolist()
+        for stitched_root in het_labels:
+            homogenize_etype_for_entity(
+                df_out, stitched_root,
+                entity_col=out_col, etype_col="_etype",
+            )
 
     return df_out, entity_to_stitched

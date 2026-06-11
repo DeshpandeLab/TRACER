@@ -320,6 +320,20 @@ def phase1_maha_remerge(
         df.loc[keep_mask, entity_col] = df.loc[keep_mask, entity_col].astype(str).map(
             lambda x: remap.get(x, x)
         )
+        # Homogenize _etype on every affected merged entity. Without this
+        # the merged entity carries mixed-_etype rows (cell tx from one
+        # side, partial tx from the other), and downstream
+        # `groupby(entity_col)["_etype"].first()` becomes non-deterministic
+        # — silently miscoding the entity for the cell-cell merge gate in
+        # Stitch. See `tracer._etype.homogenize_etype_for_entity` for the
+        # priority rule.
+        if "_etype" in df.columns:
+            from ._etype import homogenize_etype_for_entity
+            affected_roots = {dsu.find(p["a"]) for p in pairs_rescued}
+            for root in affected_roots:
+                homogenize_etype_for_entity(
+                    df, root, entity_col=entity_col, etype_col="_etype",
+                )
 
     stats = dict(
         n_candidates=len(cand),
