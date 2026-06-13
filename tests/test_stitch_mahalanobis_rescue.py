@@ -350,3 +350,42 @@ def test_default_none_does_not_invoke_rescue():
     )
     assert _LAST_GATE_STATS.get("mahalanobis_rescues", 0) == 0
     assert _LAST_GATE_STATS.get("mahalanobis_rescue_checks", 0) == 0
+
+
+# ---------------------------------------------------------------------
+# Post-merge _etype homogenization in Stitch (the original Long bug)
+# ---------------------------------------------------------------------
+
+def test_stitch_homogenizes_merged_etype():
+    """Merging a cell with a partial yields a stitched label whose rows
+    share a single `_etype` (cell wins). Reproduces the failure mode
+    where a heterogeneous merged entity makes `groupby.first()`
+    non-deterministic and bypasses the cell-cell merge gate."""
+    from tracer._etype import ETYPE_DTYPE
+    rng = np.random.default_rng(0)
+    aux, pool_A, pool_B = _build_aux_and_pools(
+        prog_size=10, overlap_frac=0.70, cross=0.0,
+    )
+    a = _gauss_entity("a-1-1", 60, center=(0.0, 0.0, 0.0),
+                      sigma=2.0, gene_pool=pool_A, rng=rng)
+    b = _gauss_entity("b-1-1", 60, center=(0.0, 0.0, 0.0),
+                      sigma=2.0, gene_pool=pool_B, rng=rng)
+    a["_etype"] = "cell"   # A is a cell; B keeps the default "partial"
+    df = pd.concat([a, b], ignore_index=True)
+    df["_etype"] = df["_etype"].astype(ETYPE_DTYPE)
+
+    df_on, _ = apply_stitching_to_transcripts_memory_efficient(
+        df.copy(), aux=aux,
+        mahalanobis_d_rescue=1.0, rescue_delta_c_floor=-0.2,
+        candidate_source="grid", G=2.0, G_z=2.0, z_neighbor_depth=1,
+        dist_threshold=10.0, deltaC_min=0.03, max_merger_depth=None,
+        c_union_bypass=None, show_progress=False,
+    )
+    lab = df_on["tracer_id"].astype(str)
+    assert lab.nunique() == 1, (
+        f"cell+partial should merge into one entity; got n={lab.nunique()}"
+    )
+    per_label = df_on.groupby(lab)["_etype"].agg(lambda s: set(s.astype(str)))
+    assert per_label.iloc[0] == {"cell"}, (
+        f"merged _etype not homogenized: {per_label.iloc[0]}"
+    )

@@ -169,3 +169,101 @@ def infer_entity_type_etype(
     Series with the same vocabulary as the legacy helper.
     """
     return df[type_col].astype(str)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Post-merge etype homogenization
+#
+# Any pipeline stage that merges entities (Phase1-Maha-Remerge, Stitch,
+# anything else that calls a DSU union and remaps `entity_col`) must
+# leave the resulting entity with a single `_etype` value across all
+# its rows. Without this invariant, `df.groupby(...)["_etype"].first()`
+# in `build_entity_table` and downstream is non-deterministic, which
+# can silently misclassify a merged entity and break the cell-cell
+# merge gate (`stitching.can_merge`).
+#
+# Convention: when multiple etypes are present, the highest-priority
+# one wins. The order reflects the value of the assignment as
+# evidence for the entity's identity — a real cell beats a partial
+# sub-program; a component beats a partial; demoted/unknown trails
+# everything.
+#
+# Use `homogenize_etype_for_entity` per affected root after each
+# union — O(merges) work, not O(N entities).
+# ─────────────────────────────────────────────────────────────────────
+_ETYPE_PRIORITY = {
+    "cell": 0,       # strongest evidence — full nuclear-anchored cell
+    "partial": 1,    # sub-partition of a real cell, also nuclear-anchored
+    "component": 2,  # UNASSIGNED_* group — clustered residual tx
+    "drop": 3,       # explicitly demoted
+    "unknown": 4,    # unclassified / sentinel
+}
+
+
+def homogenize_etype_for_entities(
+    df: pd.DataFrame,
+    entity_labels,
+    *,
+    entity_col: str = "tracer_id",
+    etype_col: str = "_etype",
+) -> None:
+    """In-place batch homogenization: give every entity in
+    ``entity_labels`` a single ``_etype`` (the highest-priority etype
+    present within that entity).
+
+    Cost: **one** O(N) scan of ``entity_col`` to locate the affected
+    rows, then the priority resolution runs over **only** those rows
+    (O(rows-in-affected)). This replaces the per-entity pattern that
+    re-scanned the whole column once *per entity* — so it is the
+    preferred form at merge call sites that touch many roots.
+
+    No-op when ``etype_col`` is absent, ``entity_labels`` is empty, or no
+    row matches. Idempotent: passing already-homogeneous entities (or
+    re-running) leaves the column unchanged.
+    """
+    if etype_col not in df.columns:
+        return
+    labels = {str(x) for x in entity_labels}
+    if not labels:
+        return
+    ent = df[entity_col].astype(str)
+    mask = ent.isin(labels).to_numpy()
+    if not mask.any():
+        return
+    # Mask first, then string-cast only the affected rows (avoids casting
+    # the full _etype column when few entities are touched).
+    sub_ent = ent.to_numpy()[mask]
+    sub_et = df[etype_col].to_numpy()[mask].astype(str)
+    prio = np.fromiter(
+        (_ETYPE_PRIORITY.get(e, 99) for e in sub_et),
+        dtype=np.int16, count=sub_et.shape[0],
+    )
+    # Winner per entity = the etype carried by its highest-priority
+    # (lowest-rank) row. Stable sort → deterministic; groupby-first picks
+    # the winner; reindex broadcasts it back to every affected row.
+    tmp = pd.DataFrame({"_ent": sub_ent, "_prio": prio, "_et": sub_et})
+    winners = (
+        tmp.sort_values("_prio", kind="stable")
+        .groupby("_ent", sort=False)["_et"]
+        .first()
+    )
+    df.loc[mask, etype_col] = winners.reindex(sub_ent).to_numpy()
+
+
+def homogenize_etype_for_entity(
+    df: pd.DataFrame,
+    entity_label: str,
+    *,
+    entity_col: str = "tracer_id",
+    etype_col: str = "_etype",
+) -> None:
+    """In-place: ensure every row of ``entity_label`` shares a single
+    ``_etype`` value (the highest-priority etype present in the group).
+
+    No-op when ``etype_col`` is absent, no row matches ``entity_label``,
+    or the entity is already homogeneous. Thin single-entity wrapper over
+    :func:`homogenize_etype_for_entities`; idempotent.
+    """
+    homogenize_etype_for_entities(
+        df, (entity_label,), entity_col=entity_col, etype_col=etype_col,
+    )

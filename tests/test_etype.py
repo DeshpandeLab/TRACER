@@ -440,3 +440,80 @@ def test_rerank_etype_unassigned_label_skipped():
     assert counts["-1"] == 1
 
 
+
+
+# ---------------------------------------------------------------------
+# Post-merge _etype homogenization (homogenize_etype_for_entity / _entities)
+# ---------------------------------------------------------------------
+
+def _etyped(labels, etypes):
+    from tracer._etype import ETYPE_DTYPE
+    df = pd.DataFrame({"tracer_id": labels, "_etype": etypes})
+    df["_etype"] = df["_etype"].astype(ETYPE_DTYPE)
+    return df
+
+
+def test_homogenize_noop_on_homogeneous_entity():
+    from tracer._etype import homogenize_etype_for_entity
+    df = _etyped(["42", "42", "42"], ["cell", "cell", "cell"])
+    homogenize_etype_for_entity(df, "42")
+    assert df["_etype"].astype(str).tolist() == ["cell", "cell", "cell"]
+
+
+@pytest.mark.parametrize(
+    "etypes, winner",
+    [
+        (["cell", "partial"], "cell"),
+        (["partial", "component"], "partial"),
+        (["component", "drop"], "component"),
+        (["drop", "unknown"], "drop"),
+        (["unknown", "partial", "cell"], "cell"),
+        (["component", "cell", "partial"], "cell"),
+    ],
+)
+def test_homogenize_priority_selection(etypes, winner):
+    """cell > partial > component > drop > unknown."""
+    from tracer._etype import homogenize_etype_for_entity
+    df = _etyped(["e"] * len(etypes), etypes)
+    homogenize_etype_for_entity(df, "e")
+    assert set(df["_etype"].astype(str)) == {winner}
+
+
+def test_homogenize_absent_label_is_noop():
+    from tracer._etype import homogenize_etype_for_entity
+    df = _etyped(["42", "42"], ["cell", "partial"])
+    before = df["_etype"].astype(str).tolist()
+    homogenize_etype_for_entity(df, "999")  # label not present
+    assert df["_etype"].astype(str).tolist() == before
+
+
+def test_homogenize_missing_etype_column_is_noop():
+    from tracer._etype import homogenize_etype_for_entity
+    df = pd.DataFrame({"tracer_id": ["42", "42"]})
+    homogenize_etype_for_entity(df, "42")  # no _etype column → no error
+    assert "_etype" not in df.columns
+
+
+def test_homogenize_batch_resolves_each_entity_independently():
+    """One call, one pass; each entity gets its own priority winner;
+    entities not listed are untouched."""
+    from tracer._etype import homogenize_etype_for_entities
+    df = _etyped(
+        ["A", "A", "B", "B", "C", "C", "D", "D"],
+        ["cell", "partial", "partial", "component",
+         "unknown", "unknown", "cell", "partial"],
+    )
+    homogenize_etype_for_entities(df, ["A", "B", "C"])  # D omitted
+    got = df.groupby("tracer_id")["_etype"].agg(lambda s: set(s.astype(str)))
+    assert got["A"] == {"cell"}
+    assert got["B"] == {"partial"}
+    assert got["C"] == {"unknown"}
+    assert got["D"] == {"cell", "partial"}  # untouched
+
+
+def test_homogenize_batch_empty_labels_is_noop():
+    from tracer._etype import homogenize_etype_for_entities
+    df = _etyped(["A", "A"], ["cell", "partial"])
+    before = df["_etype"].astype(str).tolist()
+    homogenize_etype_for_entities(df, [])
+    assert df["_etype"].astype(str).tolist() == before

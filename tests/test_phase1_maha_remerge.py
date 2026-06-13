@@ -278,3 +278,39 @@ def test_sentinel_labels_skipped():
     assert stats["n_rescues"] == 0
     # Sentinel labels unchanged.
     assert (df_out.tracer_id.astype(str) == "-1").sum() == 10
+
+
+# ---------------------------------------------------------------------
+# Post-merge _etype homogenization (the cell-cell-gate failure mode)
+# ---------------------------------------------------------------------
+
+def test_maha_remerge_homogenizes_merged_etype():
+    """A cell entity merged with a partial yields ONE entity whose every
+    row shares a single `_etype` (cell, by priority). Without
+    homogenization the merged entity carries mixed cell/partial rows and
+    downstream `groupby(...)["_etype"].first()` is non-deterministic."""
+    from tracer._etype import ETYPE_DTYPE
+    rng = np.random.default_rng(0)
+    aux, pool_A, pool_B = _build_aux_and_pools(
+        prog_size=10, overlap_frac=0.70, cross=0.0,
+    )
+    a = _entity("a-1-1", 60, center=(0.0, 0.0, 0.0),
+                sigma=2.0, gene_pool=pool_A, rng=rng)
+    b = _entity("b-1-1", 60, center=(0.0, 0.0, 0.0),
+                sigma=2.0, gene_pool=pool_B, rng=rng)
+    a["_etype"] = "cell"
+    b["_etype"] = "partial"
+    df = pd.concat([a, b], ignore_index=True)
+    df["_etype"] = df["_etype"].astype(ETYPE_DTYPE)
+
+    df_out, stats = phase1_maha_remerge(df, aux, threshold=1.0, floor=-0.2)
+    assert stats["n_rescues"] >= 1, f"expected a merge; stats={stats}"
+    merged = df_out["tracer_id"].astype(str)
+    assert merged.nunique() == 1, "cell+partial should merge into one entity"
+    per_label = df_out.groupby(merged)["_etype"].agg(
+        lambda s: set(s.astype(str))
+    )
+    assert per_label.iloc[0] == {"cell"}, (
+        f"merged _etype not homogenized to the priority winner: "
+        f"{per_label.iloc[0]}"
+    )
