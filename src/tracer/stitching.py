@@ -2764,12 +2764,11 @@ def apply_stitching_to_transcripts_memory_efficient(
                 out_codes[valid] = new_cat_codes[ent_codes[valid]]
 
             df_out[out_col] = pd.Categorical.from_codes(out_codes, categories=new_categories)
-        if debug_stages and debug_legacy_col != out_col:
-            df_out[debug_legacy_col] = df_out[out_col].copy()
-        # Fall through to the shared homogenize block below — do NOT
-        # early-return; otherwise the categorical fast path skips the
-        # _etype homogenization and downstream `.first()` becomes
-        # non-deterministic.
+        # Fall through to the shared block below — do NOT early-return;
+        # otherwise the categorical fast path skips the `_etype`
+        # homogenization and downstream `.first()` becomes
+        # non-deterministic. (debug_legacy_col is written once, in the
+        # shared block, for both map modes.)
     elif map_mode == "chunked":
         ent_str = ent.astype(str)
         merges_happened = not (
@@ -2814,12 +2813,13 @@ def apply_stitching_to_transcripts_memory_efficient(
     # stitched label, and their rows can still end up grouped with cell
     # rows under the same stitched label (when a cell entity's id equals
     # a partial's parent prefix). So we homogenize all heterogeneous
-    # stitched labels rather than only those reachable via summary —
-    # still O(heterogeneous labels), not O(N). See `tracer._etype.
-    # homogenize_etype_for_entity` for the priority rule.
-    # Only when a merge actually happened can a stitched label have become
-    # heterogeneous — skip the O(N) heterogeneity scan on the no-merge
-    # fast path (preserves the categorical fast-path performance benefit).
+    # stitched labels rather than only those reachable via summary.
+    #
+    # Complexity: detecting the heterogeneous labels is an O(N_tx)
+    # groupby-nunique scan — but it only runs when `merges_happened`
+    # (the no-merge categorical fast path skips it entirely). The fix
+    # itself (homogenize_etype_for_entities) then touches only the
+    # heterogeneous labels' rows. See that helper for the priority rule.
     if "_etype" in df_out.columns and merges_happened:
         from ._etype import homogenize_etype_for_entities
         # Find stitched labels whose rows have heterogeneous _etype.

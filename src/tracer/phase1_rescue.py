@@ -330,7 +330,8 @@ def phase1_maha_remerge(
         if "_etype" in df.columns:
             from ._etype import homogenize_etype_for_entities
             affected_roots = {dsu.find(p["a"]) for p in pairs_rescued}
-            # One pass over only the merged roots' rows (not per-root).
+            # Batch: resolve all merged roots in one call (single column
+            # scan to locate their rows), not a full rescan per root.
             homogenize_etype_for_entities(
                 df, affected_roots, entity_col=entity_col, etype_col="_etype",
             )

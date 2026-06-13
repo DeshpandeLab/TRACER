@@ -209,12 +209,13 @@ def homogenize_etype_for_entities(
 ) -> None:
     """In-place batch homogenization: give every entity in
     ``entity_labels`` a single ``_etype`` (the highest-priority etype
-    present within that entity) in **one pass over only the affected
-    rows**.
+    present within that entity).
 
-    Cost is O(rows in the affected entities), not O(N · #entities) — the
-    column is scanned/masked once rather than re-scanned per entity.
-    Prefer this at merge call sites that touch many roots.
+    Cost: **one** O(N) scan of ``entity_col`` to locate the affected
+    rows, then the priority resolution runs over **only** those rows
+    (O(rows-in-affected)). This replaces the per-entity pattern that
+    re-scanned the whole column once *per entity* — so it is the
+    preferred form at merge call sites that touch many roots.
 
     No-op when ``etype_col`` is absent, ``entity_labels`` is empty, or no
     row matches. Idempotent: passing already-homogeneous entities (or
@@ -229,8 +230,10 @@ def homogenize_etype_for_entities(
     mask = ent.isin(labels).to_numpy()
     if not mask.any():
         return
+    # Mask first, then string-cast only the affected rows (avoids casting
+    # the full _etype column when few entities are touched).
     sub_ent = ent.to_numpy()[mask]
-    sub_et = df[etype_col].astype(str).to_numpy()[mask]
+    sub_et = df[etype_col].to_numpy()[mask].astype(str)
     prio = np.fromiter(
         (_ETYPE_PRIORITY.get(e, 99) for e in sub_et),
         dtype=np.int16, count=sub_et.shape[0],
