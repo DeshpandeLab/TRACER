@@ -2739,10 +2739,16 @@ def apply_stitching_to_transcripts_memory_efficient(
     df_out = df_final if in_place else df_final.copy()
     ent = df_out[entity_col]
 
+    # Did any merge actually occur this pass (≥2 entities collapse onto
+    # one stitched label)? Guards the post-merge `_etype` homogenization
+    # so the no-merge fast path stays cheap (no O(N) heterogeneity scan).
+    merges_happened = True
+
     if map_mode == "categorical":
         ent_cat = ent.astype("category")
         categories = ent_cat.cat.categories.astype(str)
         mapped_categories = pd.Index(categories).map(lambda x: entity_to_stitched.get(x, x))
+        merges_happened = not mapped_categories.is_unique
 
         # Fast path: one-to-one mapping (no merges) -> just rename categories
         if mapped_categories.is_unique:
@@ -2766,6 +2772,11 @@ def apply_stitching_to_transcripts_memory_efficient(
         # non-deterministic.
     elif map_mode == "chunked":
         ent_str = ent.astype(str)
+        merges_happened = not (
+            pd.Index(ent_str.unique())
+            .map(lambda x: entity_to_stitched.get(x, x))
+            .is_unique
+        )
         df_out[out_col] = ent_str
 
         mask = ent_str.notna() & (ent_str != "DROP") & (ent_str != "nan")
@@ -2806,22 +2817,25 @@ def apply_stitching_to_transcripts_memory_efficient(
     # stitched labels rather than only those reachable via summary —
     # still O(heterogeneous labels), not O(N). See `tracer._etype.
     # homogenize_etype_for_entity` for the priority rule.
-    if "_etype" in df_out.columns:
-        from ._etype import homogenize_etype_for_entity
+    # Only when a merge actually happened can a stitched label have become
+    # heterogeneous — skip the O(N) heterogeneity scan on the no-merge
+    # fast path (preserves the categorical fast-path performance benefit).
+    if "_etype" in df_out.columns and merges_happened:
+        from ._etype import homogenize_etype_for_entities
         # Find stitched labels whose rows have heterogeneous _etype.
         _SENT = {"-1", "DROP", "UNASSIGNED", "nan"}
         labels = df_out[out_col].astype(str)
         sub_mask = ~labels.isin(_SENT)
-        het_labels = (
+        het_counts = (
             df_out.loc[sub_mask, [out_col, "_etype"]]
             .astype({out_col: str, "_etype": str})
             .groupby(out_col)["_etype"].nunique()
         )
-        het_labels = het_labels[het_labels > 1].index.tolist()
-        for stitched_root in het_labels:
-            homogenize_etype_for_entity(
-                df_out, stitched_root,
-                entity_col=out_col, etype_col="_etype",
+        het_labels = het_counts[het_counts > 1].index.tolist()
+        if het_labels:
+            # One pass over only the heterogeneous labels' rows.
+            homogenize_etype_for_entities(
+                df_out, het_labels, entity_col=out_col, etype_col="_etype",
             )
 
     return df_out, entity_to_stitched

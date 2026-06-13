@@ -200,6 +200,53 @@ _ETYPE_PRIORITY = {
 }
 
 
+def homogenize_etype_for_entities(
+    df: pd.DataFrame,
+    entity_labels,
+    *,
+    entity_col: str = "tracer_id",
+    etype_col: str = "_etype",
+) -> None:
+    """In-place batch homogenization: give every entity in
+    ``entity_labels`` a single ``_etype`` (the highest-priority etype
+    present within that entity) in **one pass over only the affected
+    rows**.
+
+    Cost is O(rows in the affected entities), not O(N · #entities) — the
+    column is scanned/masked once rather than re-scanned per entity.
+    Prefer this at merge call sites that touch many roots.
+
+    No-op when ``etype_col`` is absent, ``entity_labels`` is empty, or no
+    row matches. Idempotent: passing already-homogeneous entities (or
+    re-running) leaves the column unchanged.
+    """
+    if etype_col not in df.columns:
+        return
+    labels = {str(x) for x in entity_labels}
+    if not labels:
+        return
+    ent = df[entity_col].astype(str)
+    mask = ent.isin(labels).to_numpy()
+    if not mask.any():
+        return
+    sub_ent = ent.to_numpy()[mask]
+    sub_et = df[etype_col].astype(str).to_numpy()[mask]
+    prio = np.fromiter(
+        (_ETYPE_PRIORITY.get(e, 99) for e in sub_et),
+        dtype=np.int16, count=sub_et.shape[0],
+    )
+    # Winner per entity = the etype carried by its highest-priority
+    # (lowest-rank) row. Stable sort → deterministic; groupby-first picks
+    # the winner; reindex broadcasts it back to every affected row.
+    tmp = pd.DataFrame({"_ent": sub_ent, "_prio": prio, "_et": sub_et})
+    winners = (
+        tmp.sort_values("_prio", kind="stable")
+        .groupby("_ent", sort=False)["_et"]
+        .first()
+    )
+    df.loc[mask, etype_col] = winners.reindex(sub_ent).to_numpy()
+
+
 def homogenize_etype_for_entity(
     df: pd.DataFrame,
     entity_label: str,
@@ -210,21 +257,10 @@ def homogenize_etype_for_entity(
     """In-place: ensure every row of ``entity_label`` shares a single
     ``_etype`` value (the highest-priority etype present in the group).
 
-    No-op when:
-      - ``etype_col`` is not in df
-      - no row matches ``entity_label``
-      - the entity is already homogeneous
-
-    Designed to be called right after a DSU union + entity_col remap
-    by the stage that did the merge. Cheap and idempotent.
+    No-op when ``etype_col`` is absent, no row matches ``entity_label``,
+    or the entity is already homogeneous. Thin single-entity wrapper over
+    :func:`homogenize_etype_for_entities`; idempotent.
     """
-    if etype_col not in df.columns:
-        return
-    mask = df[entity_col].astype(str).to_numpy() == str(entity_label)
-    if not mask.any():
-        return
-    present = pd.unique(df.loc[mask, etype_col].astype(str))
-    if len(present) <= 1:
-        return
-    winner = min(present, key=lambda e: _ETYPE_PRIORITY.get(e, 99))
-    df.loc[mask, etype_col] = winner
+    homogenize_etype_for_entities(
+        df, (entity_label,), entity_col=entity_col, etype_col=etype_col,
+    )

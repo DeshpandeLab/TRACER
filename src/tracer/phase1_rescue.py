@@ -328,12 +328,12 @@ def phase1_maha_remerge(
         # Stitch. See `tracer._etype.homogenize_etype_for_entity` for the
         # priority rule.
         if "_etype" in df.columns:
-            from ._etype import homogenize_etype_for_entity
+            from ._etype import homogenize_etype_for_entities
             affected_roots = {dsu.find(p["a"]) for p in pairs_rescued}
-            for root in affected_roots:
-                homogenize_etype_for_entity(
-                    df, root, entity_col=entity_col, etype_col="_etype",
-                )
+            # One pass over only the merged roots' rows (not per-root).
+            homogenize_etype_for_entities(
+                df, affected_roots, entity_col=entity_col, etype_col="_etype",
+            )
 
     stats = dict(
         n_candidates=len(cand),
