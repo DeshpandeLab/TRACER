@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+._*
 
 # Python
 __pycache__/
@@ -63,6 +64,14 @@ tutorials/*/data/*.xlsx
 # Logs and temporary files
 *.log
 /tmp/
+logs/
+
+# Apptainer/Singularity images
+*.sif
+
+# GBM tutorial outputs and large stale NPMI
+tutorials/gbm/output/
+tutorials/gbm/data/gbm_npmi.csv
 
 
 # Ignore CSV and TSV files
@@ -70,3 +79,4 @@ tutorials/*/data/*.xlsx
 *.tsv
 tutorials/mouse_ileum/data/baysor_segmentation.csv
 tutorials/lung_cancer/data/Baysor_segmentation.csv
+!tutorials/gbm/data/gene_positions_grch38.tsv
