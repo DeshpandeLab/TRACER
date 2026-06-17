@@ -46,25 +46,25 @@ cd "$REPO"
 
 echo "=== Step 1: Merging 8 TRACER piece parquets ==="
 apptainer exec \
-    --bind "$REPO":/app \
     --bind /mnt/storage:/mnt/storage \
+    --bind "$REPO/tutorials":/app/tutorials \
     --pwd /app \
     "$SIF" \
-    python tutorials/gbm/merge_slide3_tracer.py \
-        --manifest /app/tutorials/gbm/output/slide3_pieces/piece_run_manifest.csv \
-        --tracer-dir /app/tutorials/gbm/output/slide3_tracer \
-        --output /app/tutorials/gbm/output/slide3_tracer_merged.parquet
+    python /app/tutorials/gbm/merge_slide3_tracer.py \
+        --manifest "$MANIFEST" \
+        --tracer-dir "$REPO/tutorials/gbm/output/slide3_tracer" \
+        --output "$MERGED"
 
 echo "=== Step 2: Comparing original vs TRACER-refined profiles ==="
 apptainer exec \
-    --bind "$REPO":/app \
     --bind /mnt/storage:/mnt/storage \
+    --bind "$REPO/tutorials":/app/tutorials \
     --pwd /app \
     "$SIF" \
-    python tutorials/gbm/compare_profiles.py \
-        --input /app/tutorials/gbm/output/slide3_tracer_merged.parquet \
-        --npmi /app/tutorials/gbm/data/gbm_npmi.csv \
-        --outdir /app/tutorials/gbm/output/slide3_profile_comparison \
-        --annotations-csv /mnt/storage/dept/medonc/beroukhim/youyun/BTC_GBM/data/xenium/Xenium_Annotations/adata_obs_annotated.csv
+    python /app/tutorials/gbm/compare_profiles.py \
+        --input "$MERGED" \
+        --npmi "$NPMI" \
+        --outdir "$OUTDIR" \
+        --annotations-csv "$ANNOTATIONS"
 
 echo "=== Done. Outputs written to $OUTDIR ==="

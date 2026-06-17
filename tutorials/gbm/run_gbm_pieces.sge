@@ -101,11 +101,11 @@ echo "Input: $INPUT_REL"
 echo "Output: $OUTPUT_REL"
 
 apptainer exec \
-    --bind "$REPO":/app \
     --bind /mnt/storage:/mnt/storage \
+    --bind "$REPO/tutorials":/app/tutorials \
     --pwd /app \
     "$SIF" \
-    python tutorials/gbm/run_gbm.py \
-        --input "/app/$INPUT_REL" \
-        --npmi /app/tutorials/gbm/data/gbm_npmi.csv \
-        --output "/app/$OUTPUT_REL"
+    python /app/tutorials/gbm/run_gbm.py \
+        --input "$INPUT" \
+        --npmi "$NPMI" \
+        --output "$OUTPUT"

@@ -30,11 +30,11 @@ export NUMEXPR_NUM_THREADS=1
 cd "$REPO"
 
 apptainer exec \
-    --bind "$REPO":/app \
     --bind /mnt/storage:/mnt/storage \
+    --bind "$REPO/tutorials":/app/tutorials \
     --pwd /app \
     "$SIF" \
-    python tutorials/gbm/run_gbm.py \
+    python /app/tutorials/gbm/run_gbm.py \
         --input "$INPUT" \
-        --npmi /app/tutorials/gbm/data/gbm_npmi.csv \
-        --output /app/tutorials/gbm/output/df_finetuned.parquet
+        --npmi "$NPMI" \
+        --output "$OUTPUT"

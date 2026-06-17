@@ -33,6 +33,26 @@ python tutorials/gbm/compare_profiles.py \
   --outdir tutorials/gbm/output/profile_comparison
 ```
 
+## Apptainer on Argos
+
+The GBM SIF is built with TRACER installed under `/app`, including compiled
+Cython extensions such as `_cy_prune`. Do not bind the repo over `/app`; that
+masks the compiled extensions with the source checkout and causes
+`ImportError: cannot import name '_cy_prune'`.
+
+Bind `/mnt/storage`, call scripts from `/app`, and write outputs to their
+absolute `/mnt/storage/...` paths:
+
+```bash
+apptainer exec \
+  --bind /mnt/storage:/mnt/storage \
+  --pwd /app \
+  tracer_deshpande_gbm.sif \
+  python /app/tutorials/gbm/generate_npmi.py \
+    --input /mnt/storage/dept/medonc/beroukhim/youyun/BTC_GBM/data/xenium/output-XETG00323__0023274__Patient4__20241004__181038/transcripts.parquet \
+    --output /mnt/storage/dept/medonc/beroukhim/youyun/BTC_GBM/code/TRACER-deshpande/tutorials/gbm/data/gbm_npmi.csv
+```
+
 ## Slide 3 Tissue Pieces
 
 Run QC first. This detects major tissue components from the available Slide 3
