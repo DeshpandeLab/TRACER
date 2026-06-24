@@ -283,6 +283,65 @@ def plot_transcript_flow(
     return fig
 
 
+def _resolve_label_col(df: pd.DataFrame, label_col: Optional[str]) -> str:
+    """Resolve the final-assignment label column, auto-detecting common names."""
+    if label_col is not None:
+        if label_col not in df.columns:
+            raise KeyError(f"label_col {label_col!r} not in df.columns")
+        return label_col
+    for cand in ("stitched", "tracer_id", "label"):
+        if cand in df.columns:
+            return cand
+    raise KeyError(
+        "plot_endpoints_flow: no label column found "
+        "(tried 'stitched', 'tracer_id', 'label'); pass label_col=..."
+    )
+
+
+def plot_endpoints_flow(
+    df: pd.DataFrame,
+    *,
+    orig_id_col: str = "cell_id",
+    label_col: Optional[str] = None,
+    etype_col: Optional[str] = None,
+    **plot_kwargs,
+):
+    """Post-hoc alluvial of INITIAL -> FINAL transcript proportions.
+
+    Works on any TRACER partition (live df or reloaded) carrying the original
+    input cell_id (`orig_id_col`) and the final assigned label (`label_col`,
+    auto-detected from 'stitched'/'tracer_id'/'label' when None). Classifies
+    each tx into original cell / neighboring cell / partial cell / component /
+    unassigned at both ends, then renders via `plot_transcript_flow`.
+
+    Defaults `class_grouping="five"` so the neighboring class is visible (the
+    3-class grouping folds it back into original). Remaining kwargs (backend,
+    palette, class_order, title, output, return_data, ...) pass through.
+    """
+    label_col = _resolve_label_col(df, label_col)
+    initial, final = sl.classify_endpoints(
+        df, orig_id_col=orig_id_col, label_col=label_col, etype_col=etype_col,
+    )
+    df2 = pd.DataFrame({
+        "etype_at_input": initial,
+        "etype_at_final": final,
+    })
+    plot_kwargs.setdefault("class_grouping", "five")
+    plot_kwargs.setdefault("phase_labels", {"input": "Initial", "final": "Final"})
+    # Neighbor (code 5) is intentionally absent from CLASS_SEMANTIC_ORDER, so by
+    # default it would land at the bottom. Place it right after original cell.
+    # Only safe to inject when using the default palette AND the 5-class
+    # grouping; if the caller supplied their own palette, they own the ordering
+    # too, and under "three" grouping codes 5/2/4 are absent from the palette
+    # (avoids a class_order-not-in-palette ValueError).
+    if "palette" not in plot_kwargs and plot_kwargs["class_grouping"] == "five":
+        plot_kwargs.setdefault("class_order", [
+            sl.CLASS_MAIN, sl.CLASS_MAIN_NEIGHBOR, sl.CLASS_PARTIAL,
+            sl.CLASS_COMPONENT, sl.CLASS_UNASSIGNED, sl.CLASS_DROPPED,
+        ])
+    return plot_transcript_flow(df2, phases=["input", "final"], **plot_kwargs)
+
+
 # ─── default palette ───────────────────────────────────────────────────
 _DEFAULT_PALETTE_5 = {
     sl.CLASS_MAIN: "#1f77b4",       # blue

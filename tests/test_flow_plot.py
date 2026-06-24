@@ -323,3 +323,67 @@ class TestRendererEndpointsSupport:
         )
         labels = [t.get_text() for t in fig.axes[0].get_xticklabels()]
         assert "Initial" in labels and "Final" in labels
+
+
+class TestPlotEndpointsFlow:
+    def _partition(self):
+        return pd.DataFrame({
+            "transcript_id": range(10),
+            "cell_id":  ["A", "A", "A", "B", "B", "C", "C", "D", "-1", "E"],
+            "stitched": ["A", "B", "A-tr-1", "B", "X", "C", "-1", "D-tr-2", "F", "E"],
+        })
+
+    def test_label_col_autodetect_and_build(self):
+        fig, tidy = fp.plot_endpoints_flow(
+            self._partition(), orig_id_col="cell_id",
+            backend="matplotlib", return_data=True,
+        )
+        assert set(tidy["phase_from"]) == {"input"}
+        assert set(tidy["phase_to"]) == {"final"}
+
+    def test_neighbor_visible_default_five_class(self):
+        _, tidy = fp.plot_endpoints_flow(
+            self._partition(), orig_id_col="cell_id",
+            backend="matplotlib", return_data=True,
+        )
+        assert sl.CLASS_MAIN_NEIGHBOR in set(tidy["class_to"])
+
+    def test_three_class_collapses_neighbor(self):
+        _, tidy = fp.plot_endpoints_flow(
+            self._partition(), orig_id_col="cell_id", class_grouping="three",
+            backend="matplotlib", return_data=True,
+        )
+        assert sl.CLASS_MAIN_NEIGHBOR not in set(tidy["class_to"])
+
+    def test_explicit_label_col(self):
+        df = self._partition().rename(columns={"stitched": "final_label"})
+        fig = fp.plot_endpoints_flow(
+            df, orig_id_col="cell_id", label_col="final_label",
+            backend="matplotlib",
+        )
+        assert fig is not None
+
+    def test_no_label_col_raises(self):
+        df = self._partition().drop(columns=["stitched"])
+        with pytest.raises(KeyError):
+            fp.plot_endpoints_flow(df, orig_id_col="cell_id",
+                                   backend="matplotlib")
+
+    def test_plotly_backend(self):
+        pytest.importorskip("plotly")
+        fig = fp.plot_endpoints_flow(
+            self._partition(), orig_id_col="cell_id", backend="plotly")
+        assert fig is not None
+
+    def test_custom_partial_palette_does_not_inject_class_order(self):
+        # When the caller supplies a palette (here missing component/dropped),
+        # plot_endpoints_flow must NOT inject its default class_order — that
+        # would raise "class_order contains codes not in palette".
+        pal = {
+            sl.CLASS_MAIN: "#1f77b4", sl.CLASS_MAIN_NEIGHBOR: "#ff7f0e",
+            sl.CLASS_PARTIAL: "#2ca02c", sl.CLASS_UNASSIGNED: "#7f7f7f",
+        }
+        fig = fp.plot_endpoints_flow(
+            self._partition(), orig_id_col="cell_id", palette=pal,
+            backend="matplotlib")
+        assert fig is not None
