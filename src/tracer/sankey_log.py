@@ -3,6 +3,7 @@
 Centralized classifier, phase-key tier tables, and display-label map.
 Pure numpy/pandas; no plotting dependencies. Public API:
 - snapshot_phase(df, phase, *, id_col)
+- classify_endpoints(df, *, orig_id_col, label_col, etype_col=None)
 - _classify_etype_vec(id_arr, etype_arr)
 - PHASE_KEYS_{SEG,NOSEG}_{DEFAULT,VERBOSE,COLLAPSED}
 - COLLAPSE_{SEG,NOSEG}

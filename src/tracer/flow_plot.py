@@ -2,6 +2,7 @@
 
 Public API:
 - plot_transcript_flow(transcripts, ...) — added in later tasks
+- plot_endpoints_flow(df, ...) — post-hoc initial→final alluvial
 
 Internals:
 - _prepare_flow_data — build tidy (phase_from, phase_to, class_from, class_to, n) df
