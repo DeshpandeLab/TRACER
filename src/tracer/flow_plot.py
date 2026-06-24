@@ -199,6 +199,10 @@ def plot_transcript_flow(
         have set via patching ``sl.display_label_for`` — they use the raw
         ``PHASE_DISPLAY_LABELS`` lookup. matplotlib backend only for now;
         plotly currently ignores ``label_target``.
+    phase_labels : dict, optional
+        Map of phase key -> display label, overriding the computed column
+        labels for those phases (others keep their computed label). Used e.g.
+        by ``plot_endpoints_flow`` to show "Initial"/"Final".
     """
     df_cols = set(transcripts.columns)
 
@@ -286,7 +290,7 @@ _DEFAULT_PALETTE_5 = {
     sl.CLASS_COMPONENT: "#9467bd",  # purple
     sl.CLASS_UNASSIGNED: "#7f7f7f", # grey
     sl.CLASS_DROPPED: "#d62728",    # red
-    sl.CLASS_MAIN_NEIGHBOR: "#ff7f0e",  # orange
+    sl.CLASS_MAIN_NEIGHBOR: "#E69F00",  # orange (Okabe-Ito)
 }
 _DEFAULT_PALETTE_3 = {
     sl.CLASS_MAIN: "#1f77b4",
