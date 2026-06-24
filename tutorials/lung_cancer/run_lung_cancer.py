@@ -186,6 +186,7 @@ def main():
         pre_stage2_rescue,
         reassign_unassigned_grid_pool,
     )
+    from tracer.sankey_log import snapshot_phase
     from tracer.graph import build_grid_graph_xy
     # import core module for reassignment helper
     import tracer.core as core
@@ -228,6 +229,13 @@ def main():
         print(f"Constructed {edge_index.shape[1]:,} edges among {N:,} transcripts (k≤{k}, d≤{dist_threshold} µm)")
         return data
 
+    # Transcript-flow Sankey snapshots: SEG driver runs Stage 1 (phase1),
+    # Stage 3 (stitch), Stage 4 (group, via spatial coherence split), and
+    # Stage 5 (finalize). Phases `rescue`, `post_group_rescue`, `demote`, and
+    # `final_rescue` are NOT executed by this driver, so they are skipped here.
+    # Snapshots are written onto the dataframe immediately after each phase,
+    # so the columns ride along through subsequent stages to the final parquet.
+
     # Stage 1: conservative NPMI pruning
     print("Stage 1: prune_transcripts_fast (conservative NPMI)")
     t0 = time.time()
@@ -242,6 +250,10 @@ def main():
         show_progress=True,
     )
     print("Stage 1 done: rows=", len(df_pruned), "took", time.time() - t0, "s")
+    # Snapshot input (using original cell_id, preserved on df_pruned) + phase1.
+    if "cell_id" in df_pruned.columns:
+        snapshot_phase(df_pruned, "input", id_col="cell_id")
+    snapshot_phase(df_pruned, "phase1", id_col="cell_id_npmi_cons_p2")
 
     # Stage 2: annotate unassigned components
     # Pick graph builder per --stage2-builder.
@@ -265,6 +277,9 @@ def main():
         show_progress=True,
     )
     print("Stage 2 done: rows=", len(df_final), "took", time.time() - t0, "s")
+    # Stage 2 produces `cell_id_final` after annotate_unassigned_components_fast —
+    # this is the post-grouping checkpoint (UNASSIGNED_* components are minted).
+    snapshot_phase(df_final, "group", id_col="cell_id_final")
 
     # Stage 3: initial stitching
     print("Stage 3: apply_stitching_to_transcripts_memory_efficient (initial stitching)")
@@ -284,6 +299,7 @@ def main():
         show_progress=True,
     )
     print("Stage 3 done: rows=", len(df_stitched), "took", time.time() - t0, "s")
+    snapshot_phase(df_stitched, "stitch", id_col="cell_id_stitched")
 
     # Stage 4: enforce spatial coherence (split large/multi-component labels)
     print("Stage 4: enforce_spatial_coherence_fast (split spatially disjoint labels)")
@@ -299,6 +315,9 @@ def main():
         show_progress=True,
     )
     print("Stage 4 done: rows=", len(df_split), "took", time.time() - t0, "s")
+    # Stage 4 (spatial coherence split) doesn't map to a canonical phase key
+    # in the SEG-default tier — skip the snapshot here. The `group` snapshot
+    # was taken at Stage 2 above, which is the correct semantic boundary.
 
     # Stage 5: re-run stitching with spatial splits
     # Pick candidate source per --stage5-candidates. Grid uses G = stage4 d.
@@ -322,6 +341,7 @@ def main():
         show_progress=True,
     )
     print("Stage 5 done: rows=", len(df_finetuned), "took", time.time() - t0, "s")
+    snapshot_phase(df_finetuned, "finalize", id_col="cell_id_finetuned")
 
     # Save final finetuned result
     finetuned_fp = out_dir / "df_finetuned_nuclear_expansion_5um.parquet"

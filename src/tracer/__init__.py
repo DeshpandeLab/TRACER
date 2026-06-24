@@ -67,6 +67,12 @@ __all__ = [
     "plot_cc",
     "plot_3d_concave_cell",
     "plot_3d_convex_cell",
+    "snapshot_phase",
+    "PHASE_KEYS_SEG_DEFAULT",
+    "PHASE_KEYS_NOSEG_DEFAULT",
+    "PHASE_KEYS_SEG_VERBOSE",
+    "PHASE_DISPLAY_LABELS",
+    "plot_transcript_flow",
 ]
 
 __version__ = "0.1.1"
@@ -145,3 +151,12 @@ try:
 except ImportError:
     # open3d not installed; plotting functions unavailable
     pass
+
+from .sankey_log import (
+    snapshot_phase,
+    PHASE_KEYS_SEG_DEFAULT,
+    PHASE_KEYS_NOSEG_DEFAULT,
+    PHASE_KEYS_SEG_VERBOSE,
+    PHASE_DISPLAY_LABELS,
+)
+from .flow_plot import plot_transcript_flow
