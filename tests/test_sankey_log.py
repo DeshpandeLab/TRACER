@@ -197,10 +197,11 @@ class TestNeighborClassConstants:
     def test_collapse_3_folds_neighbor_into_main(self):
         assert sl.CLASS_COLLAPSE_3[sl.CLASS_MAIN_NEIGHBOR] == sl.CLASS_MAIN
 
-    def test_semantic_order_neighbor_after_main(self):
-        order = sl.CLASS_SEMANTIC_ORDER
-        assert sl.CLASS_MAIN in order and sl.CLASS_MAIN_NEIGHBOR in order
-        assert order.index(sl.CLASS_MAIN_NEIGHBOR) == order.index(sl.CLASS_MAIN) + 1
+    def test_semantic_order_excludes_extended_neighbor(self):
+        # Extended code 5 is intentionally NOT in the canonical semantic
+        # order; callers place it via an explicit class_order (see
+        # flow_plot._resolve_class_order contract).
+        assert sl.CLASS_MAIN_NEIGHBOR not in sl.CLASS_SEMANTIC_ORDER
 
 
 class TestIsOriginalMatch:
