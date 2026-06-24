@@ -94,32 +94,21 @@ POST_RESCUE_PHASES = {
 }
 
 # ─── extended classification: distinguish neighbor-cell mains ──
-CLASS_MAIN_NEIGHBOR = 5
-
-sl.CLASS_NAMES.update({
-    sl.CLASS_MAIN:        "original cell",
-    sl.CLASS_PARTIAL:     "partial",
-    sl.CLASS_UNASSIGNED:  "unassigned",
-    sl.CLASS_DROPPED:     "dropped",
-    sl.CLASS_COMPONENT:   "component",
-    CLASS_MAIN_NEIGHBOR:  "neighboring cell",
-})
-sl.CLASS_COLLAPSE_3.update({
-    CLASS_MAIN_NEIGHBOR: sl.CLASS_MAIN,
-})
+# CLASS_MAIN_NEIGHBOR, CLASS_NAMES, and CLASS_COLLAPSE_3 are now canonical
+# in tracer.sankey_log; reference them via the `sl.` prefix.
 
 EXT_PALETTE = {
-    sl.CLASS_MAIN:        "#1f77b4",  # blue
-    sl.CLASS_PARTIAL:     "#2ca02c",  # green
-    sl.CLASS_COMPONENT:   "#9467bd",  # purple
-    sl.CLASS_UNASSIGNED:  "#7f7f7f",  # grey
-    sl.CLASS_DROPPED:     "#d62728",  # red
-    CLASS_MAIN_NEIGHBOR:  "#ff7f0e",  # orange
+    sl.CLASS_MAIN:           "#1f77b4",  # blue
+    sl.CLASS_PARTIAL:        "#2ca02c",  # green
+    sl.CLASS_COMPONENT:      "#9467bd",  # purple
+    sl.CLASS_UNASSIGNED:     "#7f7f7f",  # grey
+    sl.CLASS_DROPPED:        "#d62728",  # red
+    sl.CLASS_MAIN_NEIGHBOR:  "#E69F00",  # orange (colorblind-safe)
 }
 
 # Top-to-bottom visual order
 ORDER = [
-    CLASS_MAIN_NEIGHBOR,
+    sl.CLASS_MAIN_NEIGHBOR,
     sl.CLASS_MAIN,
     sl.CLASS_PARTIAL,
     sl.CLASS_UNASSIGNED,
@@ -251,7 +240,7 @@ def main() -> int:
         codes = df_out[col].to_numpy()
         main_neighbor = (codes == sl.CLASS_MAIN) & nflag
         codes_ext = codes.copy()
-        codes_ext[main_neighbor] = CLASS_MAIN_NEIGHBOR
+        codes_ext[main_neighbor] = sl.CLASS_MAIN_NEIGHBOR
         df_out[col] = codes_ext.astype("int8")
         n_neighbor_total += int(main_neighbor.sum())
     print(f"  marked {n_neighbor_total:,} (tx × phase) main cells as 'neighbor'",
@@ -283,6 +272,21 @@ def main() -> int:
     for p in (out_a_html, out_a_png, out_b_html, out_b_png):
         print(f"  wrote {p}")
 
+    out_e_html = OUT_DIR / "pdac_full_endpoints.html"
+    out_e_png  = OUT_DIR / "pdac_full_endpoints.png"
+    title_e = f"pdac_io full sample — Initial → Final (n={len(df_out):,} tx)"
+    label_col = "stitched" if "stitched" in df_out.columns else "tracer_id"
+    fp.plot_endpoints_flow(df_out, orig_id_col="cell_id", label_col=label_col,
+                           backend="plotly", palette=EXT_PALETTE,
+                           class_order=ORDER, output=str(out_e_html),
+                           title=title_e)
+    fp.plot_endpoints_flow(df_out, orig_id_col="cell_id", label_col=label_col,
+                           backend="matplotlib", palette=EXT_PALETTE,
+                           class_order=ORDER, output=str(out_e_png),
+                           title=title_e)
+    for p in (out_e_html, out_e_png):
+        print(f"  wrote {p}")
+
     # ─── persist partition (incl. snapshot cols) + summary + counts CSV ──
     print()
     out_cols = ["transcript_id", "cell_id", "x", "y", "z"]
@@ -298,7 +302,7 @@ def main() -> int:
 
     # per-phase class counts
     counts_rows = []
-    class_cols = [0, 1, 2, 3, 4, CLASS_MAIN_NEIGHBOR]
+    class_cols = [0, 1, 2, 3, 4, sl.CLASS_MAIN_NEIGHBOR]
     for phase_key in ["input", "phase1", "rescue", "group", "mid_qc",
                        "post_group_rescue", "stitch", "demote",
                        "final_rescue", "finalize"]:
