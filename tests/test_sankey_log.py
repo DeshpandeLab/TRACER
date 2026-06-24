@@ -201,3 +201,24 @@ class TestNeighborClassConstants:
         order = sl.CLASS_SEMANTIC_ORDER
         assert sl.CLASS_MAIN in order and sl.CLASS_MAIN_NEIGHBOR in order
         assert order.index(sl.CLASS_MAIN_NEIGHBOR) == order.index(sl.CLASS_MAIN) + 1
+
+
+class TestIsOriginalMatch:
+    def test_same_cell(self):
+        assert sl._is_original_match("42", "42") is True
+
+    def test_partial_of_same_cell(self):
+        assert sl._is_original_match("42-tr-1", "42") is True
+
+    def test_different_cell(self):
+        assert sl._is_original_match("57", "42") is False
+
+    def test_ffpe_dash_cell_id_same(self):
+        assert sl._is_original_match("dafehkie-1-tr-2", "dafehkie-1") is True
+
+    def test_ffpe_dash_cell_id_different(self):
+        assert sl._is_original_match("dafehkie-12", "dafehkie-1") is False
+
+    def test_unassigned_origin_is_no_match(self):
+        assert sl._is_original_match("42", "-1") is False
+        assert sl._is_original_match("42", "UNASSIGNED") is False

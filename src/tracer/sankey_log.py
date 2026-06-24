@@ -15,6 +15,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from ._etype import split_entity_label, ENTITY_DELIMITER
+
 # ─── class codes (int8) ────────────────────────────────────────────────
 CLASS_MAIN: int = 0
 CLASS_PARTIAL: int = 1
@@ -70,6 +72,29 @@ _UNASSIGNED_SENTINELS = frozenset({
     "prune_rejected", "group_rejected",
 })
 _DROPPED_SENTINELS = frozenset({"DROP", "demote_rejected"})
+
+# Origin tokens that are NOT a real cell — gate neighbor detection.
+_NEIGHBOR_NONCELL_TOKENS = frozenset(
+    _UNASSIGNED_SENTINELS | _DROPPED_SENTINELS | {""}
+)
+
+
+def _is_original_match(current_id: str, orig_cell_id: str) -> bool:
+    """True iff the tx's CURRENT entity id shares the same base cell_id as
+    its ORIGINAL (input) segmentation cell_id.
+
+    Base cell_id is the part before the `-tr-` entity delimiter, so a tx that
+    moved from cell ``A`` to a partial of the same cell (``A-tr-1``) still
+    matches, while a move to cell ``B`` (or ``B-tr-1``) does not. Returns
+    False if either id is a non-cell sentinel. `split_entity_label` only
+    splits on `-tr-`, so FFPE dash cell_ids (e.g. ``dafehkie-1``) compare
+    correctly.
+    """
+    if current_id in _NEIGHBOR_NONCELL_TOKENS or orig_cell_id in _NEIGHBOR_NONCELL_TOKENS:
+        return False
+    base_curr, _ = split_entity_label(current_id)
+    base_orig, _ = split_entity_label(orig_cell_id)
+    return base_curr == base_orig
 
 
 # ─── classifier ────────────────────────────────────────────────────────
