@@ -156,8 +156,7 @@ def classify_endpoints(
 
     orig = df[orig_id_col].astype(str).to_numpy()
     label = df[label_col].astype(str).to_numpy()
-    noncell = list(_NEIGHBOR_NONCELL_TOKENS)
-    real_orig = ~np.isin(orig, noncell)
+    real_orig = ~pd.Series(orig).isin(_NEIGHBOR_NONCELL_TOKENS).to_numpy()
 
     # initial
     initial = np.where(real_orig, CLASS_MAIN, CLASS_UNASSIGNED).astype(np.int8)
@@ -165,7 +164,7 @@ def classify_endpoints(
     # final: base etype classification
     if etype_col is None and "_etype" in df.columns:
         etype_col = "_etype"
-    etype_arr = (df[etype_col].values
+    etype_arr = (df[etype_col].to_numpy()
                  if etype_col is not None and etype_col in df.columns else None)
     final = _classify_etype_vec(label, etype_arr)
 
@@ -182,9 +181,12 @@ def classify_endpoints(
 
     # neighbor promotion (vectorized equivalent of _is_original_match):
     # whole-cell + real origin + base(label) != base(origin).
+    # Fast-path base-id split: mirrors _etype.split_entity_label (splits only on
+    # the fixed -tr- delimiter). Equivalent on well-formed TRACER labels; the
+    # scalar helper additionally validates integer suffixes, which we skip here.
     base_label = pd.Series(label).str.split(ENTITY_DELIMITER, n=1).str[0].to_numpy()
     base_orig = pd.Series(orig).str.split(ENTITY_DELIMITER, n=1).str[0].to_numpy()
-    real_label = ~np.isin(label, noncell)
+    real_label = ~pd.Series(label).isin(_NEIGHBOR_NONCELL_TOKENS).to_numpy()
     promote = (final == CLASS_MAIN) & real_orig & real_label & (base_label != base_orig)
     final[promote] = CLASS_MAIN_NEIGHBOR
 

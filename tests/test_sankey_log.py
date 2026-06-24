@@ -275,6 +275,9 @@ class TestClassifyEndpoints:
         df = self._df(with_etype=True)
         _, final = sl.classify_endpoints(
             df, orig_id_col="cell_id", label_col="label")
+        # Forward-only: promotion implies not-a-match. The reverse does NOT hold —
+        # _is_original_match returns False for sentinel origins (e.g. "-1"), but
+        # classify_endpoints correctly leaves those as original (real_orig gate).
         for i, (l, o) in enumerate(zip(df["label"], df["cell_id"])):
             if final[i] == sl.CLASS_MAIN_NEIGHBOR:
                 assert not sl._is_original_match(str(l), str(o))
