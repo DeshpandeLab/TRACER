@@ -130,6 +130,67 @@ def _classify_etype_vec(
     return out
 
 
+def classify_endpoints(
+    df: pd.DataFrame,
+    *,
+    orig_id_col: str = "cell_id",
+    label_col: str,
+    etype_col: Optional[str] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Post-hoc (initial, final) class-code arrays for an endpoints flow.
+
+    No snapshot columns required — works on any TRACER partition that carries
+    the original input cell_id and the final assigned label.
+
+    initial: real origin cell_id -> CLASS_MAIN, else CLASS_UNASSIGNED.
+    final:   5-class of the assigned label (using `etype_col`/`_etype` if
+             available, else derived from the `-tr-` label structure), then
+             whole-cell rows whose base cell_id differs from a real origin are
+             promoted to CLASS_MAIN_NEIGHBOR ("etype wins": `-tr-` partials stay
+             partial regardless of which cell).
+    """
+    if orig_id_col not in df.columns:
+        raise KeyError(f"classify_endpoints: orig_id_col {orig_id_col!r} not in df.columns")
+    if label_col not in df.columns:
+        raise KeyError(f"classify_endpoints: label_col {label_col!r} not in df.columns")
+
+    orig = df[orig_id_col].astype(str).to_numpy()
+    label = df[label_col].astype(str).to_numpy()
+    noncell = list(_NEIGHBOR_NONCELL_TOKENS)
+    real_orig = ~np.isin(orig, noncell)
+
+    # initial
+    initial = np.where(real_orig, CLASS_MAIN, CLASS_UNASSIGNED).astype(np.int8)
+
+    # final: base etype classification
+    if etype_col is None and "_etype" in df.columns:
+        etype_col = "_etype"
+    etype_arr = (df[etype_col].values
+                 if etype_col is not None and etype_col in df.columns else None)
+    final = _classify_etype_vec(label, etype_arr)
+
+    if etype_arr is None:
+        # `_classify_etype_vec` lumps non-sentinel rows into PARTIAL when no
+        # etype is given. Re-derive cell vs partial vs component from labels.
+        s = pd.Series(label)
+        non_sentinel = ~np.isin(final, [CLASS_UNASSIGNED, CLASS_DROPPED])
+        has_tr = s.str.contains(ENTITY_DELIMITER, regex=False).to_numpy()
+        comp_pref = s.str.startswith("UNASSIGNED").to_numpy()
+        final[non_sentinel & comp_pref] = CLASS_UNASSIGNED
+        final[non_sentinel & ~comp_pref & has_tr] = CLASS_PARTIAL
+        final[non_sentinel & ~comp_pref & ~has_tr] = CLASS_MAIN
+
+    # neighbor promotion (vectorized equivalent of _is_original_match):
+    # whole-cell + real origin + base(label) != base(origin).
+    base_label = pd.Series(label).str.split(ENTITY_DELIMITER, n=1).str[0].to_numpy()
+    base_orig = pd.Series(orig).str.split(ENTITY_DELIMITER, n=1).str[0].to_numpy()
+    real_label = ~np.isin(label, noncell)
+    promote = (final == CLASS_MAIN) & real_orig & real_label & (base_label != base_orig)
+    final[promote] = CLASS_MAIN_NEIGHBOR
+
+    return initial, final.astype(np.int8)
+
+
 # ─── phase tiers ───────────────────────────────────────────────────────
 # The runner's `Finalize` step is just defensive normalization (collapses
 # lingering -1 / DROP / demote_rejected / UNASSIGNED_* tokens into the

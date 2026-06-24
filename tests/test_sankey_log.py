@@ -222,3 +222,66 @@ class TestIsOriginalMatch:
     def test_unassigned_origin_is_no_match(self):
         assert sl._is_original_match("42", "-1") is False
         assert sl._is_original_match("42", "UNASSIGNED") is False
+
+
+class TestClassifyEndpoints:
+    def _df(self, with_etype):
+        # cur/orig pairs covering every case:
+        #  B   / A   cell, moved        -> neighbor
+        #  A   / A   cell, stayed       -> original
+        #  B-tr-1 / A partial of other  -> partial (etype wins)
+        #  C   / -1  cell, no real orig -> original
+        #  -1  / D   unassigned final   -> unassigned
+        cur  = ["B", "A", "B-tr-1", "C", "-1"]
+        orig = ["A", "A", "A",      "-1", "D"]
+        data = {"label": cur, "cell_id": orig}
+        if with_etype:
+            data["_etype"] = pd.Categorical(
+                ["cell", "cell", "partial", "cell", "unknown"])
+        return pd.DataFrame(data)
+
+    def test_initial_is_original_or_unassigned(self):
+        df = self._df(with_etype=True)
+        initial, _ = sl.classify_endpoints(
+            df, orig_id_col="cell_id", label_col="label")
+        assert list(initial) == [sl.CLASS_MAIN, sl.CLASS_MAIN, sl.CLASS_MAIN,
+                                 sl.CLASS_UNASSIGNED, sl.CLASS_MAIN]
+
+    def test_final_with_etype(self):
+        df = self._df(with_etype=True)
+        _, final = sl.classify_endpoints(
+            df, orig_id_col="cell_id", label_col="label")
+        assert list(final) == [
+            sl.CLASS_MAIN_NEIGHBOR,  # B from A
+            sl.CLASS_MAIN,           # A from A
+            sl.CLASS_PARTIAL,        # B-tr-1 (etype wins)
+            sl.CLASS_MAIN,           # C from unassigned origin
+            sl.CLASS_UNASSIGNED,     # -1
+        ]
+
+    def test_final_without_etype_derives_from_label(self):
+        df = self._df(with_etype=False)  # no _etype column
+        _, final = sl.classify_endpoints(
+            df, orig_id_col="cell_id", label_col="label")
+        assert list(final) == [
+            sl.CLASS_MAIN_NEIGHBOR,  # B (no -tr-) moved
+            sl.CLASS_MAIN,           # A
+            sl.CLASS_PARTIAL,        # B-tr-1 has -tr-
+            sl.CLASS_MAIN,           # C
+            sl.CLASS_UNASSIGNED,     # -1
+        ]
+
+    def test_parity_with_is_original_match(self):
+        df = self._df(with_etype=True)
+        _, final = sl.classify_endpoints(
+            df, orig_id_col="cell_id", label_col="label")
+        for i, (l, o) in enumerate(zip(df["label"], df["cell_id"])):
+            if final[i] == sl.CLASS_MAIN_NEIGHBOR:
+                assert not sl._is_original_match(str(l), str(o))
+
+    def test_missing_columns_raise(self):
+        df = self._df(with_etype=True)
+        with pytest.raises(KeyError):
+            sl.classify_endpoints(df, orig_id_col="nope", label_col="label")
+        with pytest.raises(KeyError):
+            sl.classify_endpoints(df, orig_id_col="cell_id", label_col="nope")
