@@ -289,3 +289,37 @@ class TestPublicAPI:
             pytest.skip("standalone-load fallback in use; full tracer unavailable")
         assert hasattr(tracer, "plot_transcript_flow")
         assert hasattr(tracer, "snapshot_phase")
+
+
+class TestRendererEndpointsSupport:
+    def _two_phase_df(self):
+        base = [sl.CLASS_MAIN] * 8
+        final = ([sl.CLASS_MAIN] * 3 + [sl.CLASS_MAIN_NEIGHBOR] * 2
+                 + [sl.CLASS_PARTIAL] * 2 + [sl.CLASS_UNASSIGNED] * 1)
+        return pd.DataFrame({
+            "etype_at_input": np.array(base, dtype=np.int8),
+            "etype_at_final": np.array(final, dtype=np.int8),
+        })
+
+    def test_default_palette_has_neighbor_color(self):
+        assert sl.CLASS_MAIN_NEIGHBOR in fp._DEFAULT_PALETTE_5
+
+    def test_lone_boundary_kept_with_drop_unchanged(self):
+        df = self._two_phase_df()
+        fig, tidy = fp.plot_transcript_flow(
+            df, phases=["input", "final"], class_grouping="five",
+            drop_unchanged=True, backend="matplotlib", return_data=True,
+        )
+        assert len(tidy) > 0
+        assert set(tidy["phase_from"]) == {"input"}
+        assert set(tidy["phase_to"]) == {"final"}
+
+    def test_phase_labels_override(self):
+        df = self._two_phase_df()
+        fig = fp.plot_transcript_flow(
+            df, phases=["input", "final"], class_grouping="five",
+            backend="matplotlib",
+            phase_labels={"input": "Initial", "final": "Final"},
+        )
+        labels = [t.get_text() for t in fig.axes[0].get_xticklabels()]
+        assert "Initial" in labels and "Final" in labels

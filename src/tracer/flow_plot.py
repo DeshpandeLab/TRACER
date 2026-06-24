@@ -169,6 +169,7 @@ def plot_transcript_flow(
     title: Optional[str] = None,
     backend: str = "plotly",
     label_target: str = "columns",
+    phase_labels: Optional[dict] = None,
     output=None,
     return_data: bool = False,
 ):
@@ -217,7 +218,7 @@ def plot_transcript_flow(
         strict_conservation=False,
     )
 
-    if drop_unchanged:
+    if drop_unchanged and len(phases) > 2:
         # Drop phase boundaries where every transition is identity
         # (no class crosses class boundaries)
         keep_boundaries = set()
@@ -238,6 +239,9 @@ def plot_transcript_flow(
         sl.display_label_for(p, pipeline=resolved_pipeline, view=view)
         for p in phases
     ]
+    if phase_labels:
+        display_labels = [phase_labels.get(p, dl)
+                          for p, dl in zip(phases, display_labels)]
     # Stage labels for the ribbons (action names) — bypass any caller
     # column-label prefix by looking up PHASE_DISPLAY_LABELS directly,
     # with the same Tier-A inverse-collapse logic as display_label_for.
@@ -282,6 +286,7 @@ _DEFAULT_PALETTE_5 = {
     sl.CLASS_COMPONENT: "#9467bd",  # purple
     sl.CLASS_UNASSIGNED: "#7f7f7f", # grey
     sl.CLASS_DROPPED: "#d62728",    # red
+    sl.CLASS_MAIN_NEIGHBOR: "#ff7f0e",  # orange
 }
 _DEFAULT_PALETTE_3 = {
     sl.CLASS_MAIN: "#1f77b4",
