@@ -180,3 +180,24 @@ class TestConservation:
         c_in = pd.Series(df["etype_at_input"]).value_counts().sort_index()
         c_out = pd.Series(df["etype_at_rescue"]).value_counts().sort_index()
         assert c_in.sum() == c_out.sum() == 300
+
+
+class TestNeighborClassConstants:
+    def test_neighbor_code_and_name(self):
+        assert sl.CLASS_MAIN_NEIGHBOR == 5
+        assert sl.CLASS_NAMES[sl.CLASS_MAIN_NEIGHBOR] == "neighboring cell"
+
+    def test_renamed_labels(self):
+        assert sl.CLASS_NAMES[sl.CLASS_MAIN] == "original cell"
+        assert sl.CLASS_NAMES[sl.CLASS_PARTIAL] == "partial cell"
+        assert sl.CLASS_NAMES[sl.CLASS_COMPONENT] == "component"
+        assert sl.CLASS_NAMES[sl.CLASS_UNASSIGNED] == "unassigned"
+        assert sl.CLASS_NAMES[sl.CLASS_DROPPED] == "dropped"
+
+    def test_collapse_3_folds_neighbor_into_main(self):
+        assert sl.CLASS_COLLAPSE_3[sl.CLASS_MAIN_NEIGHBOR] == sl.CLASS_MAIN
+
+    def test_semantic_order_neighbor_after_main(self):
+        order = sl.CLASS_SEMANTIC_ORDER
+        assert sl.CLASS_MAIN in order and sl.CLASS_MAIN_NEIGHBOR in order
+        assert order.index(sl.CLASS_MAIN_NEIGHBOR) == order.index(sl.CLASS_MAIN) + 1

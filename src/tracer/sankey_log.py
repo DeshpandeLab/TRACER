@@ -21,13 +21,15 @@ CLASS_PARTIAL: int = 1
 CLASS_COMPONENT: int = 2
 CLASS_UNASSIGNED: int = 3
 CLASS_DROPPED: int = 4
+CLASS_MAIN_NEIGHBOR: int = 5  # cell assigned to a different cell_id than origin
 
 CLASS_NAMES = {
-    CLASS_MAIN: "main",
-    CLASS_PARTIAL: "partial",
+    CLASS_MAIN: "original cell",
+    CLASS_PARTIAL: "partial cell",
     CLASS_COMPONENT: "component",
     CLASS_UNASSIGNED: "unassigned",
     CLASS_DROPPED: "dropped",
+    CLASS_MAIN_NEIGHBOR: "neighboring cell",
 }
 
 # Three-class collapsed view: component→partial, dropped→unassigned
@@ -37,6 +39,7 @@ CLASS_COLLAPSE_3 = {
     CLASS_COMPONENT: CLASS_PARTIAL,
     CLASS_UNASSIGNED: CLASS_UNASSIGNED,
     CLASS_DROPPED: CLASS_UNASSIGNED,
+    CLASS_MAIN_NEIGHBOR: CLASS_MAIN,
 }
 
 # Canonical top-to-bottom visual order. Read as a confidence/state
@@ -49,6 +52,7 @@ CLASS_COLLAPSE_3 = {
 # sorted-by-code at the bottom.
 CLASS_SEMANTIC_ORDER = [
     CLASS_MAIN,
+    CLASS_MAIN_NEIGHBOR,
     CLASS_PARTIAL,
     CLASS_COMPONENT,
     CLASS_UNASSIGNED,
